@@ -100,7 +100,7 @@ func (k *keeper) wsTurn(ctx context.Context, conn *websocket.Conn, header http.H
 	var c collector
 	err = readSSE(resp.Body, nil, func(event []byte) error {
 		c.event(event)
-		return conn.Write(ctx, websocket.MessageText, event)
+		return conn.Write(ctx, websocket.MessageText, rewriteResponseID(event))
 	})
 	if err != nil {
 		log.Printf("ws relay ended early: %v", err)
@@ -109,11 +109,12 @@ func (k *keeper) wsTurn(ctx context.Context, conn *websocket.Conn, header http.H
 	if !ok {
 		return "", nil, resp.StatusCode, hasPrev
 	}
+	id := publicID(rid)
 	items := append(t.input, output...)
 	if t.store {
-		k.store.put(rid, owner, items)
+		k.store.put(id, owner, items)
 	}
-	return rid, items, resp.StatusCode, hasPrev
+	return id, items, resp.StatusCode, hasPrev
 }
 
 func wsError(ctx context.Context, conn *websocket.Conn, e *apiError) int {

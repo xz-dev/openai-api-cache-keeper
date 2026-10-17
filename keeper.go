@@ -203,6 +203,75 @@ func (c *collector) final() (string, []json.RawMessage, bool) {
 	return c.id, output, true
 }
 
+// publicID is the id clients see and continue from. Upstream ids that do not
+// look like response ids (e.g. Anthropic-style msg_*) get a resp_ prefix, since
+// gateways such as Sub2API reject message-like previous_response_id values.
+func publicID(id string) string {
+	if strings.HasPrefix(id, "resp_") {
+		return id
+	}
+	return "resp_" + id
+}
+
+// rewriteResponseID applies publicID to the response object of one event or
+// JSON body. Payloads that need no change are returned unchanged.
+func rewriteResponseID(payload []byte) []byte {
+	if !bytes.Contains(payload, []byte(`"id"`)) {
+		return payload
+	}
+	var doc map[string]json.RawMessage
+	if json.Unmarshal(payload, &doc) != nil {
+		return payload
+	}
+	if nested, ok := doc["response"]; ok {
+		if fixed, changed := rewriteObjectID(nested); changed {
+			doc["response"] = fixed
+			if out, err := json.Marshal(doc); err == nil {
+				return out
+			}
+		}
+		return payload
+	}
+	if string(doc["object"]) == `"response"` {
+		if fixed, changed := rewriteObjectID(payload); changed {
+			return fixed
+		}
+	}
+	return payload
+}
+
+func rewriteObjectID(raw json.RawMessage) (json.RawMessage, bool) {
+	var obj map[string]json.RawMessage
+	if json.Unmarshal(raw, &obj) != nil {
+		return raw, false
+	}
+	var id string
+	if json.Unmarshal(obj["id"], &id) != nil || id == "" || publicID(id) == id {
+		return raw, false
+	}
+	obj["id"], _ = json.Marshal(publicID(id))
+	out, err := json.Marshal(obj)
+	if err != nil {
+		return raw, false
+	}
+	return out, true
+}
+
+// rewriteSSELine applies rewriteResponseID to a single-line SSE data field.
+func rewriteSSELine(line []byte) []byte {
+	if !bytes.HasPrefix(line, []byte("data:")) {
+		return line
+	}
+	body := bytes.TrimRight(line[5:], "\r\n")
+	ending := line[5+len(body):]
+	payload := bytes.TrimPrefix(body, []byte(" "))
+	fixed := rewriteResponseID(payload)
+	if len(fixed) == len(payload) && bytes.Equal(fixed, payload) {
+		return line
+	}
+	return append(append([]byte("data: "), fixed...), ending...)
+}
+
 // forward sends the prepared body to the same path upstream.
 func (k *keeper) forward(ctx context.Context, path string, header http.Header, body []byte) (*http.Response, error) {
 	target := *k.cfg.upstream
@@ -257,7 +326,7 @@ func (k *keeper) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	if resp.StatusCode == http.StatusOK && strings.Contains(resp.Header.Get("Content-Type"), "text/event-stream") {
 		rc := http.NewResponseController(w)
 		_ = readSSE(resp.Body, func(line []byte) error {
-			if _, err := w.Write(line); err != nil {
+			if _, err := w.Write(rewriteSSELine(line)); err != nil {
 				return err
 			}
 			if len(bytes.TrimSpace(line)) == 0 {
@@ -266,15 +335,17 @@ func (k *keeper) serveHTTP(w http.ResponseWriter, r *http.Request) {
 			return nil
 		}, func(data []byte) error { c.event(data); return nil })
 	} else {
-		body, _ := io.ReadAll(io.TeeReader(resp.Body, w))
+		body, _ := io.ReadAll(resp.Body)
 		if resp.StatusCode == http.StatusOK {
 			c.response(body)
+			body = rewriteResponseID(body)
 		}
+		_, _ = w.Write(body)
 	}
 	id := ""
 	if rid, output, ok := c.final(); ok && t.store {
-		k.store.put(rid, owner, append(t.input, output...))
-		id = rid
+		id = publicID(rid)
+		k.store.put(id, owner, append(t.input, output...))
 	}
 	logTurn("http", resp.StatusCode, hasPrev, id, start, k.store)
 }

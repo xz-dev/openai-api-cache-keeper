@@ -50,6 +50,9 @@ func (f *fakeUpstream) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	f.inputs = append(f.inputs, input)
 	f.n++
 	id := fmt.Sprintf("interaction_%d", f.n)
+	if model == "anthropic" {
+		id = fmt.Sprintf("msg_%d", f.n)
+	}
 	f.mu.Unlock()
 	reasoning := `{"type":"reasoning","id":"rs_` + id + `","encrypted_content":"opaque-` + id + `","summary":[]}`
 	message := fmt.Sprintf(`{"type":"message","role":"assistant","content":[{"type":"output_text","text":"seen %d"}]}`, len(input))
@@ -173,6 +176,27 @@ func TestHTTPDeltaContinuationAndRollback(t *testing.T) {
 	}
 	if got := strings.Join(kinds(up.last()), ","); got != "user:A,reasoning,assistant,user:C" {
 		t.Fatalf("rollback upstream input = %s", got)
+	}
+}
+
+func TestMessageStyleIDsArePublishedAsResponseIDs(t *testing.T) {
+	up, srv, _ := newTestKeeper(t)
+	_, body, _ := post(t, srv, "Bearer a", `{"model":"anthropic","input":"A","stream":true}`)
+	id := completedID(t, body)
+	if id != "resp_msg_1" || strings.Contains(body, `"id":"msg_1"`) {
+		t.Fatalf("stream id = %q body=%s", id, body)
+	}
+	status, body, _ := post(t, srv, "Bearer a", `{"model":"anthropic","input":"B","stream":false,"previous_response_id":"resp_msg_1"}`)
+	if status != 200 || !strings.Contains(body, `"id":"resp_msg_2"`) {
+		t.Fatalf("json continuation %d %s", status, body)
+	}
+	if got := strings.Join(kinds(up.last()), ","); got != "user:A,reasoning,assistant,user:B" {
+		t.Fatalf("upstream input = %s", got)
+	}
+	c := dialWS(t, srv, "Bearer a")
+	ev := wsCreate(t, c, `{"type":"response.create","model":"anthropic","input":"C","previous_response_id":"resp_msg_2"}`)
+	if responseID(ev) != "resp_msg_3" {
+		t.Fatalf("ws id = %v", ev)
 	}
 }
 

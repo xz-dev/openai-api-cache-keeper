@@ -20,7 +20,7 @@ For each request:
 
 1. If `previous_response_id` is set, the keeper looks it up, prepends the stored history to `input`, and removes the field. An unknown, expired, or foreign id returns `400` with `code: "previous_response_not_found"`. Clients can then retry once with the full history.
 2. The request is forwarded upstream with the caller's headers. The upstream status, headers, and body are relayed unchanged. Errors are not rewritten, truncated, retried, or put on a cooldown.
-3. When the upstream finishes with `status: completed` or `incomplete`, the keeper stores `input + output` under the upstream's response id.
+3. When the upstream finishes with `status: completed` or `incomplete`, the keeper stores `input + output` under the response id. Upstream ids that do not start with `resp_` (for example `msg_…` from Anthropic-style backends) are returned to the client as `resp_<id>` in SSE, JSON, and WebSocket frames, because some gateways only accept `resp_*` as `previous_response_id`.
 
 What is stored:
 
@@ -30,6 +30,10 @@ What is stored:
 - `store: false` requests are not stored. On a WebSocket, the most recent turn can still be continued on the same socket, like OpenAI's connection-local cache.
 
 Memory is bounded: entries expire `STORE_TTL` after creation, and the least recently used entries are evicted once `STORE_MAX_BYTES` is exceeded. Nothing is persisted. After a restart or an eviction, the next continuation returns `previous_response_not_found` and the client resends the full history once.
+
+### Behind Sub2API
+
+Point an OpenAI API-key account's `base_url` at the keeper and use WebSocket mode `ctx_pool`, not `passthrough`: passthrough does not bind response ids to the account, so a new socket drops `previous_response_id`. Also set `GATEWAY_OPENAI_WS_INGRESS_PREVIOUS_RESPONSE_RECOVERY_ENABLED=false`. Otherwise, when the keeper has lost an id, Sub2API silently retries without `previous_response_id` and the turn loses its context instead of returning `previous_response_not_found`.
 
 ### WebSocket mode
 
