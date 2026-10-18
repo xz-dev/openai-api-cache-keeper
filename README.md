@@ -27,7 +27,7 @@ What is stored:
 - Raw Responses items exactly as received or returned, including reasoning `encrypted_content`, `function_call`, and `function_call_output`. No format conversion is done.
 - Each entry is the full history up to that turn. Any stored id can be continued, so rolling back one or two steps is a normal continuation from an older id.
 - Entries are scoped to the SHA-256 of the `Authorization` header. If a gateway forwards one shared upstream key for every user, entries are not isolated per user.
-- `store: false` requests are not stored. On a WebSocket, the most recent turn can still be continued on the same socket, like OpenAI's connection-local cache.
+- `store: false` requests are not stored. On a WebSocket, the most recent turn can still be continued on the same socket, like OpenAI's connection-local cache. With `IGNORE_CLIENT_STORE_FALSE=true` they are stored (and returned with `store: true`) like any other turn, for clients such as Codex that always send `store: false` but should still recover after a reconnect.
 
 Memory is bounded: entries expire `STORE_TTL` after creation, and the least recently used entries are evicted once `STORE_MAX_BYTES` is exceeded. Nothing is persisted. After a restart or an eviction, the next continuation returns `previous_response_not_found` and the client resends the full history once.
 
@@ -49,6 +49,7 @@ Each text frame must be a `response.create` event; its body is handled like an H
 | `STORE_MAX_BYTES` | `134217728` | Byte budget for stored history (LRU eviction). |
 | `MAX_REQUEST_BYTES` | `33554432` | Maximum request body or WebSocket frame size. |
 | `REQUIRE_NO_DEFAULT_ROUTE` | `false` | Refuse to start while the network namespace has a default route. |
+| `IGNORE_CLIENT_STORE_FALSE` | `false` | Store turns even when the client sent `store: false`. |
 
 `/healthz` returns `200 ok`; `response-keeper healthcheck` probes it for container health checks.
 

@@ -320,6 +320,9 @@ func (k *keeper) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	owner := ownerOf(r)
 	hasPrev := doc["previous_response_id"] != nil
 	t, apiErr := prepare(doc, func(id string) ([]json.RawMessage, bool) { return k.store.get(id, owner) })
+	if t != nil && k.cfg.ignoreClientStoreFalse {
+		t.store = true
+	}
 	if apiErr != nil {
 		writeAPIError(w, apiErr)
 		logTurn("http", apiErr.status, hasPrev, "", start, k.store)

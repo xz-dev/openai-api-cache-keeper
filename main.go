@@ -27,6 +27,9 @@ type config struct {
 	maxStoreBytes         int64
 	maxRequestBytes       int64
 	requireNoDefaultRoute bool
+	// ignoreClientStoreFalse keeps turns even when the client sent store:false
+	// (e.g. Codex always does), so they can be continued on a new socket.
+	ignoreClientStoreFalse bool
 }
 
 func main() {
@@ -91,6 +94,11 @@ func loadConfig() (config, error) {
 	if v := os.Getenv("REQUIRE_NO_DEFAULT_ROUTE"); v != "" {
 		if cfg.requireNoDefaultRoute, err = strconv.ParseBool(v); err != nil {
 			return config{}, errors.New("REQUIRE_NO_DEFAULT_ROUTE must be true or false")
+		}
+	}
+	if v := os.Getenv("IGNORE_CLIENT_STORE_FALSE"); v != "" {
+		if cfg.ignoreClientStoreFalse, err = strconv.ParseBool(v); err != nil {
+			return config{}, errors.New("IGNORE_CLIENT_STORE_FALSE must be true or false")
 		}
 	}
 	return cfg, nil

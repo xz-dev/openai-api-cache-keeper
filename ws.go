@@ -87,6 +87,9 @@ func (k *keeper) wsTurn(ctx context.Context, conn *websocket.Conn, header http.H
 	if apiErr != nil {
 		return "", nil, wsError(ctx, conn, apiErr), hasPrev
 	}
+	if k.cfg.ignoreClientStoreFalse {
+		t.store = true
+	}
 	resp, err := k.forward(ctx, "/v1/responses", header, t.body)
 	if err != nil {
 		return "", nil, wsError(ctx, conn, &apiError{status: http.StatusBadGateway, typ: "upstream_error", message: "upstream request failed"}), hasPrev

@@ -79,13 +79,17 @@ func (f *fakeUpstream) last() []json.RawMessage {
 	return f.inputs[len(f.inputs)-1]
 }
 
-func newTestKeeper(t *testing.T) (*fakeUpstream, *httptest.Server, *keeper) {
+func newTestKeeper(t *testing.T, opts ...func(*config)) (*fakeUpstream, *httptest.Server, *keeper) {
 	t.Helper()
 	up := &fakeUpstream{}
 	upSrv := httptest.NewServer(up)
 	t.Cleanup(upSrv.Close)
 	u, _ := url.Parse(upSrv.URL)
-	k := newKeeper(config{upstream: u, ttl: time.Minute, maxStoreBytes: 1 << 20, maxRequestBytes: 1 << 20})
+	cfg := config{upstream: u, ttl: time.Minute, maxStoreBytes: 1 << 20, maxRequestBytes: 1 << 20}
+	for _, opt := range opts {
+		opt(&cfg)
+	}
+	k := newKeeper(cfg)
 	srv := httptest.NewServer(k)
 	t.Cleanup(srv.Close)
 	return up, srv, k
@@ -400,5 +404,48 @@ func TestStoredTurnsAreDeclaredStored(t *testing.T) {
 	ev = wsCreate(t, c, `{"type":"response.create","model":"m","input":"B","store":false}`)
 	if resp, _ := ev["response"].(map[string]any); resp["store"] != false {
 		t.Fatalf("ws store:false = %v", ev)
+	}
+}
+
+// IGNORE_CLIENT_STORE_FALSE: store:false turns (Codex) are kept, continuable on a
+// new socket or over HTTP, and declared stored to the client.
+func TestIgnoreClientStoreFalse(t *testing.T) {
+	up, srv, k := newTestKeeper(t, func(c *config) { c.ignoreClientStoreFalse = true })
+	_, body, _ := post(t, srv, "Bearer a", `{"model":"m","input":"A","stream":true,"store":false}`)
+	id1 := completedID(t, body)
+	if got := completedStore(t, body); got != true {
+		t.Fatalf("http store = %v", got)
+	}
+	if n, _ := k.store.stats(); n != 1 {
+		t.Fatalf("stored entries = %d", n)
+	}
+	c1 := dialWS(t, srv, "Bearer a")
+	ev := wsCreate(t, c1, `{"type":"response.create","model":"m","input":"B","store":false,"previous_response_id":"`+id1+`"}`)
+	if resp, _ := ev["response"].(map[string]any); ev["type"] != "response.completed" || resp["store"] != true {
+		t.Fatalf("ws continuation = %v", ev)
+	}
+	c1.Close(websocket.StatusNormalClosure, "")
+	c2 := dialWS(t, srv, "Bearer a")
+	ev = wsCreate(t, c2, `{"type":"response.create","model":"m","input":"C","store":false,"previous_response_id":"`+responseID(ev)+`"}`)
+	if ev["type"] != "response.completed" {
+		t.Fatalf("new-socket continuation = %v", ev)
+	}
+	if got := strings.Join(kinds(up.last()), ","); got != "user:A,reasoning,assistant,user:B,reasoning,assistant,user:C" {
+		t.Fatalf("new-socket input = %s", got)
+	}
+}
+
+func TestLoadConfigIgnoreClientStoreFalse(t *testing.T) {
+	t.Setenv("UPSTREAM_URL", "http://upstream:8080")
+	for _, tc := range []struct {
+		value string
+		want  bool
+		err   bool
+	}{{"", false, false}, {"false", false, false}, {"true", true, false}, {"1", true, false}, {"yes", false, true}} {
+		t.Setenv("IGNORE_CLIENT_STORE_FALSE", tc.value)
+		cfg, err := loadConfig()
+		if (err != nil) != tc.err || (err == nil && cfg.ignoreClientStoreFalse != tc.want) {
+			t.Fatalf("%q: cfg=%v err=%v", tc.value, cfg.ignoreClientStoreFalse, err)
+		}
 	}
 }
