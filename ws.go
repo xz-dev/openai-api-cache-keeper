@@ -100,7 +100,7 @@ func (k *keeper) wsTurn(ctx context.Context, conn *websocket.Conn, header http.H
 	var c collector
 	err = readSSE(resp.Body, nil, func(event []byte) error {
 		c.event(event)
-		return conn.Write(ctx, websocket.MessageText, rewriteResponseID(event))
+		return conn.Write(ctx, websocket.MessageText, rewriteResponse(event, t.store))
 	})
 	if err != nil {
 		log.Printf("ws relay ended early: %v", err)

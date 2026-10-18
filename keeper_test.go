@@ -56,7 +56,8 @@ func (f *fakeUpstream) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	f.mu.Unlock()
 	reasoning := `{"type":"reasoning","id":"rs_` + id + `","encrypted_content":"opaque-` + id + `","summary":[]}`
 	message := fmt.Sprintf(`{"type":"message","role":"assistant","content":[{"type":"output_text","text":"seen %d"}]}`, len(input))
-	response := `{"id":"` + id + `","object":"response","status":"completed","output":[` + reasoning + `,` + message + `]}`
+	// Like the production stateless upstream: it reports store:false regardless of the request.
+	response := `{"id":"` + id + `","object":"response","status":"completed","store":false,"output":[` + reasoning + `,` + message + `]}`
 	var stream bool
 	_ = json.Unmarshal(doc["stream"], &stream)
 	if !stream {
@@ -347,5 +348,57 @@ func TestReadSSEMultilineAndDone(t *testing.T) {
 	})
 	if len(got) != 1 || got[0] != "{\"a\":\n1}" {
 		t.Fatalf("got %q", got)
+	}
+}
+
+func storeOf(t *testing.T, payload string) any {
+	t.Helper()
+	var doc map[string]any
+	if err := json.Unmarshal([]byte(payload), &doc); err != nil {
+		t.Fatalf("payload %q: %v", payload, err)
+	}
+	if resp, ok := doc["response"].(map[string]any); ok {
+		return resp["store"]
+	}
+	return doc["store"]
+}
+
+func completedStore(t *testing.T, sse string) any {
+	t.Helper()
+	var store any = "missing"
+	_ = readSSE(strings.NewReader(sse), nil, func(data []byte) error {
+		if strings.Contains(string(data), `"type":"response.completed"`) {
+			store = storeOf(t, string(data))
+		}
+		return nil
+	})
+	return store
+}
+
+// The keeper is the store: a turn it keeps is declared store:true to the client
+// even though the stateless upstream reported store:false; a store:false
+// request keeps the upstream value.
+func TestStoredTurnsAreDeclaredStored(t *testing.T) {
+	_, srv, _ := newTestKeeper(t)
+	_, body, _ := post(t, srv, "Bearer a", `{"model":"m","input":"A","stream":true}`)
+	if got := completedStore(t, body); got != true {
+		t.Fatalf("sse store = %v", got)
+	}
+	_, body, _ = post(t, srv, "Bearer a", `{"model":"m","input":"A","stream":false}`)
+	if got := storeOf(t, body); got != true {
+		t.Fatalf("json store = %v", got)
+	}
+	_, body, _ = post(t, srv, "Bearer a", `{"model":"m","input":"A","stream":true,"store":false}`)
+	if got := completedStore(t, body); got != false {
+		t.Fatalf("store:false sse store = %v", got)
+	}
+	c := dialWS(t, srv, "Bearer a")
+	ev := wsCreate(t, c, `{"type":"response.create","model":"m","input":"A"}`)
+	if resp, _ := ev["response"].(map[string]any); resp["store"] != true {
+		t.Fatalf("ws store = %v", ev)
+	}
+	ev = wsCreate(t, c, `{"type":"response.create","model":"m","input":"B","store":false}`)
+	if resp, _ := ev["response"].(map[string]any); resp["store"] != false {
+		t.Fatalf("ws store:false = %v", ev)
 	}
 }

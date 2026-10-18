@@ -20,7 +20,7 @@ For each request:
 
 1. If `previous_response_id` is set, the keeper looks it up, prepends the stored history to `input`, and removes the field. An unknown, expired, or foreign id returns `400` with `code: "previous_response_not_found"`. Clients can then retry once with the full history.
 2. The request is forwarded upstream with the caller's headers. The upstream status, headers, and body are relayed unchanged. Errors are not rewritten, truncated, retried, or put on a cooldown.
-3. When the upstream finishes with `status: completed` or `incomplete`, the keeper stores `input + output` under the response id. Upstream ids that do not start with `resp_` (for example `msg_…` from Anthropic-style backends) are returned to the client as `resp_<id>` in SSE, JSON, and WebSocket frames, because some gateways only accept `resp_*` as `previous_response_id`.
+3. When the upstream finishes with `status: completed` or `incomplete`, the keeper stores `input + output` under the response id. Upstream ids that do not start with `resp_` (for example `msg_…` from Anthropic-style backends) are returned to the client as `resp_<id>` in SSE, JSON, and WebSocket frames, because some gateways only accept `resp_*` as `previous_response_id`. For a turn the keeper stores, the response object is returned with `store: true`, even when the stateless upstream reported `store: false`: the keeper is the store, and clients use that field to decide whether the response id can be continued later. `store: false` requests keep the upstream value.
 
 What is stored:
 

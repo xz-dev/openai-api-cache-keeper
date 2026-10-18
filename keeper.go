@@ -213,9 +213,11 @@ func publicID(id string) string {
 	return "resp_" + id
 }
 
-// rewriteResponseID applies publicID to the response object of one event or
-// JSON body. Payloads that need no change are returned unchanged.
-func rewriteResponseID(payload []byte) []byte {
+// rewriteResponse applies publicID to the response object of one event or JSON
+// body and, when the keeper stores the turn, declares store:true: the keeper is
+// the store, whatever the stateless upstream reported. Payloads that need no
+// change are returned unchanged.
+func rewriteResponse(payload []byte, stored bool) []byte {
 	if !bytes.Contains(payload, []byte(`"id"`)) {
 		return payload
 	}
@@ -224,7 +226,7 @@ func rewriteResponseID(payload []byte) []byte {
 		return payload
 	}
 	if nested, ok := doc["response"]; ok {
-		if fixed, changed := rewriteObjectID(nested); changed {
+		if fixed, changed := rewriteObject(nested, stored); changed {
 			doc["response"] = fixed
 			if out, err := json.Marshal(doc); err == nil {
 				return out
@@ -233,23 +235,34 @@ func rewriteResponseID(payload []byte) []byte {
 		return payload
 	}
 	if string(doc["object"]) == `"response"` {
-		if fixed, changed := rewriteObjectID(payload); changed {
+		if fixed, changed := rewriteObject(payload, stored); changed {
 			return fixed
 		}
 	}
 	return payload
 }
 
-func rewriteObjectID(raw json.RawMessage) (json.RawMessage, bool) {
+func rewriteObject(raw json.RawMessage, stored bool) (json.RawMessage, bool) {
 	var obj map[string]json.RawMessage
 	if json.Unmarshal(raw, &obj) != nil {
 		return raw, false
 	}
 	var id string
-	if json.Unmarshal(obj["id"], &id) != nil || id == "" || publicID(id) == id {
+	if json.Unmarshal(obj["id"], &id) != nil || id == "" {
 		return raw, false
 	}
-	obj["id"], _ = json.Marshal(publicID(id))
+	changed := false
+	if publicID(id) != id {
+		obj["id"], _ = json.Marshal(publicID(id))
+		changed = true
+	}
+	if stored && string(obj["store"]) != "true" {
+		obj["store"] = json.RawMessage("true")
+		changed = true
+	}
+	if !changed {
+		return raw, false
+	}
 	out, err := json.Marshal(obj)
 	if err != nil {
 		return raw, false
@@ -257,15 +270,15 @@ func rewriteObjectID(raw json.RawMessage) (json.RawMessage, bool) {
 	return out, true
 }
 
-// rewriteSSELine applies rewriteResponseID to a single-line SSE data field.
-func rewriteSSELine(line []byte) []byte {
+// rewriteSSELine applies rewriteResponse to a single-line SSE data field.
+func rewriteSSELine(line []byte, stored bool) []byte {
 	if !bytes.HasPrefix(line, []byte("data:")) {
 		return line
 	}
 	body := bytes.TrimRight(line[5:], "\r\n")
 	ending := line[5+len(body):]
 	payload := bytes.TrimPrefix(body, []byte(" "))
-	fixed := rewriteResponseID(payload)
+	fixed := rewriteResponse(payload, stored)
 	if len(fixed) == len(payload) && bytes.Equal(fixed, payload) {
 		return line
 	}
@@ -326,7 +339,7 @@ func (k *keeper) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	if resp.StatusCode == http.StatusOK && strings.Contains(resp.Header.Get("Content-Type"), "text/event-stream") {
 		rc := http.NewResponseController(w)
 		_ = readSSE(resp.Body, func(line []byte) error {
-			if _, err := w.Write(rewriteSSELine(line)); err != nil {
+			if _, err := w.Write(rewriteSSELine(line, t.store)); err != nil {
 				return err
 			}
 			if len(bytes.TrimSpace(line)) == 0 {
@@ -338,7 +351,7 @@ func (k *keeper) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(resp.Body)
 		if resp.StatusCode == http.StatusOK {
 			c.response(body)
-			body = rewriteResponseID(body)
+			body = rewriteResponse(body, t.store)
 		}
 		_, _ = w.Write(body)
 	}
