@@ -26,6 +26,10 @@ type config struct {
 	ttl                   time.Duration
 	maxStoreBytes         int64
 	maxRequestBytes       int64
+	storeDir              string
+	storeMetaBytes        int64
+	storePinBytes         int64
+	storeCompactBytes     int64
 	requireNoDefaultRoute bool
 	// ignoreClientStoreFalse keeps turns even when the client sent store:false
 	// (e.g. Codex always does), so they can be continued on a new socket.
@@ -89,6 +93,19 @@ func loadConfig() (config, error) {
 		return config{}, err
 	}
 	if cfg.maxRequestBytes, err = envPositiveInt("MAX_REQUEST_BYTES", 32<<20); err != nil {
+		return config{}, err
+	}
+	cfg.storeDir = os.Getenv("STORE_DIR")
+	if cfg.storeDir == "" {
+		cfg.storeDir = "/var/tmp/response-keeper"
+	}
+	if cfg.storeMetaBytes, err = envPositiveInt("STORE_META_MAX_BYTES", 32<<20); err != nil {
+		return config{}, err
+	}
+	if cfg.storePinBytes, err = envPositiveInt("STORE_PIN_MAX_BYTES", 64<<20); err != nil {
+		return config{}, err
+	}
+	if cfg.storeCompactBytes, err = envPositiveInt("STORE_COMPACT_BYTES", 320<<20); err != nil {
 		return config{}, err
 	}
 	if v := os.Getenv("REQUIRE_NO_DEFAULT_ROUTE"); v != "" {

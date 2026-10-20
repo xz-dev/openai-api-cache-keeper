@@ -85,13 +85,15 @@ func newTestKeeper(t *testing.T, opts ...func(*config)) (*fakeUpstream, *httptes
 	upSrv := httptest.NewServer(up)
 	t.Cleanup(upSrv.Close)
 	u, _ := url.Parse(upSrv.URL)
-	cfg := config{upstream: u, ttl: time.Minute, maxStoreBytes: 1 << 20, maxRequestBytes: 1 << 20}
+	cfg := config{upstream: u, ttl: time.Minute, maxStoreBytes: 1 << 20, maxRequestBytes: 1 << 20,
+		storeDir: t.TempDir(), storeMetaBytes: 1 << 20, storePinBytes: 1 << 20, storeCompactBytes: 4 << 20}
 	for _, opt := range opts {
 		opt(&cfg)
 	}
 	k := newKeeper(cfg)
 	srv := httptest.NewServer(k)
 	t.Cleanup(srv.Close)
+	t.Cleanup(func() { _ = k.store.close() })
 	return up, srv, k
 }
 
@@ -319,21 +321,27 @@ func TestWSUpstreamErrorFrame(t *testing.T) {
 }
 
 func TestStoreTTLAndByteBudget(t *testing.T) {
-	s := newStore(time.Minute, 10)
+	s, err := newStore(t.TempDir(), time.Minute, 10, 1<<20, 1<<20, 4<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = s.close() })
 	now := time.Unix(0, 0)
 	s.now = func() time.Time { return now }
 	owner := [32]byte{1}
-	s.put("a", owner, []json.RawMessage{json.RawMessage(`"1234"`)}) // 6 bytes
-	s.put("b", owner, []json.RawMessage{json.RawMessage(`"1234"`)}) // 12 > 10: evicts a
+	s.put("a", owner, "", []json.RawMessage{json.RawMessage(`"1234"`)}) // 6 bytes
+	s.put("b", owner, "", []json.RawMessage{json.RawMessage(`"1236"`)}) // 6 more: 12 > 10 evicts a
 	if _, ok := s.get("a", owner); ok {
 		t.Fatal("a should be evicted by the byte budget")
 	}
 	if _, ok := s.get("b", owner); !ok {
 		t.Fatal("b should be kept")
 	}
-	s.put("huge", owner, []json.RawMessage{json.RawMessage(`"this is far too large"`)})
+	if _, err := s.put("huge", owner, "", []json.RawMessage{json.RawMessage(`"this is far too large"`)}); err == nil {
+		t.Fatal("entry larger than the budget must be refused")
+	}
 	if _, ok := s.get("huge", owner); ok {
-		t.Fatal("entry larger than the budget must not be stored")
+		t.Fatal("refused entry must not be readable")
 	}
 	now = now.Add(time.Minute)
 	if _, ok := s.get("b", owner); ok {
