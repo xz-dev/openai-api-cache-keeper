@@ -228,7 +228,7 @@ func TestTruncatedWSTurnPreservesAcceptedPin(t *testing.T) {
 	first := wsCreate(t, conn, `{"type":"response.create","input":"A","store":false}`)
 	id := responseID(first)
 	failed := wsCreate(t, conn, fmt.Sprintf(`{"type":"response.create","input":"BAD-TURN","previous_response_id":%q}`, id))
-	if failed["type"] != "error" {
+	if _, ok := failureCode(failed); !ok {
 		t.Fatalf("truncated turn succeeded: %v", failed)
 	}
 	next := wsCreate(t, conn, fmt.Sprintf(`{"type":"response.create","input":"C","store":false,"previous_response_id":%q}`, id))

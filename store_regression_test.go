@@ -1,8 +1,13 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"strings"
 	"sync"
 	"testing"
@@ -142,25 +147,30 @@ func TestReviewStoreFalseThreeTurns(t *testing.T) {
 		}
 	}
 }
-func TestReviewStoreRefusalVisibleHTTP(t *testing.T) {
+
+// Store refusal is a cache miss, not a request failure: the turn is served,
+// not advertised as stored, and its id is not continuable.
+func TestReviewStoreRefusalServesUncachedHTTP(t *testing.T) {
 	_, srv, _ := newTestKeeper(t, func(c *config) { c.maxStoreBytes = 1 })
 	for _, stream := range []bool{false, true} {
 		status, body, _ := post(t, srv, "Bearer visible-refusal", fmt.Sprintf(`{"input":"A","stream":%v}`, stream))
-		if !strings.Contains(body, "history_storage_failed") || strings.Contains(body, `"status":"completed"`) || strings.Contains(body, "event: response.completed") {
-			t.Fatalf("stream=%v false/missing failure: %d %s", stream, status, body)
+		if status != 200 || strings.Contains(body, "history_storage_failed") || !strings.Contains(body, `"status":"completed"`) || terminalStored(t, body) {
+			t.Fatalf("stream=%v not served uncached: %d %s", stream, status, body)
 		}
-		if !stream && status != 503 {
-			t.Fatalf("JSON storage failure status=%d", status)
+		id := "resp_interaction_1"
+		if stream {
+			id = "resp_interaction_2"
+		}
+		status, body, _ = post(t, srv, "Bearer visible-refusal", fmt.Sprintf(`{"input":"B","previous_response_id":%q}`, id))
+		if status != 400 || !strings.Contains(body, "previous_response_not_found") {
+			t.Fatalf("uncached id must not be continuable: %d %s", status, body)
 		}
 	}
 }
-func TestReviewStoreRefusalVisibleWS(t *testing.T) {
+func TestReviewStoreRefusalServesUncachedWS(t *testing.T) {
 	_, srv, _ := newTestKeeper(t, func(c *config) { c.storePinBytes = 1 })
 	c := dialWS(t, srv, "Bearer pin-refusal-owner")
-	ev := wsCreate(t, c, `{"type":"response.create","input":"A","store":false}`)
-	if ev["type"] != "error" || ev["error"].(map[string]any)["code"] != "history_storage_failed" {
-		t.Fatalf("pin refusal not visible: %v", ev)
-	}
+	assertServedUncached(t, wsCreate(t, c, `{"type":"response.create","input":"A","store":false}`))
 }
 func reopenReadOnly(t *testing.T, s *store) {
 	t.Helper()
@@ -241,4 +251,51 @@ func TestReviewConcurrentCompactionAndLookup(t *testing.T) {
 	wg.Wait()
 	roundtrip(t, s, "stable", o, []string{`"A"`})
 	inspectStore(t, s)
+}
+
+// A keeper-side failure after the upstream started a response must end that
+// response in protocol terms (response.failed with the same public id), so any
+// client or gateway in front sees the turn terminate; the socket stays usable.
+func TestStartedTurnFailureIsTerminalResponseFailed(t *testing.T) {
+	fake := &fakeUpstream{}
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		if bytes.Contains(body, []byte("CUT")) {
+			w.Header().Set("Content-Type", "text/event-stream")
+			io.WriteString(w, `data: {"type":"response.created","response":{"id":"interaction_cut","status":"in_progress","output":[]}}`+"\n\n")
+			return // stream ends before any terminal event
+		}
+		r.Body = io.NopCloser(bytes.NewReader(body))
+		fake.ServeHTTP(w, r)
+	}))
+	defer up.Close()
+	u, _ := url.Parse(up.URL)
+	_, srv, _ := newTestKeeper(t, func(c *config) { c.upstream = u })
+	c := dialWS(t, srv, "Bearer terminal-failure")
+	ev := wsCreate(t, c, `{"type":"response.create","input":"CUT"}`)
+	resp, _ := ev["response"].(map[string]any)
+	if ev["type"] != "response.failed" || resp["status"] != "failed" || resp["id"] != "resp_interaction_cut" {
+		t.Fatalf("started turn not terminated with response.failed: %v", ev)
+	}
+	if ev := wsCreate(t, c, `{"type":"response.create","input":"B"}`); ev["type"] != "response.completed" {
+		t.Fatalf("socket unusable after terminal failure: %v", ev)
+	}
+	_, body, _ := post(t, srv, "Bearer terminal-failure", `{"input":"CUT","stream":true}`)
+	if !strings.Contains(body, "event: response.failed\ndata: ") || !strings.Contains(body, `"resp_interaction_cut"`) || strings.Contains(body, "event: error") {
+		t.Fatalf("SSE started turn not terminated with response.failed: %s", body)
+	}
+}
+
+// A failure before the upstream started any response stays a request error.
+func TestUnstartedTurnFailureIsRequestError(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		io.WriteString(w, `data: {"type":"response.output_text.delta","delta":"x"}`+"\n\n")
+	}))
+	defer up.Close()
+	u, _ := url.Parse(up.URL)
+	_, srv, _ := newTestKeeper(t, func(c *config) { c.upstream = u })
+	if ev := wsCreate(t, dialWS(t, srv, "Bearer unstarted"), `{"type":"response.create","input":"A"}`); ev["type"] != "error" {
+		t.Fatalf("unstarted failure must be a request error: %v", ev)
+	}
 }

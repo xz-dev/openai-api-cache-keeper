@@ -157,16 +157,16 @@ func (k *keeper) wsTurn(ctx context.Context, conn *websocket.Conn, header http.H
 	defer c.release(k.work)
 	id := ""
 	status := resp.StatusCode
-	var acceptError *apiError
-	accept := func() error {
+	accept := func() (bool, error) {
 		if rid, output, ok := c.final(); ok && id == "" {
 			if err := ctx.Err(); err != nil {
-				return err
+				return false, err
 			}
 			pin, err := k.acceptDisk(ctx, t, publicID(rid), owner, output, sess.lastPin, true)
 			if err != nil {
-				acceptError = storageError()
-				return err
+				// The previous pin stays intact; only this turn is not continuable.
+				logNotRetained(err)
+				return false, nil
 			}
 			// accept replaced the old pin atomically. Failure leaves it intact.
 			id = publicID(rid)
@@ -177,7 +177,7 @@ func (k *keeper) wsTurn(ctx context.Context, conn *websocket.Conn, header http.H
 				}
 			}
 		}
-		return nil
+		return true, nil
 	}
 	err = readSSE(resp.Body, nil, func(event []byte) error {
 		wire, release, err := k.responseFrame(ctx, &c, event, true, t.store, accept)
@@ -188,19 +188,26 @@ func (k *keeper) wsTurn(ctx context.Context, conn *websocket.Conn, header http.H
 		return conn.Write(ctx, websocket.MessageText, wire)
 	}, k.work)
 	if err == nil && !c.done && ctx.Err() == nil {
-		status = wsError(ctx, conn, &apiError{status: 502, typ: "upstream_error", message: "upstream stream ended before terminal response"})
+		status = wsFailure(ctx, conn, c.responseID(), &apiError{status: 502, typ: "upstream_error", message: "upstream stream ended before terminal response"})
 	}
 	if err != nil {
 		log.Printf("ws relay ended early: %v", err)
 		if ctx.Err() == nil && status == http.StatusOK && id == "" {
-			failure := responseError(err)
-			if acceptError != nil {
-				failure = acceptError
-			}
-			status = wsError(ctx, conn, failure)
+			status = wsFailure(ctx, conn, c.responseID(), responseError(err))
 		}
 	}
 	return id, status, hasPrev
+}
+
+// wsFailure ends a started response with response.failed; otherwise it is a
+// request-level error frame. The socket stays open for the next turn.
+func wsFailure(ctx context.Context, conn *websocket.Conn, started string, e *apiError) int {
+	if started == "" {
+		return wsError(ctx, conn, e)
+	}
+	frame, _ := json.Marshal(failureEvent(started, e))
+	_ = conn.Write(ctx, websocket.MessageText, frame)
+	return e.status
 }
 
 func wsError(ctx context.Context, conn *websocket.Conn, e *apiError) int {

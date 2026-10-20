@@ -212,7 +212,7 @@ func TestOutputBoundsAndIncompleteStreamExplicit(t *testing.T) {
 			}
 			c := dialWS(t, srv, "Bearer output")
 			ev := wsCreate(t, c, `{"type":"response.create","input":"A"}`)
-			if ev["type"] != "error" {
+			if _, ok := failureCode(ev); !ok {
 				t.Fatalf("WS false terminal: %v", ev)
 			}
 		})

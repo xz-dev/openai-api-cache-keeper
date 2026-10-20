@@ -118,7 +118,5 @@ func TestReviewRegisteredPutFailureVisibleWS(t *testing.T) {
 	_, srv, _ := newTestKeeper(t, func(c *config) { c.maxStoreBytes = 1 })
 	c := dialWS(t, srv, "Bearer registered-refusal")
 	ev := wsCreate(t, c, `{"type":"response.create","input":"A"}`)
-	if ev["type"] != "error" || ev["error"].(map[string]any)["code"] != "history_storage_failed" {
-		t.Fatalf("WS storage failure not visible: %v", ev)
-	}
+	assertServedUncached(t, ev)
 }

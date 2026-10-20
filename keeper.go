@@ -92,8 +92,22 @@ func writeAPIError(w http.ResponseWriter, e *apiError) {
 	_ = json.NewEncoder(w).Encode(map[string]any{"error": e.object()})
 }
 
-func storageError() *apiError {
-	return &apiError{status: http.StatusServiceUnavailable, typ: "server_error", code: "history_storage_failed", message: "Turn history could not be retained; previous accepted history is unchanged."}
+// failureEvent reports a keeper-side turn failure in Responses protocol terms:
+// a request-level error before any response exists, otherwise the terminal
+// response.failed, so every client sees the started response end.
+func failureEvent(started string, e *apiError) map[string]any {
+	if started == "" {
+		return map[string]any{"type": "error", "error": e.object()}
+	}
+	return map[string]any{"type": "response.failed", "response": map[string]any{
+		"id": publicID(started), "object": "response", "status": "failed", "output": []any{}, "error": e.object(),
+	}}
+}
+
+// The cache is an optimization: a turn whose history cannot be retained is
+// still served, only without a continuable id.
+func logNotRetained(err error) {
+	log.Printf("history not retained; turn served uncached: %v", err)
 }
 
 func ownerOf(r *http.Request) [32]byte { return sha256.Sum256([]byte(r.Header.Get("Authorization"))) }
@@ -163,9 +177,19 @@ type collector struct {
 	charged int64
 	items   []json.RawMessage // response.output_item.done, by output_index
 	id      string
+	started string // id from response.created/in_progress
 	status  string
 	output  []json.RawMessage
 	done    bool
+}
+
+// responseID is the upstream id of the response this turn produced, if any;
+// response.created is optional, so a collected terminal id also counts.
+func (c *collector) responseID() string {
+	if c.id != "" {
+		return c.id
+	}
+	return c.started
 }
 
 // final returns the response id and output items when the turn may be continued.
@@ -267,19 +291,18 @@ func (k *keeper) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	var c collector
 	defer c.release(k.work)
 	id := ""
-	var acceptError *apiError
-	accept := func() error {
+	accept := func() (bool, error) {
 		if rid, output, ok := c.final(); ok && t.store && id == "" {
 			if err := r.Context().Err(); err != nil {
-				return err
+				return false, err
 			}
 			if _, err := k.acceptDisk(r.Context(), t, publicID(rid), owner, output, "", false); err != nil {
-				acceptError = storageError()
-				return err
+				logNotRetained(err)
+				return false, nil
 			}
 			id = publicID(rid)
 		}
-		return nil
+		return true, nil
 	}
 	if resp.StatusCode == http.StatusOK && strings.Contains(resp.Header.Get("Content-Type"), "text/event-stream") {
 		w.WriteHeader(resp.StatusCode)
@@ -306,12 +329,9 @@ func (k *keeper) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			log.Printf("http relay ended early: %v", err)
 			if r.Context().Err() == nil && id == "" {
-				failure := responseError(err)
-				if acceptError != nil {
-					failure = acceptError
-				}
-				payload, _ := json.Marshal(map[string]any{"type": "error", "error": failure.object()})
-				_, _ = fmt.Fprintf(w, "event: error\ndata: %s\n\n", payload)
+				event := failureEvent(c.responseID(), responseError(err))
+				payload, _ := json.Marshal(event)
+				_, _ = fmt.Fprintf(w, "event: %s\ndata: %s\n\n", event["type"], payload)
 				_ = rc.Flush()
 			}
 		}
@@ -329,11 +349,7 @@ func (k *keeper) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		defer body.close()
 		wire, release, err := k.responseFrame(r.Context(), &c, body.data, false, t.store, accept)
 		if err != nil {
-			failure := responseError(err)
-			if acceptError != nil {
-				failure = acceptError
-			}
-			writeAPIError(w, failure)
+			writeAPIError(w, responseError(err))
 			return
 		}
 		defer release()

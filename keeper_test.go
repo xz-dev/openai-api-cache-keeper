@@ -267,10 +267,75 @@ func wsCreate(t *testing.T, conn *websocket.Conn, frame string) map[string]any {
 		if err := json.Unmarshal(data, &ev); err != nil {
 			t.Fatalf("non-JSON frame %q", data)
 		}
-		if ev["type"] == "response.completed" || ev["type"] == "error" {
+		switch ev["type"] {
+		case "response.completed", "response.incomplete", "response.failed", "error":
 			return ev
 		}
 	}
+}
+
+// assertServedUncached checks the fail-open storage contract: the turn still
+// completes, but is not advertised as stored (so clients will not continue it).
+func assertServedUncached(t *testing.T, ev map[string]any) {
+	t.Helper()
+	resp, _ := ev["response"].(map[string]any)
+	if ev["type"] != "response.completed" || resp["store"] == true {
+		t.Fatalf("storage failure must serve the turn uncached: %v", ev)
+	}
+}
+
+// terminalStored reports whether the terminal response in a JSON or SSE body
+// is advertised as stored; the terminal value is authoritative because earlier
+// stream events precede the storage decision.
+func terminalStored(t *testing.T, body string) bool {
+	t.Helper()
+	var stored *bool
+	check := func(raw []byte) {
+		var ev struct {
+			Type     string          `json:"type"`
+			Store    *bool           `json:"store"`
+			Response json.RawMessage `json:"response"`
+		}
+		if json.Unmarshal(raw, &ev) != nil {
+			return
+		}
+		if ev.Type == "response.completed" {
+			var resp struct {
+				Store *bool `json:"store"`
+			}
+			_ = json.Unmarshal(ev.Response, &resp)
+			v := resp.Store != nil && *resp.Store
+			stored = &v
+		} else if ev.Type == "" {
+			v := ev.Store != nil && *ev.Store
+			stored = &v
+		}
+	}
+	if strings.HasPrefix(strings.TrimSpace(body), "{") {
+		check([]byte(body))
+	} else {
+		_ = readSSE(strings.NewReader(body), nil, func(data []byte) error { check(data); return nil })
+	}
+	if stored == nil {
+		t.Fatalf("no terminal response in %q", body)
+	}
+	return *stored
+}
+
+// failureCode returns the error code of a request error or a response.failed
+// terminal event; ok is false for any other event.
+func failureCode(ev map[string]any) (string, bool) {
+	obj := ev
+	switch ev["type"] {
+	case "error":
+	case "response.failed":
+		obj, _ = ev["response"].(map[string]any)
+	default:
+		return "", false
+	}
+	errObj, _ := obj["error"].(map[string]any)
+	code, _ := errObj["code"].(string)
+	return code, true
 }
 
 func responseID(ev map[string]any) string {

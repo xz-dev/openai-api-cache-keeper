@@ -37,16 +37,14 @@ func TestWSPrivateTTLTransitionAndFailedReplacement(t *testing.T) {
 			if foreign["type"] != "error" {
 				t.Fatal("private history leaked across sockets")
 			}
-			// Existing accepted pin fits; another result cannot. Failure must preserve
-			// that pin and must not publish a store:true alias as a partial transaction.
+			// Existing accepted pin fits; another result cannot. The turn is served
+			// uncached; the old pin is preserved and no partial alias is published.
 			_, _, pinned, _, _ := inspectStore(t, k.store)
 			k.store.mu.Lock()
 			k.store.pinMax = pinned
 			k.store.mu.Unlock()
 			rejected := wsCreate(t, c, fmt.Sprintf(`{"type":"response.create","input":"FAIL","store":%v,"previous_response_id":%q}`, failRegistered, id))
-			if rejected["type"] != "error" || rejected["error"].(map[string]any)["code"] != "history_storage_failed" {
-				t.Fatalf("replacement not rejected explicitly: %v", rejected)
-			}
+			assertServedUncached(t, rejected)
 			inspectStore(t, k.store)
 			k.store.mu.Lock()
 			k.store.pinMax = 1 << 20
@@ -88,9 +86,7 @@ func TestStorageTransactionFailureVisibleOnAllTransports(t *testing.T) {
 				previous = responseID(ev)
 				reopenReadOnly(t, k.store)
 				ev = wsCreate(t, c, fmt.Sprintf(`{"type":"response.create","input":"B","previous_response_id":%q}`, previous))
-				if ev["type"] != "error" || ev["error"].(map[string]any)["code"] != "history_storage_failed" {
-					t.Fatalf("I/O failure success: %v", ev)
-				}
+				assertServedUncached(t, ev)
 				// Pin still exists and is charged; unlike expired aliases, no TTL applies.
 				_, _, pinned, _, _ := inspectStore(t, k.store)
 				if pinned == 0 {
@@ -123,11 +119,8 @@ func TestStorageTransactionFailureVisibleOnAllTransports(t *testing.T) {
 			previous = first["id"].(string)
 			reopenReadOnly(t, k.store)
 			status, body, _ := post(t, srv, "Bearer transaction", fmt.Sprintf(`{"input":"B","stream":%v,"previous_response_id":%q}`, transport == "sse", previous))
-			if !strings.Contains(body, "history_storage_failed") || strings.Contains(body, `"status":"completed"`) {
-				t.Fatalf("false terminal success: %d %s", status, body)
-			}
-			if transport == "json" && status != 503 {
-				t.Fatalf("status=%d", status)
+			if status != 200 || !strings.Contains(body, `"status":"completed"`) || terminalStored(t, body) || strings.Contains(body, "history_storage_failed") {
+				t.Fatalf("storage failure must serve the turn uncached: %d %s", status, body)
 			}
 			owner := ownerOf(&http.Request{Header: http.Header{"Authorization": []string{"Bearer transaction"}}})
 			if _, ok := k.store.get(previous, owner); !ok {
@@ -138,7 +131,7 @@ func TestStorageTransactionFailureVisibleOnAllTransports(t *testing.T) {
 	}
 }
 
-func TestHTTPStreamsDeltasBeforeRejectedTerminal(t *testing.T) {
+func TestHTTPStreamsDeltasBeforeUncachedTerminal(t *testing.T) {
 	proceed := make(chan struct{})
 	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
@@ -174,7 +167,7 @@ func TestHTTPStreamsDeltasBeforeRejectedTerminal(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(rest), "history_storage_failed") || strings.Contains(string(rest), "response.completed") || strings.Contains(string(rest), "[DONE]") {
-		t.Fatalf("false terminal: %s", rest)
+	if strings.Contains(string(rest), "history_storage_failed") || !strings.Contains(string(rest), "event: response.completed") || !strings.Contains(string(rest), "[DONE]") {
+		t.Fatalf("uncached turn not served to completion: %s", rest)
 	}
 }

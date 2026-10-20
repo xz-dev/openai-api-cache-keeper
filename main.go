@@ -106,7 +106,7 @@ func loadConfig() (config, error) {
 	if cfg.ttl, err = envDuration("STORE_TTL", 10*time.Minute); err != nil {
 		return config{}, err
 	}
-	if cfg.maxStoreBytes, err = envPositiveInt("STORE_MAX_BYTES", 128<<20); err != nil {
+	if cfg.maxStoreBytes, err = envPositiveInt("STORE_MAX_BYTES", 200<<20); err != nil {
 		return config{}, err
 	}
 	if cfg.maxRequestBytes, err = envPositiveInt("MAX_REQUEST_BYTES", 32<<20); err != nil {
@@ -119,10 +119,10 @@ func loadConfig() (config, error) {
 	if cfg.storeMetaBytes, err = envPositiveInt("STORE_META_MAX_BYTES", 32<<20); err != nil {
 		return config{}, err
 	}
-	if cfg.storePinBytes, err = envPositiveInt("STORE_PIN_MAX_BYTES", 64<<20); err != nil {
+	if cfg.storePinBytes, err = envPositiveInt("STORE_PIN_MAX_BYTES", 100<<20); err != nil {
 		return config{}, err
 	}
-	if cfg.storeCompactBytes, err = envPositiveInt("STORE_COMPACT_BYTES", 320<<20); err != nil {
+	if cfg.storeCompactBytes, err = envPositiveInt("STORE_COMPACT_BYTES", 400<<20); err != nil {
 		return config{}, err
 	}
 	if v := os.Getenv("REQUIRE_NO_DEFAULT_ROUTE"); v != "" {

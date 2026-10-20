@@ -129,6 +129,13 @@ func (c *collector) event(raw []byte) error {
 			c.items = append(c.items, nil)
 		}
 		c.items[index] = obj["item"]
+	case "response.created", "response.in_progress":
+		// Remember the started response so a later local failure can terminate it.
+		if response, err := responseObject(obj["response"]); err == nil {
+			if id, err := responseString(response["id"]); err == nil && id != "" {
+				c.started = id
+			}
+		}
 	case "response.completed", "response.incomplete":
 		// Validate the event/response pairing before mutating accepted collection.
 		response, err := responseObject(obj["response"])
@@ -162,7 +169,7 @@ func (m *workingSet) reserveOutput(n int64) bool {
 }
 func (m *workingSet) freeOutput(n int64) { m.mu.Lock(); m.output -= n; m.mu.Unlock() }
 func (c *collector) bytes() int64 {
-	n := int64(512 + len(c.id) + len(c.status) + (cap(c.items)+cap(c.output))*24)
+	n := int64(512 + len(c.id) + len(c.started) + len(c.status) + (cap(c.items)+cap(c.output))*24)
 	for _, v := range c.items {
 		n += int64(cap(v))
 	}
@@ -254,7 +261,10 @@ func readResponseBody(r io.Reader, m *workingSet) (*responseBuffer, error) {
 
 // Parsing and rewriting share the existing SHORT phase with input/commit.
 // Return an independently charged wire buffer; no phase spans network I/O.
-func (k *keeper) responseFrame(ctx context.Context, c *collector, raw []byte, event, stored bool, accept func() error) ([]byte, func(), error) {
+// accept reports whether the turn's history was retained; a terminal response
+// that was not retained keeps the upstream store value, so clients never
+// continue from an id the keeper does not hold.
+func (k *keeper) responseFrame(ctx context.Context, c *collector, raw []byte, event, stored bool, accept func() (bool, error)) ([]byte, func(), error) {
 	leave, err := k.work.enter(ctx)
 	if err != nil {
 		return nil, nil, err
@@ -262,6 +272,13 @@ func (k *keeper) responseFrame(ctx context.Context, c *collector, raw []byte, ev
 	defer leave()
 	if err := c.collect(raw, k.work, event); err != nil {
 		return nil, nil, err
+	}
+	if accept != nil {
+		retained, err := accept()
+		if err != nil {
+			return nil, nil, err
+		}
+		stored = stored && retained
 	}
 	scratch := responseScratch(len(raw))
 	if !k.work.reserveOutput(scratch) {
@@ -281,12 +298,6 @@ func (k *keeper) responseFrame(ctx context.Context, c *collector, raw []byte, ev
 	owned := append([]byte(nil), wire...)
 	k.work.freeOutput(scratch - int64(cap(owned)))
 	release := func() { k.work.freeOutput(int64(cap(owned))) }
-	if accept != nil {
-		if err := accept(); err != nil {
-			release()
-			return nil, nil, err
-		}
-	}
 	return owned, release, nil
 }
 func readDiscard(ctx context.Context, r io.Reader) error {
