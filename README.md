@@ -18,15 +18,16 @@ Paths: `POST /v1/responses` (or `/responses`), and `GET /v1/responses` with a We
 
 For each request:
 
-1. If `previous_response_id` is set, the keeper looks it up, prepends the stored history to `input`, and removes the field. An unknown, expired, or foreign id returns `400` with `code: "previous_response_not_found"`. Clients can then retry once with the full history.
-2. The request is forwarded upstream with the caller's headers. Upstream HTTP statuses and error bodies are preserved. Errors are not rewritten, truncated, retried, or put on a cooldown. Successful terminal responses are sent only after any required history storage and socket pin have been acquired.
-3. When the upstream finishes with `status: completed` or `incomplete`, the keeper stores `input + output` under the response id. Upstream ids that do not start with `resp_` (for example `msg_…` from Anthropic-style backends) are returned to the client as `resp_<id>` in SSE, JSON, and WebSocket frames, because some gateways only accept `resp_*` as `previous_response_id`. For a turn the keeper stores, the response object is returned with `store: true`, even when the stateless upstream reported `store: false`: the keeper is the store, and clients use that field to decide whether the response id can be continued later. `store: false` requests keep the upstream value.
+1. In routed mode, the keeper looks up the original top-level `model` before accessing history. It selects CPA or AISIX once per HTTP request or WebSocket turn; it never retries against another backend. Single-upstream mode skips classification.
+2. If `previous_response_id` is set, the keeper looks it up, prepends the stored history to `input`, and removes the field. An unknown, expired, or foreign id returns `400` with `code: "previous_response_not_found"`. Clients can then retry once with the full history.
+3. The request is forwarded upstream with the caller's headers, except CPA uses the configured `CPA_API_KEY` in routed mode. Top-level `prompt_cache_retention` is removed on HTTP and WebSocket requests; nested fields and encoded input items are preserved. Upstream HTTP statuses and error bodies are preserved. Errors are not rewritten, truncated, retried, or put on a cooldown. Successful terminal responses are sent only after any required history storage and socket pin have been acquired.
+4. When the upstream finishes with `status: completed` or `incomplete`, the keeper stores `input + output` under the response id. Upstream ids that do not start with `resp_` (for example `msg_…` from Anthropic-style backends) are returned to the client as `resp_<id>` in SSE, JSON, and WebSocket frames, because some gateways only accept `resp_*` as `previous_response_id`. For a turn the keeper stores, the response object is returned with `store: true`, even when the stateless upstream reported `store: false`: the keeper is the store, and clients use that field to decide whether the response id can be continued later. `store: false` requests keep the upstream value.
 
 What is stored:
 
 - Raw Responses items exactly as received or returned, including reasoning `encrypted_content`, `function_call`, and `function_call_output`. No format conversion is done.
 - Each entry is the full history up to that turn. Any stored id can be continued, so rolling back one or two steps is a normal continuation from an older id.
-- Entries are scoped to the SHA-256 of the `Authorization` header. If a gateway forwards one shared upstream key for every user, entries are not isolated per user.
+- Entries are scoped to the SHA-256 of the incoming `Authorization` header, before any CPA credential substitution. If a gateway forwards one shared upstream key for every user, entries are not isolated per user.
 - `store: false` requests are not stored. On a WebSocket, the most recent turn can still be continued on the same socket, like OpenAI's connection-local cache. With `IGNORE_CLIENT_STORE_FALSE=true` they are stored (and returned with `store: true`) like any other turn, for clients such as Codex that always send `store: false` but should still recover after a reconnect.
 
 Retained history is bounded by payload and metadata budgets. Entries expire `STORE_TTL` after creation; least-recently-used registered IDs can be evicted to make room. bbolt under `STORE_DIR` holds both content-addressed items and transactional references/accounting. Identical item bytes are stored once. Per-item prefix nodes share growing histories even when clients resend full history without a previous ID; no per-response growing hash manifest is retained. `STORE_META_MAX_BYTES` charges every prefix node/hash occurrence, unique item index, response alias (including ID length), and socket pin. `STORE_PIN_MAX_BYTES` bounds all live WebSocket pins, including registered turns kept alive on their original socket; each socket charges its history's unique payload bytes. Replacement uses the net pin charge, not old plus new.
@@ -71,9 +72,24 @@ Each text frame must be a `response.create` event; its body is handled like an H
 
 ## Configuration
 
+Choose one upstream mode:
+
+- **Single upstream:** set `UPSTREAM_URL` only.
+- **Routed:** unset `UPSTREAM_URL`; set `ROUTING_INDEX_URL`, `UPSTREAM_CPA_URL`, `UPSTREAM_AISIX_URL`, and `CPA_API_KEY` together. Supply the key through the runtime secret environment. Partial or mixed configurations fail startup. URL values must use HTTP(S), without userinfo, query, or fragment.
+
+Routing performs one `GET` to `ROUTING_INDEX_URL` with the exact model ID as the `model` query parameter. The model must be a non-empty string of at most 1,024 UTF-8 bytes. Lookup limits are 300 ms connect, 300 ms send, 1 s read, 1,024 response-body bytes, and a 1.6 s overall ceiling. Redirects and implicit connection-reuse retries are disabled. Only `cpa`, `aisix`, `not_found`, and `unavailable` are accepted, with a nonnegative integral numeric generation; generation zero is valid only for `unavailable`.
+
+Each keeper process retains at most 4,096 successful decisions, evicting the oldest first. A transport, non-200, or malformed-response failure may use a decision less than 15 minutes old for that exact model; a fallback does not refresh its age. Authoritative `not_found` or `unavailable` deletes the entry. Each fallback logs the model and age, without credentials. The routing map is never persisted.
+
+An invalid model or malformed request returns `400 / invalid_request_error`; `not_found` returns `404 / model_not_found`; `unavailable` or lookup failure without a fresh fallback returns `503 / service_unavailable`. Non-stream HTTP uses JSON. HTTP requests with `stream:true` use an SSE `error` event with the same non-2xx status. WebSocket turns receive an `error` frame carrying that status; the socket and previous accepted history remain usable. Routing errors do not reach a backend or access stored history.
+
 | Variable | Default | Meaning |
 |---|---|---|
-| `UPSTREAM_URL` | required | Upstream base URL, e.g. `http://cpa:8317`. The request path is appended. |
+| `UPSTREAM_URL` | required in single mode | Upstream base URL, e.g. `http://cpa:8317`. The request path is appended. |
+| `ROUTING_INDEX_URL` | required in routed mode | Full routing-index endpoint, e.g. `http://models-enricher:8090/routing-index`. |
+| `UPSTREAM_CPA_URL` | required in routed mode | Direct CPA base URL, e.g. `http://cpa:8317`. The request path is appended. |
+| `UPSTREAM_AISIX_URL` | required in routed mode | Direct AISIX base URL, e.g. `http://aisix:3000`. The request path is appended. |
+| `CPA_API_KEY` | required in routed mode | Non-empty single-line runtime secret. CPA receives `Authorization: Bearer <key>`; AISIX retains the caller header. |
 | `LISTEN_ADDR` | `:8080` | Listen address. |
 | `STORE_TTL` | `10m` | Lifetime of a stored entry. |
 | `STORE_MAX_BYTES` | `134217728` | Byte budget for stored history (LRU eviction). |
@@ -93,6 +109,8 @@ Each text frame must be a `response.create` event; its body is handled like an H
 go test -race ./...
 docker build -t response-keeper .
 ```
+
+`testdata/routing-index.json` is the parser contract fixture. `TestRoutingIndexContract` checks Go; `testdata/routing-index.lua` checks the same cases against an unmodified `routing_selector.lua` using the APISIX image's `resty` executable (arguments: selector path, JSON fixture path).
 
 CI publishes `ghcr.io/xz-dev/response-keeper` with `latest` and the full commit SHA as tags on every push to `main`. Deployments should pin a digest.
 

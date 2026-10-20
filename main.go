@@ -22,6 +22,10 @@ import (
 
 type config struct {
 	upstream              *url.URL
+	routingIndex          *url.URL
+	upstreamCPA           *url.URL
+	upstreamAISIX         *url.URL
+	cpaAPIKey             string
 	listen                string
 	ttl                   time.Duration
 	maxStoreBytes         int64
@@ -59,7 +63,7 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	log.Printf("listening on %s upstream=%s ttl=%s max_store_bytes=%d", listener.Addr(), cfg.upstream, cfg.ttl, cfg.maxStoreBytes)
+	log.Printf("listening on %s routed=%t ttl=%s max_store_bytes=%d", listener.Addr(), cfg.routingIndex != nil, cfg.ttl, cfg.maxStoreBytes)
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	go func() {
@@ -74,15 +78,28 @@ func main() {
 }
 
 func loadConfig() (config, error) {
-	raw := os.Getenv("UPSTREAM_URL")
-	if raw == "" {
-		return config{}, errors.New("UPSTREAM_URL is required")
+	cfg := config{listen: os.Getenv("LISTEN_ADDR"), cpaAPIKey: os.Getenv("CPA_API_KEY")}
+	var err error
+	routed := os.Getenv("ROUTING_INDEX_URL") != "" || os.Getenv("UPSTREAM_CPA_URL") != "" || os.Getenv("UPSTREAM_AISIX_URL") != "" || cfg.cpaAPIKey != ""
+	if routed {
+		if os.Getenv("UPSTREAM_URL") != "" {
+			return config{}, errors.New("UPSTREAM_URL cannot be combined with routed upstream configuration")
+		}
+		if cfg.cpaAPIKey == "" || strings.ContainsAny(cfg.cpaAPIKey, "\r\n") {
+			return config{}, errors.New("CPA_API_KEY must be a non-empty single-line value")
+		}
+		if cfg.routingIndex, err = envURL("ROUTING_INDEX_URL"); err != nil {
+			return config{}, err
+		}
+		if cfg.upstreamCPA, err = envURL("UPSTREAM_CPA_URL"); err != nil {
+			return config{}, err
+		}
+		if cfg.upstreamAISIX, err = envURL("UPSTREAM_AISIX_URL"); err != nil {
+			return config{}, err
+		}
+	} else if cfg.upstream, err = envURL("UPSTREAM_URL"); err != nil {
+		return config{}, err
 	}
-	u, err := url.Parse(raw)
-	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" {
-		return config{}, errors.New("UPSTREAM_URL must be an http(s) URL without userinfo, query, or fragment")
-	}
-	cfg := config{upstream: u, listen: os.Getenv("LISTEN_ADDR")}
 	if cfg.listen == "" {
 		cfg.listen = ":8080"
 	}
@@ -119,6 +136,18 @@ func loadConfig() (config, error) {
 		}
 	}
 	return cfg, nil
+}
+
+func envURL(name string) (*url.URL, error) {
+	raw := os.Getenv(name)
+	if raw == "" {
+		return nil, fmt.Errorf("%s is required", name)
+	}
+	u, err := url.Parse(raw)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" {
+		return nil, fmt.Errorf("%s must be an http(s) URL without userinfo, query, or fragment", name)
+	}
+	return u, nil
 }
 
 func envDuration(name string, fallback time.Duration) (time.Duration, error) {

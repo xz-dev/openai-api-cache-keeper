@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"sort"
 	"sync"
 	"time"
@@ -192,6 +193,10 @@ func (k *keeper) prepareDisk(ctx context.Context, raw *spool, owner [32]byte, lo
 			return nil, workingError(errWorkSize)
 		}
 		switch name {
+		case "prompt_cache_retention":
+			if _, err := skipJSONValue(dec); err != nil {
+				return nil, &apiError{status: 400, typ: "invalid_request_error", message: "invalid request JSON"}
+			}
 		case "input":
 			tok, err := dec.Token()
 			if err != nil {
@@ -475,10 +480,10 @@ func (k *keeper) acceptDisk(ctx context.Context, t *diskTurn, id string, owner [
 	return handle, err
 }
 
-func (k *keeper) forwardDisk(ctx context.Context, path string, header http.Header, t *diskTurn) (*http.Response, error) {
+func (k *keeper) forwardDisk(ctx context.Context, upstream *url.URL, path string, header http.Header, t *diskTurn) (*http.Response, error) {
 	body, err := t.file.requestBody()
 	if err != nil {
 		return nil, err
 	}
-	return k.forwardReader(ctx, path, header, body)
+	return k.forwardReader(ctx, upstream, path, header, body)
 }

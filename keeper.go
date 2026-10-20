@@ -10,15 +10,17 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 )
 
 type keeper struct {
-	cfg    config
-	store  *store
-	client *http.Client
-	work   *workingSet
+	cfg     config
+	store   *store
+	client  *http.Client
+	routing *routingClient
+	work    *workingSet
 }
 
 func newKeeper(cfg config) *keeper {
@@ -33,11 +35,16 @@ func newKeeper(cfg config) *keeper {
 		st.close()
 		log.Fatalf("transient cleanup: %v", err)
 	}
+	var routing *routingClient
+	if cfg.routingIndex != nil {
+		routing = newRoutingClient(cfg.routingIndex)
+	}
 	return &keeper{
-		work:   newWorkingSet(),
-		cfg:    cfg,
-		store:  st,
-		client: &http.Client{Transport: transport, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }},
+		routing: routing,
+		work:    newWorkingSet(),
+		cfg:     cfg,
+		store:   st,
+		client:  &http.Client{Transport: transport, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }},
 	}
 }
 
@@ -187,8 +194,8 @@ func publicID(id string) string {
 	return "resp_" + id
 }
 
-func (k *keeper) forwardReader(ctx context.Context, path string, header http.Header, body io.Reader) (*http.Response, error) {
-	target := *k.cfg.upstream
+func (k *keeper) forwardReader(ctx context.Context, upstream *url.URL, path string, header http.Header, body io.Reader) (*http.Response, error) {
+	target := *upstream
 	target.Path = strings.TrimRight(target.Path, "/") + path
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, target.String(), body)
 	if err != nil {
@@ -198,6 +205,9 @@ func (k *keeper) forwardReader(ctx context.Context, path string, header http.Hea
 		return nil, err
 	}
 	copyHeader(req.Header, header)
+	if k.routing != nil && upstream == k.cfg.upstreamCPA {
+		req.Header.Set("Authorization", "Bearer "+k.cfg.cpaAPIKey)
+	}
 	for name := range req.Header {
 		if strings.HasPrefix(strings.ToLower(name), "sec-websocket-") {
 			req.Header.Del(name)
@@ -222,6 +232,11 @@ func (k *keeper) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer raw.Close()
+	upstream, stream, routeErr := k.routeRequest(r.Context(), raw, false)
+	if routeErr != nil {
+		writeRoutingError(w, routeErr, stream)
+		return
+	}
 	leave, err := k.work.enter(r.Context())
 	if err != nil {
 		writeAPIError(w, workingError(err))
@@ -240,7 +255,7 @@ func (k *keeper) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	defer t.file.Close()
 	hasPrev := t.hasPrev
-	resp, err := k.forwardDisk(r.Context(), r.URL.Path, r.Header, t)
+	resp, err := k.forwardDisk(r.Context(), upstream, r.URL.Path, r.Header, t)
 	if err != nil {
 		writeAPIError(w, &apiError{status: http.StatusBadGateway, typ: "upstream_error", message: "upstream request failed"})
 		logTurn("http", http.StatusBadGateway, hasPrev, "", start, k.store)

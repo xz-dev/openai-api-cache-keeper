@@ -116,6 +116,10 @@ func (k *keeper) serveWS(w http.ResponseWriter, r *http.Request) {
 }
 
 func (k *keeper) wsTurn(ctx context.Context, conn *websocket.Conn, header http.Header, owner [32]byte, data *spool, sess *wsSession) (string, int, bool) {
+	upstream, _, routeErr := k.routeRequest(ctx, data, true)
+	if routeErr != nil {
+		return "", wsError(ctx, conn, routeErr), false
+	}
 	leave, err := k.work.enter(ctx)
 	if err != nil {
 		return "", wsError(ctx, conn, workingError(err)), false
@@ -136,7 +140,7 @@ func (k *keeper) wsTurn(ctx context.Context, conn *websocket.Conn, header http.H
 	}
 	defer t.file.Close()
 	hasPrev := t.hasPrev
-	resp, err := k.forwardDisk(ctx, "/v1/responses", header, t)
+	resp, err := k.forwardDisk(ctx, upstream, "/v1/responses", header, t)
 	if err != nil {
 		return "", wsError(ctx, conn, &apiError{status: http.StatusBadGateway, typ: "upstream_error", message: "upstream request failed"}), hasPrev
 	}
