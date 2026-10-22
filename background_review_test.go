@@ -210,7 +210,7 @@ func reviewTask(rt roundTripFunc) (*keeper, *responseTask) {
 	owner := httptest.NewRequest(http.MethodGet, "/v1/responses/resp_ck_review", nil)
 	owner.Header.Set("Authorization", "Bearer owner")
 	k := &keeper{cfg: config{upstream: u}, work: newWorkingSet(), tasks: map[string]*responseTask{}, client: &http.Client{Transport: rt}}
-	t := &responseTask{keeper: k, id: "resp_ck_review", owner: ownerOf(owner), cancel: func() {}, stream: true, done: true, count: 2, changed: make(chan struct{})}
+	t := &responseTask{keeper: k, id: "resp_ck_review", owner: k.ownerOf(owner), cancel: func() {}, stream: true, done: true, count: 2, changed: make(chan struct{})}
 	k.tasks[t.id] = t
 	return k, t
 }
@@ -258,11 +258,12 @@ func TestBackgroundMalformedCursorQueryRejected(t *testing.T) {
 	}
 }
 
-// Unauthenticated or foreign callers stalled at billing cannot spend the
-// owner's per-task reader budget.
-func TestBackgroundForeignCallersCannotSpendTaskBudget(t *testing.T) {
+// Single-upstream mode has no per-credential isolation: callers stalled at
+// billing share the task's reader budget, and a stalled pool of them can
+// starve later readers until they release or the upstream decides.
+func TestBackgroundCallersShareTaskBudget(t *testing.T) {
 	entered, release := make(chan struct{}, maxTaskReaders), make(chan struct{})
-	k, task := reviewTask(func(r *http.Request) (*http.Response, error) {
+	k, _ := reviewTask(func(r *http.Request) (*http.Response, error) {
 		if r.Header.Get("Authorization") != "Bearer owner" {
 			entered <- struct{}{}
 			select {
@@ -287,11 +288,10 @@ func TestBackgroundForeignCallersCannotSpendTaskBudget(t *testing.T) {
 			t.Fatal("foreign callers never reached billing")
 		}
 	}
-	task.mu.Lock()
-	pending := task.pending
-	task.mu.Unlock()
-	if got := reviewCall(k, "", "owner"); got != http.StatusOK || pending != 0 {
-		t.Fatalf("owner denied by foreign callers: status=%d foreign pending=%d", got, pending)
+	// The budget is shared: stalled callers fill it and the next reader is
+	// denied until they release.
+	if got := reviewCall(k, "", "owner"); got != http.StatusServiceUnavailable {
+		t.Fatalf("shared budget should deny a further reader: status=%d", got)
 	}
 }
 

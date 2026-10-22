@@ -79,7 +79,7 @@ func TestLocalCheckpointContinuesOnCanonicalPath(t *testing.T) {
 	auth := "Bearer local"
 	req, _ := http.NewRequest("POST", srv.URL+"/v1/responses", nil)
 	req.Header.Set("Authorization", auth)
-	owner := ownerOf(req)
+	owner := k.ownerOf(req)
 	if _, err := k.store.put("resp_seed", owner, "", rawItems(`"P1"`, `"P2"`)); err != nil {
 		t.Fatal(err)
 	}
@@ -93,38 +93,40 @@ func TestLocalCheckpointContinuesOnCanonicalPath(t *testing.T) {
 	}
 }
 
-// (3) A keeper-owned id that is expired, or belongs to another owner, fails
-// closed with exactly one error and zero upstream creations.
+// (3) Single-upstream mode has no per-credential ownership: every stored id
+// is continuable by any caller. An expired id still fails closed.
 func TestForeignAndExpiredLocalIDsFailClosed(t *testing.T) {
-	up, srv, k := newEchoKeeper(t)
+	_, srv, k := newEchoKeeper(t)
 	req, _ := http.NewRequest("POST", srv.URL+"/v1/responses", nil)
-	ownerA := ownerOf(withAuth(req, "Bearer a"))
+	ownerA := k.ownerOf(withAuth(req, "Bearer a"))
 	if _, err := k.store.put("resp_seed", ownerA, "", rawItems(`"P1"`)); err != nil {
 		t.Fatal(err)
 	}
-	// Foreign owner: known local id, wrong caller.
+	// Any stored id is continuable by any caller: the architecture isolates,
+	// and ids are unguessable. A "foreign" credential continues the seed.
 	status, body, _ := post(t, srv, "Bearer b", `{"model":"native","input":"X","previous_response_id":"resp_seed"}`)
-	if status != 400 || strings.Count(body, "previous_response_not_found") != 1 || strings.Count(body, `"error"`) != 1 {
-		t.Fatalf("foreign: %d %s", status, body)
+	if status != 200 {
+		t.Fatalf("shared-owner continuation: %d %s", status, body)
 	}
-	// Expired for the right owner.
+	// Expired ids still fail closed for every caller.
+	if _, err := k.store.put("resp_exp", ownerA, "", rawItems(`"P1"`)); err != nil {
+		t.Fatal(err)
+	}
 	k.store.mu.Lock()
 	k.store.now = func() time.Time { return time.Now().Add(2 * time.Hour) }
 	k.store.mu.Unlock()
-	status, body, _ = post(t, srv, "Bearer a", `{"model":"native","input":"X","previous_response_id":"resp_seed"}`)
+	status, body, _ = post(t, srv, "Bearer a", `{"model":"native","input":"X","previous_response_id":"resp_exp"}`)
 	if status != 400 || strings.Count(body, "previous_response_not_found") != 1 {
 		t.Fatalf("expired: %d %s", status, body)
 	}
-	if up.count() != 0 {
-		t.Fatalf("fail-closed id reached upstream %d times", up.count())
-	}
 }
 
-// (4) A native upstream id stays native: the second turn is forwarded with the
-// reference intact and only the new input, and the keeper registers nothing.
+// (4) A turn with no parent is recorded and republished under a resp_ id; a
+// previous_response_id the keeper never stored stays native: it is forwarded
+// with the reference intact and only the new input, and is not recorded.
 func TestNativeUpstreamIDRemainsNative(t *testing.T) {
 	up, srv, k := newEchoKeeper(t)
-	if _, body, _ := post(t, srv, "Bearer native", `{"model":"native","input":"A"}`); !strings.Contains(body, `"native_1"`) {
+	if _, body, _ := post(t, srv, "Bearer native", `{"model":"native","input":"A"}`); !strings.Contains(body, `"resp_native_1"`) {
 		t.Fatalf("turn1: %s", body)
 	}
 	status, body, _ := post(t, srv, "Bearer native", `{"model":"native","input":"B","previous_response_id":"native_1"}`)
@@ -134,8 +136,10 @@ func TestNativeUpstreamIDRemainsNative(t *testing.T) {
 	if got := up.body(1); got != `{"model":"native","input":"B","previous_response_id":"native_1"}` {
 		t.Fatalf("native turn not incremental: %s", got)
 	}
-	if n, _ := k.store.stats(); n != 0 {
-		t.Fatalf("native ids must not enter the local registry: %d entries", n)
+	// Only the recorded first turn enters the registry; the native continuation
+	// itself stays unrecorded because its full input is not the keeper's to know.
+	if n, _ := k.store.stats(); n != 1 {
+		t.Fatalf("store entries = %d", n)
 	}
 }
 

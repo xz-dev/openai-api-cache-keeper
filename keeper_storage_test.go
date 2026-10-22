@@ -122,7 +122,7 @@ func TestStorageTransactionFailureVisibleOnAllTransports(t *testing.T) {
 			if status != 200 || !strings.Contains(body, `"status":"completed"`) || terminalStored(t, body) || strings.Contains(body, "history_storage_failed") {
 				t.Fatalf("storage failure must serve the turn uncached: %d %s", status, body)
 			}
-			owner := ownerOf(&http.Request{Header: http.Header{"Authorization": []string{"Bearer transaction"}}})
+			owner := k.ownerOf(&http.Request{Header: http.Header{"Authorization": []string{"Bearer transaction"}}})
 			if _, ok := k.store.get(previous, owner); !ok {
 				t.Fatal("accepted id lost on failed transaction")
 			}

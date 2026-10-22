@@ -42,7 +42,7 @@ func TestReviewCoreOversizedTerminalRealHTTP(t *testing.T) {
 			})
 			req, _ := http.NewRequest(http.MethodPost, srv.URL+"/v1/responses", nil)
 			req.Header.Set("Authorization", "Bearer review")
-			owner := ownerOf(req)
+			owner := k.ownerOf(req)
 			one := json.RawMessage(`"` + strings.Repeat("a", (256<<10)-1026) + `"`)
 			full := make([]json.RawMessage, 256)
 			for i := range full {

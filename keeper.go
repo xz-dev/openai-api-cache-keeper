@@ -84,12 +84,18 @@ func (k *keeper) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		k.serveLocalTurn(w, r)
 		return
 	}
-	// Standard Responses paths select local checkpoint handling only for an
-	// explicit keeper-owned previous_response_id; everything else (native
-	// previous_response_id, plain turns, WS upgrades) is native transparent
-	// traffic with no private path or flag.
+	// Standard Responses paths are recorded locally unless they reference a
+	// previous_response_id the keeper cannot expand: such a delta's full input
+	// is known only downstream, so it stays native transparent traffic. A
+	// keeper-owned id that is expired, foreign or malformed fails closed before
+	// the dispatcher returns. WS upgrades are terminated and relayed frame by
+	// frame by serveWSNative so the same per-turn rule applies.
+	if isUpgradeRequest(r) && r.Method == http.MethodGet {
+		k.serveWSNative(w, r)
+		return
+	}
 	if r.Method == http.MethodPost && !isUpgradeRequest(r) {
-		release, owned, background, handled := k.localCheckpointTurn(w, r)
+		release, local, background, handled := k.localCheckpointTurn(w, r)
 		if handled {
 			return
 		}
@@ -98,7 +104,7 @@ func (k *keeper) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			k.startBackground(w, r)
 			return
 		}
-		if owned {
+		if local {
 			k.serveLocalTurn(w, r)
 			return
 		}
@@ -121,14 +127,16 @@ func (k *keeper) serveLocalTurn(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// localCheckpointTurn decides whether this POST is a local checkpoint turn
-// (keeper-owned previous_response_id for the caller). The body is spooled to
-// inspect the id, then handed back re-read so serveHTTP does not re-read the
-// network body; a local checkpoint turn never reaches the native proxy. When
-// the id is keeper-owned but no longer usable, it writes the fail-closed
-// error itself and returns handled. The returned release keeps the spool
-// alive until the chosen handler finishes with the body.
-func (k *keeper) localCheckpointTurn(w http.ResponseWriter, r *http.Request) (release func(), ownedTurn bool, background bool, handled bool) {
+// localCheckpointTurn decides whether this POST is a local turn, i.e. one the
+// keeper can expand and record: no previous_response_id, or one the keeper
+// owns for this caller. A previous_response_id the keeper does not know keeps
+// the request native so its delta stays meaningful downstream. A keeper-owned
+// id that is expired, foreign or malformed fails closed before this returns.
+// The body is spooled to inspect the id, then handed back re-read so
+// serveHTTP does not re-read the network body; a local turn never reaches
+// the native proxy. The returned release keeps the spool alive until the
+// chosen handler finishes with the body.
+func (k *keeper) localCheckpointTurn(w http.ResponseWriter, r *http.Request) (release func(), local bool, background bool, handled bool) {
 	if !trySlot(k.work.turns) {
 		writeAPIError(w, workingError(errors.New("turn limit")))
 		return nil, false, false, true
@@ -154,7 +162,7 @@ func (k *keeper) localCheckpointTurn(w http.ResponseWriter, r *http.Request) (re
 		Background json.RawMessage `json:"background"`
 	}
 	decodeErr := json.NewDecoder(io.NewSectionReader(raw.File, raw.offset, raw.size)).Decode(&flags)
-	_, owned, apiErr := k.ownedLocalPreviousID(raw, ownerOf(r))
+	prevID, owned, apiErr := k.ownedLocalPreviousID(raw, k.ownerOf(r))
 	leave()
 	if apiErr != nil {
 		writeAPIError(w, apiErr)
@@ -169,7 +177,11 @@ func (k *keeper) localCheckpointTurn(w http.ResponseWriter, r *http.Request) (re
 	}
 	r.Body = body
 	background = decodeErr == nil && string(flags.Stream) == "true" && string(flags.Background) == "true"
-	return func() { body.Close(); raw.Close() }, owned, background, false
+	// A turn is local when the keeper can replay its full input: either it
+	// carries no parent at all, or it names one the keeper stored for this
+	// owner. Any other previous_response_id is an opaque native reference and
+	// the request keeps native semantics end to end.
+	return func() { body.Close(); raw.Close() }, owned || prevID == "", background, false
 }
 
 // apiError renders as an OpenAI-shaped error object.
@@ -213,9 +225,16 @@ func logNotRetained(err error) {
 	log.Printf("history not retained; turn served uncached: %v", err)
 }
 
-// Match Sub2API's credential precedence after the same hop-by-hop cleanup used
-// for upstream requests; the digest is not authentication.
-func ownerOf(r *http.Request) [32]byte {
+// ownerOf returns the history owner for a request. In single-upstream mode
+// there is no per-credential isolation: the architecture provides it, and
+// response ids are unguessable. Routed mode keeps per-credential ownership by
+// hashing the caller's credential, matching Sub2API's precedence after the
+// same hop-by-hop cleanup used for upstream requests; the digest is not
+// authentication.
+func (k *keeper) ownerOf(r *http.Request) [32]byte {
+	if k.cfg.upstream != nil {
+		return [32]byte{}
+	}
 	h := http.Header{}
 	copyHeader(h, r.Header)
 	var credential string
@@ -387,7 +406,7 @@ func (k *keeper) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, workingError(err))
 		return
 	}
-	owner := ownerOf(r)
+	owner := k.ownerOf(r)
 	t, apiErr := k.prepareDisk(r.Context(), raw, owner, func(id string) ([32]byte, bool) {
 		tip, _, ok := k.store.resolveID(id, owner, false)
 		return tip, ok

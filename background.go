@@ -67,7 +67,7 @@ func (k *keeper) startBackground(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ctx, cancel := context.WithCancel(context.WithoutCancel(r.Context()))
-	t := &responseTask{keeper: k, id: keeperResponsePrefix + rand.Text(), owner: ownerOf(r), cancel: cancel,
+	t := &responseTask{keeper: k, id: keeperResponsePrefix + rand.Text(), owner: k.ownerOf(r), cancel: cancel,
 		log: log, readers: 1, changed: make(chan struct{}), ready: make(chan struct{}), finished: make(chan struct{})}
 	k.cacheMu.Lock()
 	if len(k.tasks) >= maxTurns {
@@ -448,7 +448,7 @@ func (k *keeper) taskOperation(w http.ResponseWriter, r *http.Request) bool {
 		k.cacheMu.Unlock()
 		// Only the owner's credential spends this task's budget, so unauthenticated
 		// or foreign callers cannot target it (digest isolates, billing still decides).
-		if pending != nil && pending.owner == ownerOf(r) {
+		if pending != nil && pending.owner == k.ownerOf(r) {
 			pending.mu.Lock()
 			full := pending.readers+pending.pending >= maxTaskReaders
 			if !full {
@@ -504,7 +504,7 @@ func (k *keeper) taskOperation(w http.ResponseWriter, r *http.Request) bool {
 	k.cacheMu.Lock()
 	t := k.tasks[parts[0]]
 	k.cacheMu.Unlock()
-	if t == nil || t.owner != ownerOf(r) {
+	if t == nil || t.owner != k.ownerOf(r) {
 		writeAPIError(w, &apiError{status: 404, typ: "invalid_request_error", code: "response_not_found", message: "Response not found."})
 		return true
 	}

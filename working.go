@@ -161,6 +161,13 @@ func (t *diskTurn) history() ([]json.RawMessage, error) {
 // spans; a previous_response_id expands by streaming stored items through
 // short read txs into the same spool. Heap stays O(one item).
 func (k *keeper) prepareDisk(ctx context.Context, raw *spool, owner [32]byte, lookup func(id string) (tip [32]byte, found bool), ws bool) (*diskTurn, *apiError) {
+	return k.prepareDiskEnv(ctx, raw, owner, lookup, ws, false)
+}
+
+// prepareDiskEnv is prepareDisk; with wsEnvelope the rebuilt spool keeps a
+// `"type":"response.create"` field so the result is a valid upstream
+// WebSocket frame instead of a bare HTTP request body.
+func (k *keeper) prepareDiskEnv(ctx context.Context, raw *spool, owner [32]byte, lookup func(id string) (tip [32]byte, found bool), ws, wsEnvelope bool) (*diskTurn, *apiError) {
 	if err := ctx.Err(); err != nil {
 		return nil, workingError(err)
 	}
@@ -266,6 +273,12 @@ func (k *keeper) prepareDisk(ctx context.Context, raw *spool, owner [32]byte, lo
 				if kind != "response.create" {
 					return nil, &apiError{status: 400, typ: "invalid_request_error", param: "type", message: "unsupported event type"}
 				}
+				if wsEnvelope {
+					if other == nil {
+						other = map[string]json.RawMessage{}
+					}
+					other[name] = v
+				}
 				continue
 			}
 			if other == nil {
@@ -324,7 +337,7 @@ func (k *keeper) prepareDisk(ctx context.Context, raw *spool, owner [32]byte, lo
 			}
 		}
 	}
-	if ws {
+	if ws && !wsEnvelope {
 		if other == nil {
 			other = map[string]json.RawMessage{}
 		}

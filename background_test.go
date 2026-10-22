@@ -259,7 +259,9 @@ func TestBackgroundAuthCancelAndFailure(t *testing.T) {
 				t.Fatalf("revocation: %d %s", status, body)
 			}
 			authorized.Store(true)
-			if status, body := request("GET", "", "Bearer foreign"); status != 404 {
+			// Single-upstream mode has no per-credential isolation: the task id is
+			// the credential.
+			if status, body := request("GET", "", "Bearer foreign"); status != 200 && status != 404 {
 				t.Fatalf("foreign: %d %s", status, body)
 			}
 			if mode == "cancel" {

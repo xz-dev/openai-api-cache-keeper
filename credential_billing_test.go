@@ -51,7 +51,7 @@ func TestBillingRevalidationFailsClosed(t *testing.T) {
 				}
 				body, _ := io.ReadAll(r.Body)
 				w.Header().Set("Content-Type", "text/event-stream")
-				if !strings.Contains(string(body), `"background"`) && strings.Contains(string(body), `"input":"B"`) {
+				if !strings.Contains(string(body), `"background"`) && (strings.Contains(string(body), `"input":"B"`) || strings.Contains(string(body), `"content":"B"`)) {
 					plain.Add(1)
 					_, _ = io.WriteString(w, gateEvent("response.created", ""))
 					_, _ = io.WriteString(w, gateEvent("response.completed", ""))

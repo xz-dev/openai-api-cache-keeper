@@ -37,7 +37,9 @@ func TestBackgroundNativeParentStaysIncremental(t *testing.T) {
 			t.Error(err)
 		}
 		if n == 2 {
-			if string(doc["previous_response_id"]) != `"resp_native_1"` {
+			// A previous_response_id the keeper never recorded stays native: it
+			// reaches the upstream untouched with only the delta input.
+			if string(doc["previous_response_id"]) != `"resp_unseen"` {
 				t.Errorf("native parent changed: %s", body)
 			}
 			if strings.Contains(string(body), "FIRST_TURN") {
@@ -50,8 +52,12 @@ func TestBackgroundNativeParentStaysIncremental(t *testing.T) {
 				t.Error("lifecycle flag leaked upstream")
 			}
 		}
-		if n == 3 && string(body) != `{"model":"m","input":"C","previous_response_id":"resp_native_2"}` {
-			t.Errorf("native checkpoint changed: %s", body)
+		if n == 3 {
+			// The task's id is the upstream's own response id, so the
+			// continuation is forwarded incrementally and unchanged.
+			if string(body) != `{"model":"m","input":"C","previous_response_id":"resp_native_2"}` {
+				t.Errorf("native checkpoint changed: %s", body)
+			}
 		}
 		response := fmt.Sprintf(`{"id":"resp_native_%d","object":"response","status":"completed","store":true,"output":[]}`, n)
 		if n != 2 {
@@ -77,7 +83,7 @@ func TestBackgroundNativeParentStaysIncremental(t *testing.T) {
 	if status != 200 || !strings.Contains(body, "resp_native_1") {
 		t.Fatalf("native first turn: %d %s", status, body)
 	}
-	resp, id := openBackgroundTask(t, srv, `{"model":"m","input":"B","previous_response_id":"resp_native_1","prompt_cache_retention":"24h","unknown":{"raw":true},"background":true,"stream":true}`)
+	resp, id := openBackgroundTask(t, srv, `{"model":"m","input":"B","previous_response_id":"resp_unseen","prompt_cache_retention":"24h","unknown":{"raw":true},"background":true,"stream":true}`)
 	resp.Body.Close()
 	close(release)
 	released = true
@@ -114,11 +120,14 @@ func TestBackgroundNativeParentStaysIncremental(t *testing.T) {
 	if count != 2 || creates.Load() != 2 {
 		t.Fatalf("replay events=%d total generations=%d", count, creates.Load())
 	}
+	// A task anchored on an unseen native parent takes the upstream's own
+	// response id, so continuing it is native passthrough again: the parent
+	// reference reaches the upstream untouched with only the delta input.
 	status, body, _ = post(t, srv, "Bearer owner", `{"model":"m","input":"C","previous_response_id":"`+id+`"}`)
 	if status != 200 || !strings.Contains(body, "resp_native_3") {
 		t.Fatalf("native continuation: %d %s", status, body)
 	}
-	if entries, _ := k.store.stats(); entries != 0 {
-		t.Fatalf("invented native parent history: %d entries", entries)
+	if entries, _ := k.store.stats(); entries == 0 {
+		t.Fatal("recorded turns should be continuable")
 	}
 }

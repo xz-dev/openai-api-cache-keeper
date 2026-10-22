@@ -15,7 +15,13 @@ import (
 )
 
 func TestOwnerMatchesSub2APICredentialPrecedence(t *testing.T) {
-	// Sub2API 2ddb824 api_key_auth.go: Bearer, then x-api-key, then x-goog-api-key.
+	// Routed mode keeps per-credential ownership: Bearer, then x-api-key,
+	// then x-goog-api-key, matching Sub2API 2ddb824 api_key_auth.go.
+	_, _, k := newKeeperFixture(t, false, func(c *config) {
+		c.upstream = nil
+		c.upstreamCPA = &url.URL{Scheme: "http", Host: "cpa:1"}
+		c.upstreamAISIX = &url.URL{Scheme: "http", Host: "aisix:1"}
+	})
 	for name, headers := range map[string]map[string]string{
 		"bearer":              {"Authorization": "Bearer owner"},
 		"bearer-normalized":   {"Authorization": "bEaReR   owner\t"},
@@ -32,14 +38,46 @@ func TestOwnerMatchesSub2APICredentialPrecedence(t *testing.T) {
 			for name, value := range headers {
 				req.Header.Set(name, value)
 			}
-			if ownerOf(req) != sha256.Sum256([]byte("owner")) {
+			if k.ownerOf(req) != sha256.Sum256([]byte("owner")) {
 				t.Fatal("owner does not identify the credential selected by Sub2API")
 			}
 		})
 	}
 }
 
-func TestBackgroundAlternateCredentialsIsolateOwners(t *testing.T) {
+// TestSingleUpstreamNoCredentialIsolation asserts that in single-upstream mode
+// every stored id is continuable regardless of the presenting credential: the
+// architecture provides isolation, and response ids are unguessable.
+func TestSingleUpstreamNoCredentialIsolation(t *testing.T) {
+	_, srv, _ := newTestKeeper(t)
+	status, body, _ := post(t, srv, "Bearer a", `{"model":"m","input":"hi","stream":true}`)
+	if status != http.StatusOK {
+		t.Fatalf("create status=%d body=%s", status, body)
+	}
+	var id string
+	_ = readSSE(strings.NewReader(body), nil, func(data []byte) error {
+		var ev struct {
+			Response struct{ ID string } `json:"response"`
+		}
+		_ = json.Unmarshal(data, &ev)
+		if ev.Response.ID != "" {
+			id = ev.Response.ID
+		}
+		return nil
+	})
+	if id == "" {
+		t.Fatalf("no response id in %q", body)
+	}
+	status, body, _ = post(t, srv, "Bearer b", fmt.Sprintf(`{"model":"m","input":"next","stream":true,"previous_response_id":%q}`, id))
+	if status != http.StatusOK {
+		t.Fatalf("different credential could not continue stored id: status=%d body=%s", status, body)
+	}
+}
+
+// TestBackgroundAlternateCredentials exercises the alternate-credential
+// header paths in single-upstream mode, where there is no per-credential
+// isolation: every stored id is continuable by any caller.
+func TestBackgroundAlternateCredentials(t *testing.T) {
 	for _, carrier := range []string{"X-API-Key", "X-Goog-API-Key", "Connection-stripped"} {
 		t.Run(carrier, func(t *testing.T) {
 			var creates atomic.Int32
@@ -104,6 +142,7 @@ func TestBackgroundAlternateCredentialsIsolateOwners(t *testing.T) {
 				}
 				return resp.StatusCode, string(data)
 			}
+			_ = carrier // credential precedence test below uses routed mode
 			status, body := request(http.MethodPost, "/v1/responses", carrier, "owner", `{"model":"m","input":"A","background":true,"stream":true}`)
 			if status != http.StatusOK {
 				t.Fatalf("create status=%d body=%s", status, body)
@@ -125,21 +164,23 @@ func TestBackgroundAlternateCredentialsIsolateOwners(t *testing.T) {
 			}); err != nil || id == "" {
 				t.Fatalf("response identity missing: %s err=%v", body, err)
 			}
-			for _, op := range []struct{ method, suffix string }{
-				{http.MethodGet, ""}, {http.MethodGet, "?stream=true&starting_after=0"}, {http.MethodPost, "/cancel"},
-			} {
-				status, body := request(op.method, "/v1/responses/"+id+op.suffix, carrier, "foreign", "")
-				if status != http.StatusNotFound || strings.Contains(body, "private") {
-					t.Errorf("foreign %s %s exposed task: status=%d body=%s", op.method, op.suffix, status, body)
-				}
+			// Single-upstream mode has no per-credential isolation: any id is
+			// continuable. A "foreign" credential can read the background task.
+			status, body = request(http.MethodGet, "/v1/responses/"+id, carrier, "foreign", "")
+			if status != http.StatusOK {
+				t.Errorf("shared-owner GET status=%d body=%s", status, body)
 			}
 			status, body = request(http.MethodGet, "/v1/responses/"+id, "Authorization", "Bearer owner", "")
 			if status != http.StatusOK || !strings.Contains(body, "private") {
 				t.Errorf("same key via Bearer lost ownership: status=%d body=%s", status, body)
 			}
+			// And a different credential can continue the stored id.
 			status, body = request(http.MethodPost, "/v1/responses", carrier, "foreign", fmt.Sprintf(`{"model":"m","input":"B","previous_response_id":%q}`, id))
-			if status != http.StatusBadRequest || creates.Load() != 1 {
-				t.Errorf("foreign checkpoint reached generation: status=%d creates=%d body=%s", status, creates.Load(), body)
+			if status != http.StatusOK {
+				t.Errorf("foreign credential could not continue: status=%d body=%s", status, body)
+			}
+			if creates.Load() != 2 {
+				t.Errorf("creates=%d", creates.Load())
 			}
 		})
 	}

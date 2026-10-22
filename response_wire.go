@@ -95,6 +95,10 @@ func readSSE(body io.Reader, onFrame func([]byte) error, onData func([]byte) err
 	reader := bufio.NewReaderSize(body, 32<<10)
 	frame := responseBuffer{work: m}
 	defer frame.close()
+	// WHATWG §9.2.6: strip a leading UTF-8 BOM once at the stream head.
+	if b, err := reader.Peek(3); err == nil && bytes.Equal(b, []byte("\xef\xbb\xbf")) {
+		_, _ = reader.Discard(3)
+	}
 	total, lineStart := 0, 0
 	dispatch := func() error {
 		var data []byte

@@ -48,7 +48,7 @@ func (k *keeper) serveWS(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 	header := r.Header.Clone()
 	header.Del("Upgrade")
-	owner := ownerOf(r)
+	owner := k.ownerOf(r)
 
 	frames := make(chan *spool, 1)
 	go func() {

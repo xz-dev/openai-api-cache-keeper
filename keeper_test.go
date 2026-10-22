@@ -236,8 +236,11 @@ func TestMessageStyleIDsArePublishedAsResponseIDs(t *testing.T) {
 func TestHTTPUnknownAndForeignIDs(t *testing.T) {
 	_, srv, _ := newLocalTestKeeper(t)
 	status, body, _ := post(t, srv, "Bearer a", `{"model":"m","input":"A","stream":true}`)
-	id := completedID(t, body)
-	for _, tc := range []struct{ auth, id string }{{"Bearer a", "missing"}, {"Bearer b", id}} {
+	completedID(t, body)
+	// The local handler still fails closed on an id it cannot expand (an
+	// id it never saw, or one that expired). The dispatcher's native branch
+	// for never-seen ids is covered by TestNativeUpstreamIDRemainsNative.
+	for _, tc := range []struct{ auth, id string }{{"Bearer a", "missing"}, {"Bearer b", "missing"}} {
 		status, body, _ = post(t, srv, tc.auth, `{"model":"m","input":"B","previous_response_id":"`+tc.id+`"}`)
 		if status != 400 || !strings.Contains(body, `"code":"previous_response_not_found"`) {
 			t.Fatalf("%s/%s: %d %s", tc.auth, tc.id, status, body)
