@@ -23,7 +23,9 @@ type wsFrame struct {
 
 // wsRefusedHandshake holds a non-101 upgrade response's spooled body.
 type wsRefusedHandshake struct {
-	body io.ReadCloser
+	body     io.ReadCloser
+	overflow bool // body exceeded maxResponseBytes; refusing silent truncation
+	failed   bool // body capture failed; refusing silent truncation
 }
 
 // wsHandshakeBody is a RoundTripper wrapper for the upstream WS handshake:
@@ -46,11 +48,14 @@ func (t *wsHandshakeBody) RoundTrip(req *http.Request) (*http.Response, error) {
 	if !isUpgradeRequest(req) {
 		return resp, nil
 	}
+	body := &wsRefusedHandshake{}
 	spool, err := t.k.newSpool()
 	if err != nil {
-		return resp, nil // fall back to the truncated diagnostic body
+		// No spool: refuse the silent 1024-byte truncation explicitly.
+		body.failed = true
+		*t.keep = body
+		return resp, nil
 	}
-	body := &wsRefusedHandshake{}
 	// Read into the spool while still returning the original stream to
 	// websocket.Dial, which consumes its own 1024-byte diagnostic prefix.
 	orig := resp.Body
@@ -65,6 +70,8 @@ func (t *wsHandshakeBody) RoundTrip(req *http.Request) (*http.Response, error) {
 		orig.Close()
 		if spool.size > maxResponseBytes {
 			spool.Close()
+			body.overflow = true
+			*t.keep = body
 			return nil
 		}
 		if rb, err := spool.requestBody(); err == nil {
@@ -74,6 +81,7 @@ func (t *wsHandshakeBody) RoundTrip(req *http.Request) (*http.Response, error) {
 			spool.Close()
 		} else {
 			spool.Close()
+			body.failed = true
 		}
 		*t.keep = body
 		return nil
@@ -149,6 +157,12 @@ func (k *keeper) serveWSNative(w http.ResponseWriter, r *http.Request) {
 	dialCancel()
 	if err != nil {
 		// A refused upgrade keeps the upstream status, headers and body.
+		// A body that overflowed or could not be captured is an explicit
+		// upstream error instead of a silently truncated reply.
+		if refused != nil && (refused.overflow || refused.failed) {
+			writeAPIError(w, &apiError{status: http.StatusBadGateway, typ: "upstream_error", message: "upstream rejection body exceeded working limit or could not be read"})
+			return
+		}
 		if resp != nil && resp.StatusCode != http.StatusSwitchingProtocols {
 			copyHeader(w.Header(), resp.Header)
 			w.Header().Del("Content-Length")
@@ -209,8 +223,15 @@ func (k *keeper) serveWSNative(w http.ResponseWriter, r *http.Request) {
 				}
 				return
 			}
-			f, err := k.spoolRequest(ctx, reader)
+			f, err := k.spoolRequestUTF8(ctx, reader, typ)
 			if err != nil {
+				if errors.Is(err, errInvalidUTF8) {
+					// RFC 6455 §8.1: invalid UTF-8 in a text message fails the
+					// connection with 1007 in the keeper's server role too.
+					_ = upstream.Close(websocket.StatusInvalidFramePayloadData, "invalid UTF-8")
+					upCh <- pumpResult{err: err}
+					return
+				}
 				if readDiscard(ctx, reader) != nil {
 					upCh <- pumpResult{err: errors.New("upstream read failed")}
 					return
@@ -289,26 +310,38 @@ func (k *keeper) serveWSNative(w http.ResponseWriter, r *http.Request) {
 	var nativeOpen bool            // native create forwarded, terminal not seen
 	var queued *wsFrame            // one create frame held while a turn runs
 
-	// cleanup releases every resource owned by this handler on every exit
-	// path: the in-flight turn spool and collector charge, a held queued
-	// frame, and any frames still sitting in a pump channel.
-	cleanup := func() {
+	// releaseInflight frees the recorded turn's spool and collector charge on
+	// every early exit; callers clear the pointer only after it returns.
+	releaseInflight := func() {
 		if inflight != nil {
 			inflight.turn.file.Close()
 			inflight.c.release(k.work)
 			inflight = nil
 		}
+	}
+
+	// cleanup releases every resource owned by this handler on every exit
+	// path: the in-flight turn spool and collector charge, a held queued
+	// frame, and any frames still sitting in a pump channel. It must only run
+	// after BOTH sockets are closed: each pump reads with
+	// context.Background(), so its Reader returns only when its own socket
+	// dies. Ranging a pump channel before that deadlocks and leaks the
+	// socket slot. It drains the original channels captured at pump start,
+	// not the select variables the handler nils on shutdown.
+	pumpUp, pumpCl := upCh, clCh
+	cleanup := func() {
+		releaseInflight()
 		if queued != nil {
 			queued.spool.Close()
 			<-k.work.turns
 			queued = nil
 		}
-		for res := range upCh {
+		for res := range pumpUp {
 			if res.frame.spool != nil {
 				res.frame.spool.Close()
 			}
 		}
-		for res := range clCh {
+		for res := range pumpCl {
 			if res.frame.spool != nil {
 				res.frame.spool.Close()
 				<-k.work.turns
@@ -353,6 +386,14 @@ func (k *keeper) serveWSNative(w http.ResponseWriter, r *http.Request) {
 			nativeOpen = false
 		}
 	}
+
+	// pendingFrame releases the frame carried by a pump result that arrived
+	// too late to be processed (cancellation race).
+	pendingFrame := func(res pumpResult) {
+		if res.frame.spool != nil {
+			res.frame.spool.Close()
+		}
+	}
 	for {
 		if queued != nil && inflight == nil && !nativeOpen {
 			f := queued
@@ -364,6 +405,9 @@ func (k *keeper) serveWSNative(w http.ResponseWriter, r *http.Request) {
 			if !ok {
 				// Channel closed after pump return without an error result;
 				// treat like a transport EOF.
+				upCh = nil
+				conn.CloseNow()
+				upstream.CloseNow()
 				cleanup()
 				return
 			}
@@ -371,11 +415,15 @@ func (k *keeper) serveWSNative(w http.ResponseWriter, r *http.Request) {
 				// Propagate the downstream close status to the client when
 				// it was a clean close handshake (RFC 6455 §7.1).
 				var ce websocket.CloseError
-				if errors.As(res.err, &ce) {
+				switch {
+				case errors.As(res.err, &ce):
 					_ = conn.Close(ce.Code, ce.Reason)
-				} else {
-					conn.CloseNow()
+				case errors.Is(res.err, errInvalidUTF8):
+					_ = conn.Close(websocket.StatusInvalidFramePayloadData, "invalid UTF-8")
 				}
+				upCh = nil
+				conn.CloseNow()
+				upstream.CloseNow()
 				cleanup()
 				return
 			}
@@ -383,6 +431,9 @@ func (k *keeper) serveWSNative(w http.ResponseWriter, r *http.Request) {
 			processUpstream(&f)
 		case res, ok := <-clCh:
 			if !ok {
+				clCh = nil
+				conn.CloseNow()
+				upstream.CloseNow()
 				cleanup()
 				return
 			}
@@ -390,9 +441,10 @@ func (k *keeper) serveWSNative(w http.ResponseWriter, r *http.Request) {
 				var ce websocket.CloseError
 				if errors.As(res.err, &ce) {
 					_ = upstream.Close(ce.Code, ce.Reason)
-				} else {
-					upstream.CloseNow()
 				}
+				clCh = nil
+				conn.CloseNow()
+				upstream.CloseNow()
 				cleanup()
 				return
 			}
@@ -401,23 +453,30 @@ func (k *keeper) serveWSNative(w http.ResponseWriter, r *http.Request) {
 				processClient(&f)
 				continue
 			}
-			// Hold at most one create while a turn is in flight; the reader
-			// already bounds the channel, so a second queued frame is shed.
-			if queued != nil {
-				queued.spool.Close()
-				<-k.work.turns
-				wsError(ctx, conn, workingError(errors.New("socket queue full")))
-			}
+			// Classify before touching the create queue: a non-create frame
+			// has no turn ordering and relays immediately; it must never
+			// evict the held create.
 			if !isWSCreate(f.spool) {
-				// Non-create frames have no turn ordering: relay immediately.
 				if err := k.wsRelayFrame(ctx, upstream, f.spool, f.typ); err != nil {
 					f.spool.Close()
 					<-k.work.turns
+					clCh = nil
+					conn.CloseNow()
+					upstream.CloseNow()
+					cleanup()
 					cancel()
-					continue
+					return
 				}
 				f.spool.Close()
 				<-k.work.turns
+				continue
+			}
+			// Hold at most one create while a turn is in flight; a second
+			// queued create is shed with an explicit overload error.
+			if queued != nil {
+				f.spool.Close()
+				<-k.work.turns
+				wsError(ctx, conn, workingError(errors.New("socket queue full")))
 				continue
 			}
 			held := f
@@ -425,15 +484,34 @@ func (k *keeper) serveWSNative(w http.ResponseWriter, r *http.Request) {
 		case <-ctx.Done():
 			// A pump may have queued its terminal error result just before
 			// cancelling; prefer propagating its close status over a bare
-			// drop so the peer still sees the real status/reason.
+			// drop so the peer still sees the real status/reason. Any frame
+			// carried by that result is released, never processed.
 			select {
 			case res := <-upCh:
 				var ce websocket.CloseError
 				if errors.As(res.err, &ce) {
 					_ = conn.Close(ce.Code, ce.Reason)
 				}
+				pendingFrame(res)
 			default:
 			}
+			select {
+			case res := <-clCh:
+				var ce websocket.CloseError
+				if errors.As(res.err, &ce) {
+					_ = upstream.Close(ce.Code, ce.Reason)
+				}
+				if res.frame.spool != nil {
+					res.frame.spool.Close()
+					<-k.work.turns
+				}
+			default:
+			}
+			// Kill both sockets first: the pumps read with
+			// context.Background(), so their Readers return only after this,
+			// closing the channels cleanup drains.
+			conn.CloseNow()
+			upstream.CloseNow()
 			cleanup()
 			return
 		}
@@ -463,52 +541,39 @@ type wsProbe struct {
 	generateSet       bool
 }
 
-// probeWSFrame scans the spooled frame for wsProbe fields. The JSON decoder's
-// buffer holds only decoder-internal state; skipped values stay on disk.
+// probeWSFrame scans the spooled frame for wsProbe fields with the span
+// scanner: a multi-megabyte input is skipped as a file span, never decoded
+// to heap.
 func probeWSFrame(data *spool) wsProbe {
 	var p wsProbe
-	dec := json.NewDecoder(io.NewSectionReader(data.File, data.offset, data.size))
-	if t, err := dec.Token(); err != nil || t != json.Delim('{') {
-		return p
-	}
-	for dec.More() {
-		key, err := dec.Token()
-		if err != nil {
-			return wsProbe{}
-		}
-		name, _ := key.(string)
-		switch name {
+	s := spoolScanner(data)
+	err := s.objectFields(data.keySlice, func(key string, start, end int64) error {
+		switch key {
 		case "type":
-			var s string
-			if err := dec.Decode(&s); err != nil {
-				return wsProbe{}
+			if raw := data.keySlice(start, end); raw != nil {
+				if v, ok := readJSONString(raw); ok {
+					p.typeSet = true
+					p.isCreate = v == "response.create"
+				}
 			}
-			p.typeSet = true
-			p.isCreate = s == "response.create"
 		case "previous_response_id":
-			var s string
-			if err := dec.Decode(&s); err != nil {
-				// null or non-string: treat as absent
-				if _, err := skipJSONValue(dec); err != nil {
-					return wsProbe{}
+			if raw := data.keySlice(start, end); raw != nil {
+				if v, ok := readJSONString(raw); ok && v != "" {
+					p.prev, p.prevSet = v, true
 				}
-				continue
 			}
-			p.prev, p.prevSet = s, s != ""
 		case "generate":
-			var b bool
-			if err := dec.Decode(&b); err != nil {
-				if _, err := skipJSONValue(dec); err != nil {
-					return wsProbe{}
+			if raw := data.keySlice(start, end); raw != nil {
+				var b bool
+				if json.Unmarshal(raw, &b) == nil {
+					p.generate, p.generateSet = b, true
 				}
-				continue
-			}
-			p.generate, p.generateSet = b, true
-		default:
-			if _, err := skipJSONValue(dec); err != nil {
-				return wsProbe{}
 			}
 		}
+		return nil
+	})
+	if err != nil {
+		return wsProbe{}
 	}
 	return p
 }
@@ -520,14 +585,22 @@ func isWSCreate(data *spool) bool {
 
 // wsNativeTerminal reports whether the spooled upstream text frame ends a
 // native turn (terminal response event or a request-level error frame).
+// It scans only the type field; the rest is skipped as spans.
 func wsNativeTerminal(data *spool) bool {
-	var probe struct {
-		Type string `json:"type"`
-	}
-	if err := json.NewDecoder(io.NewSectionReader(data.File, data.offset, data.size)).Decode(&probe); err != nil {
+	var kind string
+	s := spoolScanner(data)
+	err := s.objectFields(data.keySlice, func(key string, start, end int64) error {
+		if key == "type" {
+			if raw := data.keySlice(start, end); raw != nil {
+				kind, _ = readJSONString(raw)
+			}
+		}
+		return nil
+	})
+	if err != nil {
 		return true // unparseable: stop attributing frames to this turn
 	}
-	switch probe.Type {
+	switch kind {
 	case "response.completed", "response.incomplete", "response.failed", "error":
 		return true
 	}
@@ -681,26 +754,24 @@ func (k *keeper) wsNativeClientFrame(ctx context.Context, conn, upstream *websoc
 // rewriting ids and store as local turns do. On the terminal frame it stores
 // input+output, sets the session pin, and returns the stored public id; a
 // non-zero status marks the turn finished (-1: connection-level failure).
-func (k *keeper) wsNativeUpstreamFrame(ctx context.Context, conn *websocket.Conn, f *wsFrame, sess *wsSession, inflight *wsNativeInflight) int {
+// Every non-zero return releases the turn's spool and collector charge, so
+// the caller only clears its pointer.
+func (k *keeper) wsNativeUpstreamFrame(ctx context.Context, conn *websocket.Conn, f *wsFrame, sess *wsSession, inflight *wsNativeInflight) (status int) {
 	data := f.spool
+	endTurn := func(code int) int {
+		inflight.failed = code == -1
+		inflight.turn.file.Close()
+		inflight.c.release(k.work)
+		return code
+	}
 	// The event is the smallest unit: copy it once into a charged buffer so
 	// rewrite and collect share one bounded copy instead of two.
 	raw, err := data.chargedCopy(k.work)
 	if err != nil {
 		log.Printf("ws native upstream frame uncharged: %v", err)
-		inflight.failed = true
-		inflight.turn.file.Close()
-		inflight.c.release(k.work)
-		return -1
+		return endTurn(-1)
 	}
 	defer k.work.freeOutput(int64(cap(raw)))
-	if err := inflight.c.boundedEvent(raw, k.work); err != nil {
-		log.Printf("ws native upstream event rejected: %v", err)
-		inflight.failed = true
-		inflight.turn.file.Close()
-		inflight.c.release(k.work)
-		return -1
-	}
 	terminal := wsNativeTerminal(data)
 	accept := func() (bool, error) {
 		if rid, output, ok := inflight.c.final(); ok && inflight.id == "" {
@@ -725,19 +796,14 @@ func (k *keeper) wsNativeUpstreamFrame(ctx context.Context, conn *websocket.Conn
 	wire, release, err := k.responseFrame(ctx, &inflight.c, raw, true, inflight.turn.store, accept)
 	if err != nil {
 		log.Printf("ws native upstream frame failed: %v", err)
-		inflight.failed = true
-		inflight.turn.file.Close()
-		inflight.c.release(k.work)
-		return -1
+		return endTurn(-1)
 	}
 	defer release()
 	if err := conn.Write(ctx, websocket.MessageText, wire); err != nil {
-		return -1
+		return endTurn(-1)
 	}
 	if terminal {
-		inflight.turn.file.Close()
-		inflight.c.release(k.work)
-		return http.StatusOK
+		return endTurn(http.StatusOK)
 	}
 	return 0
 }

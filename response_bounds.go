@@ -117,10 +117,16 @@ func (c *collector) event(raw []byte) error {
 	}
 	return c.eventObj(obj)
 }
+// collectEventCalls is a test hook fired once per event decode.
+var collectEventCalls func()
+
 func (c *collector) eventObj(obj map[string]json.RawMessage) error {
 	kind, err := responseString(obj["type"])
 	if err != nil || kind == "" {
 		return errUpstreamData
+	}
+	if collectEventCalls != nil {
+		collectEventCalls()
 	}
 	switch kind {
 	case "response.output_item.done":
@@ -240,9 +246,10 @@ func (c *collector) boundedResponse(raw []byte, m *workingSet) error { return c.
 // Raw frames/bodies use a flat buffer. Capacity and the old+new copy overlap
 // are charged before growth; comments cannot allocate one slice per line.
 type responseBuffer struct {
-	data    []byte
-	work    *workingSet
-	started bool // at least one field was appended (empty data is valid)
+	data     []byte
+	work     *workingSet
+	started  bool // at least one field was appended (empty data is valid)
+	lastLine bool // SSE join: the previous data line ended; next byte prepends '\n'
 }
 
 func (b *responseBuffer) append(p []byte, limit int) error {
@@ -267,6 +274,7 @@ func (b *responseBuffer) close() {
 	b.work.freeOutput(int64(cap(b.data)))
 	b.data = nil
 	b.started = false
+	b.lastLine = false
 }
 func readResponseBody(r io.Reader, m *workingSet) (*responseBuffer, error) {
 	b := &responseBuffer{work: m}
@@ -316,14 +324,22 @@ func (k *keeper) responseFrameParsed(ctx context.Context, c *collector, raw []by
 	}
 	// The parse scratch held with the map stays reserved through acceptance and
 	// also covers the rewrite's encoder buffers (as one scratch always did).
+	retained := true
 	if accept != nil {
-		retained, err := accept()
+		var err error
+		retained, err = accept()
 		if err != nil {
 			k.work.freeOutput(held)
 			return nil, nil, nil, err
 		}
 		stored = stored && retained
 	}
+	// A turn the keeper could not retain keeps the upstream response id:
+	// publishing a resp_ alias the keeper cannot expand would promise a
+	// continuation it cannot serve. Pre-terminal frames still carry the
+	// rewrite (acceptance is decided at the terminal frame), the documented
+	// early-publication trade-off.
+	rewrite := accept == nil || retained
 	budget := held
 	if obj == nil {
 		budget = responseScratch(len(raw))
@@ -332,7 +348,10 @@ func (k *keeper) responseFrameParsed(ctx context.Context, c *collector, raw []by
 		}
 	}
 	var wire []byte
-	if obj != nil {
+	if !rewrite {
+		wire = raw
+		err = nil
+	} else if obj != nil {
 		wire, err = rewriteParsedPayload(obj, raw, stored)
 	} else {
 		wire, err = rewritePayload(raw, stored)
