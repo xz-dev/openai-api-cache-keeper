@@ -29,7 +29,7 @@ func waitWorking(t *testing.T, k *keeper, want int) {
 	t.Fatalf("turn slots=%d want=%d", len(k.work.turns), want)
 }
 func TestQueuedWSPingAndCancellation(t *testing.T) {
-	_, srv, k := newTestKeeper(t)
+	_, srv, k := newLocalTestKeeper(t)
 	leave, err := k.work.enter(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -63,7 +63,7 @@ func TestQueuedWSPingAndCancellation(t *testing.T) {
 	}
 }
 func TestQueuedHTTPCancellationAndOverflow(t *testing.T) {
-	_, srv, k := newTestKeeper(t)
+	_, srv, k := newLocalTestKeeper(t)
 	leave, err := k.work.enter(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -202,7 +202,7 @@ func TestOutputBoundsAndIncompleteStreamExplicit(t *testing.T) {
 			}))
 			defer up.Close()
 			u, _ := url.Parse(up.URL)
-			_, srv, k := newTestKeeper(t, func(c *config) { c.upstream = u })
+			_, srv, k := newLocalTestKeeper(t, func(c *config) { c.upstream = u })
 			status, body, _ := post(t, srv, "Bearer output", `{"input":"A","stream":true}`)
 			if strings.Contains(body, `"status":"completed"`) || (!strings.Contains(body, "working_set_too_large") && !strings.Contains(body, "upstream_error")) {
 				t.Fatalf("missing explicit failure: %d %s", status, body[:min(len(body), 500)])
@@ -219,7 +219,7 @@ func TestOutputBoundsAndIncompleteStreamExplicit(t *testing.T) {
 	}
 }
 func TestSpoolRemovedAfterSuccessfulTurns(t *testing.T) {
-	_, srv, k := newTestKeeper(t)
+	_, srv, k := newLocalTestKeeper(t)
 	for i := 0; i < 5; i++ {
 		status, _, _ := post(t, srv, "Bearer cleanup", `{"input":"A","stream":true}`)
 		if status != 200 {

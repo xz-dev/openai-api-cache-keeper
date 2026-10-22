@@ -140,7 +140,7 @@ func (k *keeper) wsTurn(ctx context.Context, conn *websocket.Conn, header http.H
 	}
 	defer t.file.Close()
 	hasPrev := t.hasPrev
-	resp, err := k.forwardDisk(ctx, upstream, "/v1/responses", header, t)
+	resp, err := k.forwardDisk(ctx, upstream, "/v1/responses", "", header, t)
 	if err != nil {
 		return "", wsError(ctx, conn, &apiError{status: http.StatusBadGateway, typ: "upstream_error", message: "upstream request failed"}), hasPrev
 	}

@@ -1,9 +1,9 @@
-# response-keeper
+# openai-api-cache-keeper
 
 Small Go reverse proxy that keeps OpenAI Responses API history in front of a stateless upstream. Clients send `previous_response_id` plus only the new input; the keeper replays the full history upstream.
 
 ```text
-API gateway -> response-keeper -> Responses upstream (no server-side state required)
+API gateway -> openai-api-cache-keeper -> Responses upstream (no server-side state required)
 ```
 
 The API gateway in front remains the public and security boundary. It must authenticate, authorize, rate-limit, and validate requests before forwarding here. This service has no admin API, metrics, or user-selected target.
@@ -27,7 +27,7 @@ What is stored:
 
 - Raw Responses items exactly as received or returned, including reasoning `encrypted_content`, `function_call`, and `function_call_output`. No format conversion is done.
 - Each entry is the full history up to that turn. Any stored id can be continued, so rolling back one or two steps is a normal continuation from an older id.
-- Entries are scoped to the SHA-256 of the incoming `Authorization` header, before any CPA credential substitution. If a gateway forwards one shared upstream key for every user, entries are not isolated per user.
+- Entries are scoped to the SHA-256 of the credential Sub2API authenticates after hop-by-hop headers are removed: a case-insensitive `Bearer` token (trimmed), else `X-API-Key`, else `X-Goog-API-Key`. The same key through either carrier owns the same entries. The digest only isolates entries; every task read or cancel is still revalidated upstream. If a gateway forwards one shared upstream key for every user, entries are not isolated per user.
 - `store: false` requests are not stored. On a WebSocket, the most recent turn can still be continued on the same socket, like OpenAI's connection-local cache. With `IGNORE_CLIENT_STORE_FALSE=true` they are stored (and returned with `store: true`) like any other turn, for clients such as Codex that always send `store: false` but should still recover after a reconnect.
 
 Retained history is bounded by payload and metadata budgets. Entries expire `STORE_TTL` after creation; least-recently-used registered IDs can be evicted to make room. bbolt under `STORE_DIR` holds both content-addressed items and transactional references/accounting. Identical item bytes are stored once. Per-item prefix nodes share growing histories even when clients resend full history without a previous ID; no per-response growing hash manifest is retained. `STORE_META_MAX_BYTES` charges every prefix node/hash occurrence, unique item index, response alias (including ID length), and socket pin. `STORE_PIN_MAX_BYTES` bounds all live WebSocket pins, including registered turns kept alive on their original socket; each socket charges its history's unique payload bytes. Replacement uses the net pin charge, not old plus new.
@@ -94,25 +94,25 @@ An invalid model or malformed request returns `400 / invalid_request_error`; `no
 | `STORE_TTL` | `10m` | Lifetime of a stored entry. |
 | `STORE_MAX_BYTES` | `209715200` | Byte budget for stored history (LRU eviction). |
 | `MAX_REQUEST_BYTES` | `33554432` | Maximum request body or WebSocket frame size. |
-| `STORE_DIR` | `/var/tmp/response-keeper` | Directory for the disposable disk cache. Must be a real disk volume, never tmpfs. |
+| `STORE_DIR` | `/var/tmp/openai-api-cache-keeper` | Directory for the disposable disk cache. Must be a real disk volume, never tmpfs. |
 | `STORE_META_MAX_BYTES` | `33554432` | Accounted metadata budget for prefix nodes, unique item indexes, response aliases and socket pins. |
 | `STORE_PIN_MAX_BYTES` | `104857600` | Aggregate payload budget for all live WebSocket history pins. |
 | `STORE_COMPACT_BYTES` | `419430400` | Physical file maintenance trigger before admission, not a hard disk quota; temporary-copy headroom required. |
 | `REQUIRE_NO_DEFAULT_ROUTE` | `false` | Refuse to start while the network namespace has a default route. |
 | `IGNORE_CLIENT_STORE_FALSE` | `false` | Store turns even when the client sent `store: false`. |
 
-`/healthz` returns `200 ok`; `response-keeper healthcheck` probes it for container health checks.
+`/healthz` returns `200 ok`; `openai-api-cache-keeper healthcheck` probes it for container health checks.
 
 ## Build and test
 
 ```sh
 go test -race ./...
-docker build -t response-keeper .
+docker build -t openai-api-cache-keeper .
 ```
 
 `testdata/routing-index.json` is the parser contract fixture. `TestRoutingIndexContract` checks Go; `testdata/routing-index.lua` checks the same cases against an unmodified `routing_selector.lua` using the APISIX image's `resty` executable (arguments: selector path, JSON fixture path).
 
-CI publishes `ghcr.io/xz-dev/response-keeper` with `latest` and the full commit SHA as tags on every push to `main`. Deployments should pin a digest.
+CI publishes `ghcr.io/xz-dev/openai-api-cache-keeper` with `latest` and the full commit SHA as tags on every push to `main`. Deployments should pin a digest.
 
 ## License
 

@@ -80,7 +80,7 @@ func TestConcurrentStoreFalseMetadataRefusal(t *testing.T) {
 	}))
 	defer upstream.Close()
 	u, _ := url.Parse(upstream.URL)
-	_, srv, k := newTestKeeper(t, func(c *config) { c.upstream = u })
+	_, srv, k := newLocalTestKeeper(t, func(c *config) { c.upstream = u })
 	var wg sync.WaitGroup
 	for i := 0; i < 16; i++ {
 		wg.Go(func() {
@@ -166,7 +166,7 @@ func TestTerminalJSONValidationAndAsynchronousPassThrough(t *testing.T) {
 			}))
 			defer up.Close()
 			u, _ := url.Parse(up.URL)
-			_, srv, k := newTestKeeper(t, func(c *config) { c.upstream = u })
+			_, srv, k := newLocalTestKeeper(t, func(c *config) { c.upstream = u })
 			status, body, _ := post(t, srv, "Bearer terminal", `{"input":"A"}`)
 			if (status == 200) != tc.success {
 				t.Fatalf("status=%d body=%s", status, body)
@@ -223,7 +223,7 @@ func TestTruncatedWSTurnPreservesAcceptedPin(t *testing.T) {
 	}))
 	defer up.Close()
 	u, _ := url.Parse(up.URL)
-	_, srv, k := newTestKeeper(t, func(c *config) { c.upstream = u })
+	_, srv, k := newLocalTestKeeper(t, func(c *config) { c.upstream = u })
 	conn := dialWS(t, srv, "Bearer private")
 	first := wsCreate(t, conn, `{"type":"response.create","input":"A","store":false}`)
 	id := responseID(first)

@@ -18,7 +18,7 @@ import (
 func TestWSPrivateTTLTransitionAndFailedReplacement(t *testing.T) {
 	for _, failRegistered := range []bool{false, true} {
 		t.Run(fmt.Sprint("registered_failure=", failRegistered), func(t *testing.T) {
-			up, srv, k := newTestKeeper(t)
+			up, srv, k := newLocalTestKeeper(t)
 			c := dialWS(t, srv, "Bearer lifecycle")
 			other := dialWS(t, srv, "Bearer lifecycle")
 			ev := wsCreate(t, c, `{"type":"response.create","input":"A","store":false}`)
@@ -76,7 +76,7 @@ func TestWSPrivateTTLTransitionAndFailedReplacement(t *testing.T) {
 func TestStorageTransactionFailureVisibleOnAllTransports(t *testing.T) {
 	for _, transport := range []string{"json", "sse", "ws"} {
 		t.Run(transport, func(t *testing.T) {
-			_, srv, k := newTestKeeper(t)
+			_, srv, k := newLocalTestKeeper(t)
 			// First obtain an accepted reference, then force bbolt's actual read-only
 			// transaction rejection. This is NOT an ENOSPC fixture.
 			var previous string

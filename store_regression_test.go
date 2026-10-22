@@ -133,7 +133,7 @@ func TestReviewCompactionTriggerRuns(t *testing.T) {
 	inspectStore(t, s)
 }
 func TestReviewStoreFalseThreeTurns(t *testing.T) {
-	_, srv, _ := newTestKeeper(t)
+	_, srv, _ := newLocalTestKeeper(t)
 	c := dialWS(t, srv, "Bearer separate-owner-1")
 	ev := wsCreate(t, c, `{"type":"response.create","input":"A","store":false}`)
 	for _, input := range []string{"B", "C", "D"} {
@@ -151,7 +151,7 @@ func TestReviewStoreFalseThreeTurns(t *testing.T) {
 // Store refusal is a cache miss, not a request failure: the turn is served,
 // not advertised as stored, and its id is not continuable.
 func TestReviewStoreRefusalServesUncachedHTTP(t *testing.T) {
-	_, srv, _ := newTestKeeper(t, func(c *config) { c.maxStoreBytes = 1 })
+	_, srv, _ := newLocalTestKeeper(t, func(c *config) { c.maxStoreBytes = 1 })
 	for _, stream := range []bool{false, true} {
 		status, body, _ := post(t, srv, "Bearer visible-refusal", fmt.Sprintf(`{"input":"A","stream":%v}`, stream))
 		if status != 200 || strings.Contains(body, "history_storage_failed") || !strings.Contains(body, `"status":"completed"`) || terminalStored(t, body) {
@@ -168,7 +168,7 @@ func TestReviewStoreRefusalServesUncachedHTTP(t *testing.T) {
 	}
 }
 func TestReviewStoreRefusalServesUncachedWS(t *testing.T) {
-	_, srv, _ := newTestKeeper(t, func(c *config) { c.storePinBytes = 1 })
+	_, srv, _ := newLocalTestKeeper(t, func(c *config) { c.storePinBytes = 1 })
 	c := dialWS(t, srv, "Bearer pin-refusal-owner")
 	assertServedUncached(t, wsCreate(t, c, `{"type":"response.create","input":"A","store":false}`))
 }
@@ -270,7 +270,7 @@ func TestStartedTurnFailureIsTerminalResponseFailed(t *testing.T) {
 	}))
 	defer up.Close()
 	u, _ := url.Parse(up.URL)
-	_, srv, _ := newTestKeeper(t, func(c *config) { c.upstream = u })
+	_, srv, _ := newLocalTestKeeper(t, func(c *config) { c.upstream = u })
 	c := dialWS(t, srv, "Bearer terminal-failure")
 	ev := wsCreate(t, c, `{"type":"response.create","input":"CUT"}`)
 	resp, _ := ev["response"].(map[string]any)
@@ -294,7 +294,7 @@ func TestUnstartedTurnFailureIsRequestError(t *testing.T) {
 	}))
 	defer up.Close()
 	u, _ := url.Parse(up.URL)
-	_, srv, _ := newTestKeeper(t, func(c *config) { c.upstream = u })
+	_, srv, _ := newLocalTestKeeper(t, func(c *config) { c.upstream = u })
 	if ev := wsCreate(t, dialWS(t, srv, "Bearer unstarted"), `{"type":"response.create","input":"A"}`); ev["type"] != "error" {
 		t.Fatalf("unstarted failure must be a request error: %v", ev)
 	}

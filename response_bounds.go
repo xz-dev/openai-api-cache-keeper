@@ -115,6 +115,9 @@ func (c *collector) event(raw []byte) error {
 	if err != nil {
 		return err
 	}
+	return c.eventObj(obj)
+}
+func (c *collector) eventObj(obj map[string]json.RawMessage) error {
 	kind, err := responseString(obj["type"])
 	if err != nil || kind == "" {
 		return errUpstreamData
@@ -185,27 +188,51 @@ func responseScratch(n int) int64 {
 	return 8*int64(n) + 2*maxHistoryItems*24 + 256*128
 }
 func (c *collector) collect(raw []byte, m *workingSet, event bool) error {
+	_, held, err := c.collectParsed(raw, m, event)
+	m.freeOutput(held)
+	return err
+}
+
+// collectParsed also returns an event's decoded top level for reuse. While the
+// map lives, a frame-sized part of the parse scratch stays reserved as held
+// bytes; the caller frees held once the map is dropped. No per-map size
+// estimate is attempted.
+func (c *collector) collectParsed(raw []byte, m *workingSet, event bool) (map[string]json.RawMessage, int64, error) {
 	scratch := responseScratch(len(raw))
 	if len(raw) > maxResponseBytes || !m.reserveOutput(scratch) {
-		return errWorkSize
+		return nil, 0, errWorkSize
 	}
+	var obj map[string]json.RawMessage
 	var err error
 	if event {
-		err = c.event(raw)
+		if obj, err = responseObject(raw); err == nil {
+			err = c.eventObj(obj)
+		}
 	} else {
 		err = c.response(raw)
 	}
 	if err != nil {
 		m.freeOutput(scratch)
-		return err
+		return nil, 0, err
 	}
 	actual := c.bytes()
-	m.freeOutput(scratch + c.charged - actual)
+	rest := scratch + c.charged - actual // what the collector did not keep
 	c.charged = actual
-	if actual > maxResponseBytes {
-		return errWorkSize
+	// Keep the frame-sized part of scratch (8x the frame) with the map; its
+	// copied values/keys plus allocator slack and <=256 entries stay far below.
+	var held int64
+	if obj != nil {
+		held = min(rest, 8*int64(len(raw))+256*128)
 	}
-	return nil
+	if held <= 0 {
+		obj, held = nil, 0 // never return a map without its reservation
+	}
+	m.freeOutput(rest - held)
+	if actual > maxResponseBytes {
+		m.freeOutput(held)
+		return nil, 0, errWorkSize
+	}
+	return obj, held, nil
 }
 func (c *collector) boundedEvent(raw []byte, m *workingSet) error    { return c.collect(raw, m, true) }
 func (c *collector) boundedResponse(raw []byte, m *workingSet) error { return c.collect(raw, m, false) }
@@ -265,40 +292,73 @@ func readResponseBody(r io.Reader, m *workingSet) (*responseBuffer, error) {
 // that was not retained keeps the upstream store value, so clients never
 // continue from an id the keeper does not hold.
 func (k *keeper) responseFrame(ctx context.Context, c *collector, raw []byte, event, stored bool, accept func() (bool, error)) ([]byte, func(), error) {
+	wire, release, _, err := k.responseFrameParsed(ctx, c, raw, event, stored, accept)
+	return wire, release, err
+}
+
+// responseFrameParsed decodes an event's top level once. The decoded object is
+// returned (and stays charged until release) only when it still describes the
+// returned wire bytes, so a background log can reuse it.
+func (k *keeper) responseFrameParsed(ctx context.Context, c *collector, raw []byte, event, stored bool, accept func() (bool, error)) ([]byte, func(), map[string]json.RawMessage, error) {
 	leave, err := k.work.enter(ctx)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	defer leave()
-	if err := c.collect(raw, k.work, event); err != nil {
-		return nil, nil, err
+	obj, held, err := c.collectParsed(raw, k.work, event)
+	if err != nil {
+		return nil, nil, nil, err
 	}
+	// The parse scratch held with the map stays reserved through acceptance and
+	// also covers the rewrite's encoder buffers (as one scratch always did).
 	if accept != nil {
 		retained, err := accept()
 		if err != nil {
-			return nil, nil, err
+			k.work.freeOutput(held)
+			return nil, nil, nil, err
 		}
 		stored = stored && retained
 	}
-	scratch := responseScratch(len(raw))
-	if !k.work.reserveOutput(scratch) {
-		return nil, nil, errWorkSize
+	budget := held
+	if obj == nil {
+		budget = responseScratch(len(raw))
+		if !k.work.reserveOutput(budget) {
+			return nil, nil, nil, errWorkSize
+		}
 	}
-	wire, err := rewritePayload(raw, stored)
+	var wire []byte
+	if obj != nil {
+		wire, err = rewriteParsedPayload(obj, raw, stored)
+	} else {
+		wire, err = rewritePayload(raw, stored)
+	}
+	if err == nil && len(wire) > maxResponseBytes {
+		err = errWorkSize
+	}
 	if err != nil {
-		k.work.freeOutput(scratch)
-		return nil, nil, err
-	}
-	if len(wire) > maxResponseBytes {
-		k.work.freeOutput(scratch)
-		return nil, nil, errWorkSize
+		k.work.freeOutput(budget)
+		return nil, nil, nil, err
 	}
 	// The returned copy is independent of the raw read buffer and remains
-	// charged while the network writer is blocked.
+	// charged while the network writer is blocked. An escaping map keeps the
+	// whole budget until release.
 	owned := append([]byte(nil), wire...)
-	k.work.freeOutput(scratch - int64(cap(owned)))
-	release := func() { k.work.freeOutput(int64(cap(owned))) }
-	return owned, release, nil
+	keep := int64(cap(owned))
+	if obj != nil && bytes.Equal(wire, raw) {
+		keep = max(keep, budget)
+	} else {
+		obj = nil
+	}
+	if keep > budget {
+		if !k.work.reserveOutput(keep - budget) {
+			k.work.freeOutput(budget)
+			return nil, nil, nil, errWorkSize
+		}
+	} else {
+		k.work.freeOutput(budget - keep)
+	}
+	release := func() { k.work.freeOutput(keep) }
+	return owned, release, obj, nil
 }
 func readDiscard(ctx context.Context, r io.Reader) error {
 	_, err := io.CopyBuffer(io.Discard, r, make([]byte, 32<<10))

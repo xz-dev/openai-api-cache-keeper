@@ -10,17 +10,23 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/http/httputil"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 )
 
 type keeper struct {
-	cfg     config
-	store   *store
-	client  *http.Client
-	routing *routingClient
-	work    *workingSet
+	cfg        config
+	store      *store
+	client     *http.Client
+	routing    *routingClient
+	work       *workingSet
+	native     *httputil.ReverseProxy
+	cacheMu    sync.Mutex
+	tasks      map[string]*responseTask
+	eventBytes int64
 }
 
 func newKeeper(cfg config) *keeper {
@@ -39,13 +45,18 @@ func newKeeper(cfg config) *keeper {
 	if cfg.routingIndex != nil {
 		routing = newRoutingClient(cfg.routingIndex)
 	}
-	return &keeper{
+	k := &keeper{
 		routing: routing,
 		work:    newWorkingSet(),
 		cfg:     cfg,
 		store:   st,
+		tasks:   make(map[string]*responseTask),
 		client:  &http.Client{Transport: transport, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }},
 	}
+	if cfg.upstream != nil {
+		k.native = k.newNativeProxy()
+	}
+	return k
 }
 
 func (k *keeper) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -54,12 +65,53 @@ func (k *keeper) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		_, _ = io.WriteString(w, "ok")
 		return
 	}
-	if r.URL.Path != "/v1/responses" && r.URL.Path != "/responses" {
-		writeAPIError(w, &apiError{status: http.StatusNotFound, typ: "invalid_request_error", message: "not found"})
+	if k.cfg.upstream != nil && k.taskOperation(w, r) {
 		return
 	}
+	if r.URL.Path != "/v1/responses" && r.URL.Path != "/responses" {
+		// Native default path: the fixed single upstream decides every other
+		// path, method, and query itself. Routed deployments have no single
+		// upstream, so nothing transparent exists to forward to.
+		if k.cfg.upstream == nil {
+			writeAPIError(w, &apiError{status: http.StatusNotImplemented, typ: "invalid_request_error", message: "no upstream configured"})
+			return
+		}
+		k.serveNative(w, r)
+		return
+	}
+	if k.cfg.upstream == nil {
+		// Routed mode: every Responses request is a local checkpoint turn.
+		k.serveLocalTurn(w, r)
+		return
+	}
+	// Standard Responses paths select local checkpoint handling only for an
+	// explicit keeper-owned previous_response_id; everything else (native
+	// previous_response_id, plain turns, WS upgrades) is native transparent
+	// traffic with no private path or flag.
+	if r.Method == http.MethodPost && !isUpgradeRequest(r) {
+		release, owned, background, handled := k.localCheckpointTurn(w, r)
+		if handled {
+			return
+		}
+		defer release()
+		if background {
+			k.startBackground(w, r)
+			return
+		}
+		if owned {
+			k.serveLocalTurn(w, r)
+			return
+		}
+	}
+	k.serveNative(w, r)
+}
+
+// serveLocalTurn dispatches the existing local-history handlers: the WS
+// protocol for upgrades, the SSE/JSON relay for POSTs, and the prior explicit
+// method error for anything else on these two paths.
+func (k *keeper) serveLocalTurn(w http.ResponseWriter, r *http.Request) {
 	switch {
-	case r.Method == http.MethodGet && strings.EqualFold(r.Header.Get("Upgrade"), "websocket"):
+	case r.Method == http.MethodGet && isUpgradeRequest(r):
 		k.serveWS(w, r)
 	case r.Method == http.MethodPost:
 		k.serveHTTP(w, r)
@@ -67,6 +119,57 @@ func (k *keeper) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Allow", "GET, POST")
 		writeAPIError(w, &apiError{status: http.StatusMethodNotAllowed, typ: "invalid_request_error", message: "method not allowed"})
 	}
+}
+
+// localCheckpointTurn decides whether this POST is a local checkpoint turn
+// (keeper-owned previous_response_id for the caller). The body is spooled to
+// inspect the id, then handed back re-read so serveHTTP does not re-read the
+// network body; a local checkpoint turn never reaches the native proxy. When
+// the id is keeper-owned but no longer usable, it writes the fail-closed
+// error itself and returns handled. The returned release keeps the spool
+// alive until the chosen handler finishes with the body.
+func (k *keeper) localCheckpointTurn(w http.ResponseWriter, r *http.Request) (release func(), ownedTurn bool, background bool, handled bool) {
+	if !trySlot(k.work.turns) {
+		writeAPIError(w, workingError(errors.New("turn limit")))
+		return nil, false, false, true
+	}
+	defer func() { <-k.work.turns }()
+	if r.ContentLength > k.cfg.maxRequestBytes {
+		writeAPIError(w, workingError(errWorkSize))
+		return nil, false, false, true
+	}
+	raw, err := k.spoolRequest(r.Context(), http.MaxBytesReader(w, r.Body, k.cfg.maxRequestBytes))
+	if err != nil {
+		writeAPIError(w, workingError(err))
+		return nil, false, false, true
+	}
+	leave, err := k.work.enter(r.Context())
+	if err != nil {
+		raw.Close()
+		writeAPIError(w, workingError(err))
+		return nil, false, false, true
+	}
+	var flags struct {
+		Stream     json.RawMessage `json:"stream"`
+		Background json.RawMessage `json:"background"`
+	}
+	decodeErr := json.NewDecoder(io.NewSectionReader(raw.File, raw.offset, raw.size)).Decode(&flags)
+	_, owned, apiErr := k.ownedLocalPreviousID(raw, ownerOf(r))
+	leave()
+	if apiErr != nil {
+		writeAPIError(w, apiErr)
+		raw.Close()
+		return nil, false, false, true
+	}
+	body, err := raw.requestBody()
+	if err != nil {
+		raw.Close()
+		writeAPIError(w, workingError(err))
+		return nil, false, false, true
+	}
+	r.Body = body
+	background = decodeErr == nil && string(flags.Stream) == "true" && string(flags.Background) == "true"
+	return func() { body.Close(); raw.Close() }, owned, background, false
 }
 
 // apiError renders as an OpenAI-shaped error object.
@@ -110,7 +213,23 @@ func logNotRetained(err error) {
 	log.Printf("history not retained; turn served uncached: %v", err)
 }
 
-func ownerOf(r *http.Request) [32]byte { return sha256.Sum256([]byte(r.Header.Get("Authorization"))) }
+// Match Sub2API's credential precedence after the same hop-by-hop cleanup used
+// for upstream requests; the digest is not authentication.
+func ownerOf(r *http.Request) [32]byte {
+	h := http.Header{}
+	copyHeader(h, r.Header)
+	var credential string
+	if scheme, token, ok := strings.Cut(h.Get("Authorization"), " "); ok && strings.EqualFold(scheme, "Bearer") {
+		credential = strings.TrimSpace(token)
+	}
+	if credential == "" {
+		credential = h.Get("X-API-Key")
+	}
+	if credential == "" {
+		credential = h.Get("X-Goog-API-Key")
+	}
+	return sha256.Sum256([]byte(credential))
+}
 
 type lookupFunc func(id string) ([]json.RawMessage, bool)
 
@@ -218,9 +337,10 @@ func publicID(id string) string {
 	return "resp_" + id
 }
 
-func (k *keeper) forwardReader(ctx context.Context, upstream *url.URL, path string, header http.Header, body io.Reader) (*http.Response, error) {
+func (k *keeper) forwardReader(ctx context.Context, upstream *url.URL, path, rawQuery string, header http.Header, body io.Reader) (*http.Response, error) {
 	target := *upstream
 	target.Path = strings.TrimRight(target.Path, "/") + path
+	target.RawQuery = rawQuery
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, target.String(), body)
 	if err != nil {
 		if closer, ok := body.(io.Closer); ok {
@@ -244,6 +364,7 @@ func (k *keeper) forwardReader(ctx context.Context, upstream *url.URL, path stri
 }
 
 func (k *keeper) serveHTTP(w http.ResponseWriter, r *http.Request) {
+	task, _ := r.Context().Value(backgroundTaskKey{}).(*responseTask)
 	start := time.Now()
 	if !trySlot(k.work.turns) {
 		writeAPIError(w, workingError(errors.New("turn limit")))
@@ -279,7 +400,7 @@ func (k *keeper) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	defer t.file.Close()
 	hasPrev := t.hasPrev
-	resp, err := k.forwardDisk(r.Context(), upstream, r.URL.Path, r.Header, t)
+	resp, err := k.forwardDisk(r.Context(), upstream, r.URL.Path, r.URL.RawQuery, r.Header, t)
 	if err != nil {
 		writeAPIError(w, &apiError{status: http.StatusBadGateway, typ: "upstream_error", message: "upstream request failed"})
 		logTurn("http", http.StatusBadGateway, hasPrev, "", start, k.store)
@@ -292,7 +413,25 @@ func (k *keeper) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	defer c.release(k.work)
 	id := ""
 	accept := func() (bool, error) {
+		if task != nil {
+			rid := c.responseID()
+			task.mu.Lock()
+			if rid != "" && task.upstreamID != "" && task.upstreamID != rid {
+				task.mu.Unlock()
+				return false, errUpstreamData
+			}
+			if rid != "" {
+				task.upstreamID = rid
+			}
+			task.mu.Unlock()
+		}
 		if rid, output, ok := c.final(); ok && t.store && id == "" {
+			if task != nil {
+				if !task.stream || c.status != "completed" {
+					return false, nil
+				}
+				rid = task.id
+			}
 			if err := r.Context().Err(); err != nil {
 				return false, err
 			}
@@ -308,11 +447,18 @@ func (k *keeper) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(resp.StatusCode)
 		rc := http.NewResponseController(w)
 		var wire []byte
+		var parsed map[string]json.RawMessage
 		var release func()
 		err = readSSE(resp.Body, func(frame []byte) error {
 			if release != nil {
 				defer release()
-				defer func() { wire = nil; release = nil }()
+				defer func() { wire, parsed, release = nil, nil, nil }()
+			}
+			if task != nil {
+				if wire == nil {
+					return nil
+				}
+				return task.record(r.Context(), wire, parsed)
 			}
 			if err := writeSSEFrame(w, frame, wire); err != nil {
 				return err
@@ -320,7 +466,15 @@ func (k *keeper) serveHTTP(w http.ResponseWriter, r *http.Request) {
 			return rc.Flush()
 		}, func(data []byte) error {
 			var e error
-			wire, release, e = k.responseFrame(r.Context(), &c, data, true, t.store, accept)
+			if task == nil {
+				wire, release, e = k.responseFrame(r.Context(), &c, data, true, t.store, accept)
+				return e
+			}
+			wire, release, parsed, e = k.responseFrameParsed(r.Context(), &c, data, true, t.store, accept)
+			if e == nil && task.nativeParent && parsed == nil {
+				// Native parents keep upstream bytes; the decoded object no longer matches wire.
+				wire = data
+			}
 			return e
 		}, k.work)
 		if err == nil && !c.done {
@@ -336,7 +490,8 @@ func (k *keeper) serveHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	} else {
-		if resp.StatusCode != http.StatusOK {
+		// Unexpected HTTP replies to background streams are opaque, not checkpoint documents.
+		if resp.StatusCode != http.StatusOK || task != nil {
 			w.WriteHeader(resp.StatusCode)
 			_, _ = io.Copy(w, resp.Body)
 			return

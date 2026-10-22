@@ -1,4 +1,4 @@
-module github.com/xz-dev/response-keeper
+module github.com/xz-dev/openai-api-cache-keeper
 
 go 1.26
 

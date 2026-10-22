@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 )
@@ -19,6 +20,7 @@ import (
 const (
 	maxTurns                = 64
 	maxSockets              = 64
+	maxTaskReaders          = 4 // concurrent local readers per background task
 	maxHistoryBytes   int64 = 64 << 20
 	maxHistoryItems         = 8192
 	maxEventBytes           = 1 << 20
@@ -162,6 +164,7 @@ func (k *keeper) prepareDisk(ctx context.Context, raw *spool, owner [32]byte, lo
 	if err := ctx.Err(); err != nil {
 		return nil, workingError(err)
 	}
+	task, _ := ctx.Value(backgroundTaskKey{}).(*responseTask)
 	r := io.NewSectionReader(raw.File, raw.offset, raw.size)
 	dec := json.NewDecoder(r)
 	start, decodeErr := dec.Token()
@@ -194,7 +197,16 @@ func (k *keeper) prepareDisk(ctx context.Context, raw *spool, owner [32]byte, lo
 		}
 		switch name {
 		case "prompt_cache_retention":
-			if _, err := skipJSONValue(dec); err != nil {
+			if task != nil {
+				var value json.RawMessage
+				if err := dec.Decode(&value); err != nil {
+					return nil, responseError(errUpstreamData)
+				}
+				if other == nil {
+					other = map[string]json.RawMessage{}
+				}
+				other[name] = value
+			} else if _, err := skipJSONValue(dec); err != nil {
 				return nil, &apiError{status: 400, typ: "invalid_request_error", message: "invalid request JSON"}
 			}
 		case "input":
@@ -296,6 +308,21 @@ func (k *keeper) prepareDisk(ctx context.Context, raw *spool, owner [32]byte, lo
 			return nil, &apiError{status: 400, typ: "invalid_request_error", param: "input", message: err.Error()}
 		}
 		inStrings = append(inStrings, string(bytes.TrimRight(sb.Bytes(), "\n")))
+	}
+	if task != nil {
+		delete(other, "background")
+		if prevID != "" {
+			if _, local := lookup(prevID); !local && !strings.HasPrefix(prevID, keeperResponsePrefix) {
+				if other == nil {
+					other = map[string]json.RawMessage{}
+				}
+				other["previous_response_id"], _ = json.Marshal(prevID)
+				prevID = ""
+				task.mu.Lock()
+				task.nativeParent = true
+				task.mu.Unlock()
+			}
+		}
 	}
 	if ws {
 		if other == nil {
@@ -422,6 +449,10 @@ func (k *keeper) prepareDisk(ctx context.Context, raw *spool, owner [32]byte, lo
 	if k.cfg.ignoreClientStoreFalse {
 		t.store = true
 	}
+	if task != nil && task.nativeParent {
+		// Unknown native parent history must stay native, never a partial local chain.
+		t.store = false
+	}
 	return t, nil
 }
 
@@ -476,14 +507,22 @@ func (k *keeper) acceptDisk(ctx context.Context, t *diskTurn, id string, owner [
 	if len(t.spans) > maxHistoryItems {
 		return "", errWorkSize
 	}
+	k.cacheMu.Lock()
+	defer k.cacheMu.Unlock()
+	if k.eventBytes > 0 {
+		_, history := k.store.stats()
+		if history+k.eventBytes+encoded > k.cfg.maxStoreBytes {
+			return "", errWorkSize
+		}
+	}
 	_, handle, err := k.store.accept(id, owner, t.itemSource(), oldPin, t.store, pin)
 	return handle, err
 }
 
-func (k *keeper) forwardDisk(ctx context.Context, upstream *url.URL, path string, header http.Header, t *diskTurn) (*http.Response, error) {
+func (k *keeper) forwardDisk(ctx context.Context, upstream *url.URL, path, rawQuery string, header http.Header, t *diskTurn) (*http.Response, error) {
 	body, err := t.file.requestBody()
 	if err != nil {
 		return nil, err
 	}
-	return k.forwardReader(ctx, upstream, path, header, body)
+	return k.forwardReader(ctx, upstream, path, rawQuery, header, body)
 }

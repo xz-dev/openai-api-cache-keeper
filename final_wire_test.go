@@ -42,7 +42,7 @@ func TestFinalTruncatedWireSSE(t *testing.T) {
 	}))
 	defer up.Close()
 	u, _ := url.Parse(up.URL)
-	_, srv, k := newTestKeeper(t, func(c *config) { c.upstream = u })
+	_, srv, k := newLocalTestKeeper(t, func(c *config) { c.upstream = u })
 	status, body, _ := post(t, srv, "Bearer wire", `{"input":"A","stream":true}`)
 	n, _ := k.store.stats()
 	t.Logf("status=%d stored=%d body=%s", status, n, body)
@@ -83,7 +83,7 @@ func TestFinalEarlyResponseRealHTTP(t *testing.T) {
 		got <- fmt.Sprintf("wireRequestBytes=%d err=%v", n, err)
 	}()
 	u, _ := url.Parse("http://" + ln.Addr().String())
-	_, srv, _ := newTestKeeper(t, func(c *config) {
+	_, srv, _ := newLocalTestKeeper(t, func(c *config) {
 		c.upstream = u
 		c.maxRequestBytes = 32 << 20
 		c.maxStoreBytes = 64 << 20

@@ -40,7 +40,7 @@ func TestFinalMalformedJSONExplicit(t *testing.T) {
 			}))
 			defer up.Close()
 			u, _ := url.Parse(up.URL)
-			_, srv, k := newTestKeeper(t, func(c *config) { c.upstream = u })
+			_, srv, k := newLocalTestKeeper(t, func(c *config) { c.upstream = u })
 			status, got, _ := post(t, srv, "Bearer test", `{"input":"A"}`)
 			entries, _ := k.store.stats()
 			t.Logf("status=%d entries=%d body=%s", status, entries, got)
@@ -78,13 +78,13 @@ func (f finalEarlyTransport) RoundTrip(r *http.Request) (*http.Response, error) 
 	return &http.Response{StatusCode: 200, Header: http.Header{"Content-Type": []string{"application/json"}}, Body: io.NopCloser(strings.NewReader(`{"object":"response","id":"resp_early","status":"completed","output":[]}`))}, nil
 }
 func TestFinalEarlyResponseBodyLifetime(t *testing.T) {
-	_, _, k := newTestKeeper(t)
+	_, _, k := newLocalTestKeeper(t)
 	resume := make(chan struct{})
 	result := make(chan error, 1)
 	k.client = &http.Client{Transport: finalEarlyTransport{resume, result}}
 	req := httptest.NewRequest("POST", "http://keeper/v1/responses", strings.NewReader(`{"input":"still reading"}`))
 	out := httptest.NewRecorder()
-	k.ServeHTTP(out, req)
+	k.serveLocalTurn(out, req)
 	close(resume)
 	err := <-result
 	t.Logf("clientStatus=%d transportReadError=%v", out.Code, err)
@@ -108,12 +108,12 @@ func TestFinalEscapedOutputRewrite(t *testing.T) {
 }
 
 func TestFinalIncompleteTransportDoesNotCommit(t *testing.T) {
-	_, _, k := newTestKeeper(t)
+	_, _, k := newLocalTestKeeper(t)
 	// A complete JSON token followed by truncated HTTP framing is not a complete SSE event.
 	raw := `data: {"type":"response.completed","response":{"id":"resp_truncated","status":"completed","output":[]}}`
 	k.client = &http.Client{Transport: finalErrorTransport{raw}}
 	out := httptest.NewRecorder()
-	k.ServeHTTP(out, httptest.NewRequest("POST", "http://keeper/v1/responses", strings.NewReader(`{"input":"A","stream":true}`)))
+	k.serveLocalTurn(out, httptest.NewRequest("POST", "http://keeper/v1/responses", strings.NewReader(`{"input":"A","stream":true}`)))
 	n, _ := k.store.stats()
 	t.Logf("entries=%d body=%s", n, out.Body.String())
 	if n != 0 || strings.Contains(out.Body.String(), "response.completed") {

@@ -80,6 +80,10 @@ func (f *fakeUpstream) last() []json.RawMessage {
 }
 
 func newTestKeeper(t *testing.T, opts ...func(*config)) (*fakeUpstream, *httptest.Server, *keeper) {
+	return newKeeperFixture(t, false, opts...)
+}
+
+func newKeeperFixture(t *testing.T, local bool, opts ...func(*config)) (*fakeUpstream, *httptest.Server, *keeper) {
 	t.Helper()
 	up := &fakeUpstream{}
 	upSrv := httptest.NewServer(up)
@@ -91,9 +95,31 @@ func newTestKeeper(t *testing.T, opts ...func(*config)) (*fakeUpstream, *httptes
 		opt(&cfg)
 	}
 	k := newKeeper(cfg)
-	srv := httptest.NewServer(k)
+	var handler http.Handler = k
+	if local {
+		handler = http.HandlerFunc(k.serveLocalTurn)
+	}
+	srv := httptest.NewServer(handler)
 	t.Cleanup(srv.Close)
 	t.Cleanup(func() { _ = k.store.close() })
+	t.Cleanup(func() {
+		k.cacheMu.Lock()
+		tasks := make([]*responseTask, 0, len(k.tasks))
+		for _, task := range k.tasks {
+			tasks = append(tasks, task)
+		}
+		k.cacheMu.Unlock()
+		for _, task := range tasks {
+			task.expire()
+		}
+		for _, task := range tasks {
+			select {
+			case <-task.finished:
+			case <-time.After(workWait):
+				t.Error("background task did not stop")
+			}
+		}
+	})
 	return up, srv, k
 }
 
@@ -157,7 +183,7 @@ func kinds(items []json.RawMessage) []string {
 }
 
 func TestHTTPDeltaContinuationAndRollback(t *testing.T) {
-	up, srv, _ := newTestKeeper(t)
+	up, srv, _ := newLocalTestKeeper(t)
 	auth := "Bearer a"
 	status, body, _ := post(t, srv, auth, `{"model":"m","input":"A","stream":true}`)
 	if status != 200 {
@@ -187,7 +213,7 @@ func TestHTTPDeltaContinuationAndRollback(t *testing.T) {
 }
 
 func TestMessageStyleIDsArePublishedAsResponseIDs(t *testing.T) {
-	up, srv, _ := newTestKeeper(t)
+	up, srv, _ := newLocalTestKeeper(t)
 	_, body, _ := post(t, srv, "Bearer a", `{"model":"anthropic","input":"A","stream":true}`)
 	id := completedID(t, body)
 	if id != "resp_msg_1" || strings.Contains(body, `"id":"msg_1"`) {
@@ -208,7 +234,7 @@ func TestMessageStyleIDsArePublishedAsResponseIDs(t *testing.T) {
 }
 
 func TestHTTPUnknownAndForeignIDs(t *testing.T) {
-	_, srv, _ := newTestKeeper(t)
+	_, srv, _ := newLocalTestKeeper(t)
 	status, body, _ := post(t, srv, "Bearer a", `{"model":"m","input":"A","stream":true}`)
 	id := completedID(t, body)
 	for _, tc := range []struct{ auth, id string }{{"Bearer a", "missing"}, {"Bearer b", id}} {
@@ -220,7 +246,7 @@ func TestHTTPUnknownAndForeignIDs(t *testing.T) {
 }
 
 func TestHTTPStoreFalseIsNotKept(t *testing.T) {
-	_, srv, k := newTestKeeper(t)
+	_, srv, k := newLocalTestKeeper(t)
 	_, body, _ := post(t, srv, "Bearer a", `{"model":"m","input":"A","stream":true,"store":false}`)
 	completedID(t, body)
 	if n, _ := k.store.stats(); n != 0 {
@@ -229,7 +255,7 @@ func TestHTTPStoreFalseIsNotKept(t *testing.T) {
 }
 
 func TestUpstreamErrorsPassThroughVerbatim(t *testing.T) {
-	_, srv, _ := newTestKeeper(t)
+	_, srv, _ := newLocalTestKeeper(t)
 	for _, code := range []int{400, 404, 413, 429, 500} {
 		status, body, header := post(t, srv, "Bearer a", fmt.Sprintf(`{"model":"status-%d","input":"x","stream":true}`, code))
 		if status != code || !strings.Contains(body, "must not be truncated by the keeper") || header.Get("Retry-After") != "7" {
@@ -345,7 +371,7 @@ func responseID(ev map[string]any) string {
 }
 
 func TestWSSameSocketNewSocketAndStoreFalse(t *testing.T) {
-	up, srv, _ := newTestKeeper(t)
+	up, srv, _ := newLocalTestKeeper(t)
 	c1 := dialWS(t, srv, "Bearer a")
 	id1 := responseID(wsCreate(t, c1, `{"type":"response.create","model":"m","input":"A"}`))
 	id2 := responseID(wsCreate(t, c1, `{"type":"response.create","model":"m","input":"B","previous_response_id":"`+id1+`"}`))
@@ -376,7 +402,7 @@ func TestWSSameSocketNewSocketAndStoreFalse(t *testing.T) {
 }
 
 func TestWSUpstreamErrorFrame(t *testing.T) {
-	_, srv, _ := newTestKeeper(t)
+	_, srv, _ := newLocalTestKeeper(t)
 	c := dialWS(t, srv, "Bearer a")
 	ev := wsCreate(t, c, `{"type":"response.create","model":"status-429","input":"x"}`)
 	errObj, _ := ev["error"].(map[string]any)
@@ -456,7 +482,7 @@ func completedStore(t *testing.T, sse string) any {
 // even though the stateless upstream reported store:false; a store:false
 // request keeps the upstream value.
 func TestStoredTurnsAreDeclaredStored(t *testing.T) {
-	_, srv, _ := newTestKeeper(t)
+	_, srv, _ := newLocalTestKeeper(t)
 	_, body, _ := post(t, srv, "Bearer a", `{"model":"m","input":"A","stream":true}`)
 	if got := completedStore(t, body); got != true {
 		t.Fatalf("sse store = %v", got)
@@ -483,7 +509,7 @@ func TestStoredTurnsAreDeclaredStored(t *testing.T) {
 // IGNORE_CLIENT_STORE_FALSE: store:false turns (Codex) are kept, continuable on a
 // new socket or over HTTP, and declared stored to the client.
 func TestIgnoreClientStoreFalse(t *testing.T) {
-	up, srv, k := newTestKeeper(t, func(c *config) { c.ignoreClientStoreFalse = true })
+	up, srv, k := newLocalTestKeeper(t, func(c *config) { c.ignoreClientStoreFalse = true })
 	_, body, _ := post(t, srv, "Bearer a", `{"model":"m","input":"A","stream":true,"store":false}`)
 	id1 := completedID(t, body)
 	if got := completedStore(t, body); got != true {
@@ -521,4 +547,10 @@ func TestLoadConfigIgnoreClientStoreFalse(t *testing.T) {
 			t.Fatalf("%q: cfg=%v err=%v", tc.value, cfg.ignoreClientStoreFalse, err)
 		}
 	}
+}
+
+// Local-history unit tests exercise the adapter directly; native_test.go tests
+// the standard-path dispatcher without a private path or routing dependency.
+func newLocalTestKeeper(t *testing.T, opts ...func(*config)) (*fakeUpstream, *httptest.Server, *keeper) {
+	return newKeeperFixture(t, true, opts...)
 }

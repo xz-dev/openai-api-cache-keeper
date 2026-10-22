@@ -644,6 +644,38 @@ func (s *store) stats() (entries int, bytes int64) {
 	return
 }
 func (s *store) diskUsage() int64 { s.mu.Lock(); defer s.mu.Unlock(); return fileSizeOf(s.path) }
+
+// ownedID reports whether id is a local checkpoint alias for this owner. It
+// distinguishes native upstream references from keeper-owned checkpoint ids
+// without a private path or protocol flag. A miss on a known local id (wrong
+// owner or expired) must fail closed, so callers can refuse to forward it.
+func (s *store) ownedID(id string, owner [32]byte) (known bool, valid bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.db.View(func(tx *bolt.Tx) error {
+		entry := tx.Bucket(bucketResponses).Get([]byte(id))
+		if entry == nil {
+			return nil
+		}
+		known = true
+		if number(entry[32:40]) <= s.now().UnixNano() {
+			return nil // expired alias
+		}
+		// Ownership lives on the chain's tip node record, same layout as
+		// historyHashes: tip bytes 64:96 are the owning identity.
+		node := tx.Bucket(bucketNodes).Get(entry[:32])
+		valid = node != nil && len(node) == 104 && string(node[64:96]) == string(owner[:])
+		return nil
+	})
+	return known, valid
+}
+
+func (s *store) forget(id string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.update(func(st *storeTx) error { return st.dropResponse([]byte(id)) })
+}
+
 func (s *store) close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()

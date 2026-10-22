@@ -115,7 +115,7 @@ func TestReviewCompactionFailureKeepsOriginal(t *testing.T) {
 }
 
 func TestReviewRegisteredPutFailureVisibleWS(t *testing.T) {
-	_, srv, _ := newTestKeeper(t, func(c *config) { c.maxStoreBytes = 1 })
+	_, srv, _ := newLocalTestKeeper(t, func(c *config) { c.maxStoreBytes = 1 })
 	c := dialWS(t, srv, "Bearer registered-refusal")
 	ev := wsCreate(t, c, `{"type":"response.create","input":"A"}`)
 	assertServedUncached(t, ev)

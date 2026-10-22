@@ -1,4 +1,4 @@
-// Command response-keeper keeps OpenAI Responses history in front of a
+// Command openai-api-cache-keeper keeps OpenAI Responses history in front of a
 // stateless upstream so clients can continue with previous_response_id and a
 // delta input, over HTTP or WebSocket.
 package main
@@ -114,7 +114,7 @@ func loadConfig() (config, error) {
 	}
 	cfg.storeDir = os.Getenv("STORE_DIR")
 	if cfg.storeDir == "" {
-		cfg.storeDir = "/var/tmp/response-keeper"
+		cfg.storeDir = "/var/tmp/openai-api-cache-keeper"
 	}
 	if cfg.storeMetaBytes, err = envPositiveInt("STORE_META_MAX_BYTES", 32<<20); err != nil {
 		return config{}, err

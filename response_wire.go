@@ -21,6 +21,9 @@ func rewritePayload(raw []byte, stored bool) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+	return rewriteParsedPayload(obj, raw, stored)
+}
+func rewriteParsedPayload(obj map[string]json.RawMessage, raw []byte, stored bool) ([]byte, error) {
 	if nested, ok := obj["response"]; ok {
 		fixed, err := rewriteResponseObject(nested, stored)
 		if err != nil {
@@ -32,13 +35,18 @@ func rewritePayload(raw []byte, stored bool) ([]byte, error) {
 		obj["response"] = fixed
 		return encodeResponse(obj)
 	}
-	return rewriteResponseObject(raw, stored)
+	return rewriteParsed(obj, raw, stored)
 }
 func rewriteResponseObject(raw []byte, stored bool) ([]byte, error) {
 	obj, err := responseObject(raw)
 	if err != nil {
 		return nil, err
 	}
+	return rewriteParsed(obj, raw, stored)
+}
+
+// rewriteParsed reuses an already decoded object so no event is parsed twice.
+func rewriteParsed(obj map[string]json.RawMessage, raw []byte, stored bool) ([]byte, error) {
 	id, err := responseString(obj["id"])
 	if err != nil {
 		return nil, err
