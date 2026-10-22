@@ -240,8 +240,9 @@ func (c *collector) boundedResponse(raw []byte, m *workingSet) error { return c.
 // Raw frames/bodies use a flat buffer. Capacity and the old+new copy overlap
 // are charged before growth; comments cannot allocate one slice per line.
 type responseBuffer struct {
-	data []byte
-	work *workingSet
+	data    []byte
+	work    *workingSet
+	started bool // at least one field was appended (empty data is valid)
 }
 
 func (b *responseBuffer) append(p []byte, limit int) error {
@@ -262,7 +263,11 @@ func (b *responseBuffer) append(p []byte, limit int) error {
 	b.data = append(b.data, p...)
 	return nil
 }
-func (b *responseBuffer) close() { b.work.freeOutput(int64(cap(b.data))); b.data = nil }
+func (b *responseBuffer) close() {
+	b.work.freeOutput(int64(cap(b.data)))
+	b.data = nil
+	b.started = false
+}
 func readResponseBody(r io.Reader, m *workingSet) (*responseBuffer, error) {
 	b := &responseBuffer{work: m}
 	if !m.reserveOutput(32 << 10) {
