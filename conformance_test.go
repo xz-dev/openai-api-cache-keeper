@@ -100,4 +100,3 @@ func TestWHATWGSSECommentsAndNamedEventsTransparent(t *testing.T) {
 		t.Fatalf("frames rewritten: %q", frames)
 	}
 }
-

@@ -220,7 +220,9 @@ func mustRaw(t *testing.T, up *wsFakeUpstream, i int) []byte {
 	return []byte(up.frames[i])
 }
 
-// An owned-but-expired/foreign keeper id fails closed on WS like HTTP does.
+// An owned id whose registered alias expired still continues on the same
+// socket through its live pin (OpenAI connection-local semantics); a fresh
+// socket sees only the expired alias and fails closed like HTTP.
 func TestWSNativeExpiredParentFailsClosed(t *testing.T) {
 	up, srv, k := newWSNativeKeeper(t)
 	c := dialWS(t, srv, "Bearer a")
@@ -228,24 +230,33 @@ func TestWSNativeExpiredParentFailsClosed(t *testing.T) {
 	k.store.mu.Lock()
 	k.store.now = func() time.Time { return time.Now().Add(2 * time.Hour) }
 	k.store.mu.Unlock()
+	// Same socket: the pin keeps the chain alive and expands it.
 	ev := wsCreate(t, c, `{"type":"response.create","model":"m","input":"B","previous_response_id":"`+id1+`"}`)
+	if ev["type"] != "response.completed" {
+		t.Fatalf("same-socket pinned continuation should succeed: %v", ev)
+	}
+	c.Close(websocket.StatusNormalClosure, "")
+	// New socket: no pin, the expired alias fails closed.
+	c2 := dialWS(t, srv, "Bearer a")
+	ev = wsCreate(t, c2, `{"type":"response.create","model":"m","input":"B","previous_response_id":"`+id1+`"}`)
 	if code, ok := failureCode(ev); ev["type"] != "error" || !ok || code != "previous_response_not_found" {
-		t.Fatalf("expired parent must fail closed: %v", ev)
+		t.Fatalf("expired parent must fail closed on a new socket: %v", ev)
 	}
 	// The socket stays usable after a fail-closed turn.
-	ev = wsCreate(t, c, `{"type":"response.create","model":"m","input":"B"}`)
+	ev = wsCreate(t, c2, `{"type":"response.create","model":"m","input":"B"}`)
 	if ev["type"] != "response.completed" {
 		t.Fatalf("socket unusable after fail-closed turn: %v", ev)
 	}
 	_ = up
 }
 
-// generate:false prewarm frames carry no parent; they forward untouched and
-// their (empty) turn is not recorded as continuable output.
+// generate:false prewarm turns record like any other turn: the produced id
+// is continuable, and a following previous_response_id expands locally.
 func TestWSNativePrewarmPassthrough(t *testing.T) {
 	up, srv, k := newWSNativeKeeper(t)
 	c := dialWS(t, srv, "Bearer a")
 	ev := wsCreate(t, c, `{"type":"response.create","model":"m","generate":false,"input":[]}`)
+	id := responseID(ev)
 	if resp, _ := ev["response"].(map[string]any); ev["type"] != "response.completed" {
 		t.Fatalf("prewarm: %v %v", ev, resp)
 	}
@@ -253,9 +264,14 @@ func TestWSNativePrewarmPassthrough(t *testing.T) {
 	if doc := up.frame(0); json.Unmarshal(doc["generate"], &g) != nil || g != false {
 		t.Fatalf("generate flag altered: %v", doc)
 	}
-	// Empty output and store:false → nothing continuable recorded.
-	if n, _ := k.store.stats(); n != 0 {
-		t.Fatalf("prewarm recorded: %d", n)
+	// The prewarm turn is recorded so its id continues.
+	if n, _ := k.store.stats(); n != 1 {
+		t.Fatalf("prewarm not recorded: %d", n)
+	}
+	// Continuation from the prewarm id expands and succeeds.
+	ev = wsCreate(t, c, `{"type":"response.create","model":"m","input":"next","previous_response_id":"`+id+`"}`)
+	if ev["type"] != "response.completed" {
+		t.Fatalf("prewarm id %q cannot continue: %v", id, ev)
 	}
 }
 
