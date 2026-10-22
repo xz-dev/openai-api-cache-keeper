@@ -18,16 +18,17 @@ import (
 // Bounds for the measured 384-MiB envelope. Materialization is a short phase,
 // never a whole streamed turn. Slow upstreams retain disk files, not histories.
 const (
-	maxTurns                = 64
-	maxSockets              = 64
-	maxTaskReaders          = 4 // concurrent local readers per background task
-	maxHistoryBytes   int64 = 64 << 20
-	maxHistoryItems         = 8192
-	maxEventBytes           = 1 << 20
-	maxResponseBytes        = 8 << 20
-	maxCollectedBytes       = 16 << 20
-	maxSpoolBytes     int64 = 1 << 30
-	workWait                = 8 * time.Second
+	maxTurns                 = 64
+	maxSockets               = 64
+	maxTaskReaders           = 4 // concurrent local readers per background task
+	maxHistoryBytes    int64 = 64 << 20
+	maxHistoryItems          = 8192
+	maxEventBytes            = 1 << 20
+	maxResponseBytes         = 8 << 20 // per object, event or non-stream body
+	maxCollectedBytes        = 16 << 20
+	maxTaskStreamBytes       = 8 << 20 // cumulative task-log re-parse budget; SSE relay itself is unbounded
+	maxSpoolBytes      int64 = 1 << 30
+	workWait                 = 8 * time.Second
 )
 
 var errWorkSize = errors.New("encoded history or response exceeds working limit")
@@ -204,7 +205,9 @@ func (k *keeper) prepareDiskEnv(ctx context.Context, raw *spool, owner [32]byte,
 		}
 		switch name {
 		case "prompt_cache_retention":
-			if task != nil {
+			// Routed mode drops this field on ordinary turns; the pure
+			// single-upstream cache is not a policy filter and forwards it.
+			if task != nil || k.cfg.upstream != nil {
 				var value json.RawMessage
 				if err := dec.Decode(&value); err != nil {
 					return nil, responseError(errUpstreamData)
