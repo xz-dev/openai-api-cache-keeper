@@ -64,7 +64,9 @@ func TestFlatSSECommentsChargedWithoutLineAllocations(t *testing.T) {
 	if err != nil || frames != 1 {
 		t.Fatalf("frames=%d err=%v", frames, err)
 	}
-	if alloc := after.TotalAlloc - before.TotalAlloc; alloc > 4<<20 {
+	// Race instrumentation multiplies per-op allocation accounting; the real
+	// bound is the 4 MiB no-race limit asserted in normal builds.
+	if alloc := after.TotalAlloc - before.TotalAlloc; !raceBuild && alloc > 4<<20 {
 		t.Fatalf("per-line allocation amplification=%d", alloc)
 	}
 	if m.output != 0 {

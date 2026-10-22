@@ -93,4 +93,4 @@ func TestWSIdleSocketRSS(t *testing.T) {
 	t.Logf("RSS after 16 concurrent sockets x5 turns=%.1fMB entries=%s", float64(s16)/(1<<20), fmt.Sprint(benchEntries(up)))
 }
 
-func benchEntries(u *benchUpstream) int { return u.n }
+func benchEntries(u *benchUpstream) int64 { return u.n.Load() }

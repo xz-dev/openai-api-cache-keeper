@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -17,7 +18,7 @@ import (
 
 // benchUpstream answers response.create frames instantly with a minimal
 // completed sequence, so the benchmark measures the keeper's relay path.
-type benchUpstream struct{ n int }
+type benchUpstream struct{ n atomic.Int64 }
 
 func (b *benchUpstream) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	conn, err := websocket.Accept(w, r, nil)
@@ -47,8 +48,8 @@ func (b *benchUpstream) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			_ = conn.Write(r.Context(), websocket.MessageText, []byte(`{"type":"error","status":400,"error":{"type":"invalid_request_error","code":"previous_response_not_found"}}`))
 			continue
 		}
-		b.n++
-		id := fmt.Sprintf("bench_%d", b.n)
+		n := b.n.Add(1)
+		id := fmt.Sprintf("bench_%d", n)
 		_ = conn.Write(r.Context(), websocket.MessageText, []byte(`{"type":"response.created","response":{"id":"`+id+`","status":"in_progress","output":[]}}`))
 		_ = conn.Write(r.Context(), websocket.MessageText, []byte(`{"type":"response.completed","response":{"id":"`+id+`","status":"completed","store":false,"output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"ok"}]}]}}`))
 	}
