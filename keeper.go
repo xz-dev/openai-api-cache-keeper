@@ -331,6 +331,7 @@ type collector struct {
 	done    bool
 	seq     int64 // last upstream sequence_number seen
 	seqSet  bool
+	rewrite bool // latched at first response event: this turn publishes resp_ ids
 }
 
 // responseID is the upstream id of the response this turn produced, if any;

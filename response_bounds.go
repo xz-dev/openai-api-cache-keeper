@@ -341,12 +341,29 @@ func (k *keeper) responseFrameParsed(ctx context.Context, c *collector, raw []by
 		}
 		stored = stored && retained
 	}
-	// A turn the keeper could not retain keeps the upstream response id:
-	// publishing a resp_ alias the keeper cannot expand would promise a
-	// continuation it cannot serve. Pre-terminal frames still carry the
-	// rewrite (acceptance is decided at the terminal frame), the documented
-	// early-publication trade-off.
-	rewrite := accept == nil || retained
+	// The public id is decided once, at the first response-bearing event:
+	// a turn that intends recording advertises the resp_ alias from that
+	// point on and never switches back to the upstream id mid-turn, even if
+	// the terminal accept later fails (REVIEW3: one response, one id).
+	// c.rewrite latches the decision; non-storing turns never latch, so a
+	// store:false turn keeps its upstream id as before.
+	// The public id is decided once, at the first response-bearing event:
+	// a turn that intends recording advertises the resp_ alias from that
+	// point on and never switches back to the upstream id mid-turn, even if
+	// the terminal accept later fails (REVIEW3: one response, one id).
+	// c.rewrite latches the decision; non-storing turns never latch, so a
+	// store:false turn keeps its upstream id as before.
+	if accept != nil && event && obj != nil && stored {
+		if _, hasResp := obj["response"]; hasResp && isResponseEventType(responseTypeOf(obj)) {
+			c.rewrite = true
+		}
+	}
+	// Non-event calls publish a single bare Response object: rewrite exactly
+	// when it is a stored (recorded) turn's response.
+	rewrite := accept == nil || c.rewrite
+	if !event {
+		rewrite = stored
+	}
 	budget := held
 	if obj == nil {
 		budget = responseScratch(len(raw))

@@ -798,7 +798,10 @@ func (k *keeper) wsNativeUpstreamFrame(ctx context.Context, conn *websocket.Conn
 				logNotRetained(err)
 				return false, nil
 			}
-			inflight.id = publicID(rid)
+			inflight.id = rid
+			if inflight.c.rewrite {
+				inflight.id = publicID(rid)
+			}
 			sess.lastID, sess.lastPin = inflight.id, pin
 			sess.release = func() {
 				if err := k.store.release(pin); err != nil {

@@ -42,6 +42,12 @@ func isResponseEventType(t string) bool {
 	return responseEventTypes[t]
 }
 
+// responseTypeOf extracts the event's type field from a decoded object.
+func responseTypeOf(obj map[string]json.RawMessage) string {
+	kind, _ := responseString(obj["type"])
+	return kind
+}
+
 func rewriteParsedPayload(obj map[string]json.RawMessage, raw []byte, stored bool) ([]byte, error) {
 	kind, _ := responseString(obj["type"])
 	if nested, ok := obj["response"]; ok && isResponseEventType(kind) {

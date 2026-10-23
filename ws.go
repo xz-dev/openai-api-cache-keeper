@@ -169,7 +169,14 @@ func (k *keeper) wsTurn(ctx context.Context, conn *websocket.Conn, header http.H
 				return false, nil
 			}
 			// accept replaced the old pin atomically. Failure leaves it intact.
-			id = publicID(rid)
+			// The session pins the id the client actually saw: the resp_ alias
+			// when the turn latched the rewrite, the upstream id otherwise
+			// (store:false turns publish no alias but still pin same-socket
+			// continuation under the upstream id).
+			id = rid
+			if c.rewrite {
+				id = publicID(rid)
+			}
 			sess.lastID, sess.lastPin = id, pin
 			sess.release = func() {
 				if err := k.store.release(pin); err != nil {

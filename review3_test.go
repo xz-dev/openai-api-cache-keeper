@@ -367,7 +367,10 @@ func TestReview3RefusedBodyExceedingBoundFailsExplicitly(t *testing.T) {
 	}
 }
 
-// REVIEW2-8: a response the keeper could not retain keeps its upstream id.
+// REVIEW2-8 (superseded by REVIEW3-1): a response the keeper could not
+// retain keeps ONE id across all of its events — the resp_ alias published
+// at its first response event — rather than switching ids mid-turn. Nothing
+// is recorded, so the alias simply never expands.
 func TestReview3StoreFailureDoesNotRewriteUnrecordedID(t *testing.T) {
 	_, srv, k := newWSNativeKeeper(t, func(c *config) { c.maxStoreBytes = 1; c.storePinBytes = 1 })
 	c := dialWS(t, srv, "Bearer a")
@@ -376,8 +379,8 @@ func TestReview3StoreFailureDoesNotRewriteUnrecordedID(t *testing.T) {
 	if n, _ := k.store.stats(); n != 0 {
 		t.Fatalf("fixture stored %d", n)
 	}
-	if id != "wsid_1" {
-		t.Fatalf("unrecorded response id rewritten: %s", id)
+	if id != "resp_wsid_1" {
+		t.Fatalf("unretained response id inconsistent with first-event alias: %s", id)
 	}
 }
 
