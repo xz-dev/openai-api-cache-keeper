@@ -117,6 +117,7 @@ func (c *collector) event(raw []byte) error {
 	}
 	return c.eventObj(obj)
 }
+
 // collectEventCalls is a test hook fired once per event decode.
 var collectEventCalls func()
 

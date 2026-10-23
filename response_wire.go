@@ -23,17 +23,18 @@ func rewritePayload(raw []byte, stored bool) ([]byte, error) {
 	}
 	return rewriteParsedPayload(obj, raw, stored)
 }
+
 // responseEventTypes are the known Responses lifecycle events whose payload
 // embeds a full Response object (OpenAI Responses streaming schema). Any
 // other response.* name — present or future vendor/namespace extension — is
 // relayed byte-for-byte even when it carries a nested response/id field.
 var responseEventTypes = map[string]bool{
-	"response.created":    true,
-	"response.queued":     true,
+	"response.created":     true,
+	"response.queued":      true,
 	"response.in_progress": true,
-	"response.completed":  true,
-	"response.incomplete": true,
-	"response.failed":     true,
+	"response.completed":   true,
+	"response.incomplete":  true,
+	"response.failed":      true,
 }
 
 // isResponseEventType reports whether the event's type field names a known
@@ -149,10 +150,10 @@ func readSSE(body io.Reader, onFrame func([]byte) error, onData func([]byte) err
 	data := responseBuffer{work: m}
 	defer data.close()
 
-	var lineLen int  // content bytes on the current line
-	var content int  // non-terminator bytes appended since the last dispatch
-	var holdCR bool  // last byte was CR; a following LF completes its pair
-	var prefix int   // -1 = non-data line; 0-4 = matching "data"; 5 = saw ':', next byte may be a stripped space; 6 = value bytes
+	var lineLen int // content bytes on the current line
+	var content int // non-terminator bytes appended since the last dispatch
+	var holdCR bool // last byte was CR; a following LF completes its pair
+	var prefix int  // -1 = non-data line; 0-4 = matching "data"; 5 = saw ':', next byte may be a stripped space; 6 = value bytes
 
 	// finishLine applies WHATWG §9.2.6 field processing: every data field —
 	// "data:v", "data:", or the colonless "data" — appends its value plus
@@ -293,7 +294,6 @@ func readSSE(body io.Reader, onFrame func([]byte) error, onData func([]byte) err
 		}
 	}
 }
-
 
 // Preserve non-data framing/comments, replacing only the data fields.
 // frame is the raw event block exactly as read (original terminators,

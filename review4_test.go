@@ -74,7 +74,7 @@ func TestReview4SSEEmptyDataLines(t *testing.T) {
 		{"data: X\ndata:\n\n", "X\n"},
 		{"data\ndata: X\n\n", "\nX"},
 		{"data: X\ndata:\ndata: Y\n\n", "X\n\nY"},
-		{"data: \n\n", ""},          // "data: " with stripped space → empty
+		{"data: \n\n", ""},             // "data: " with stripped space → empty
 		{"event: e\ndata: X\n\n", "X"}, // non-data fields still coexist
 	}
 	for i, tc := range tests {
