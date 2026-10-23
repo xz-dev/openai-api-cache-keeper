@@ -29,6 +29,7 @@ type config struct {
 	listen                string
 	ttl                   time.Duration
 	maxStoreBytes         int64
+	maxStoreEntries       int64
 	maxRequestBytes       int64
 	storeDir              string
 	storeMetaBytes        int64
@@ -63,7 +64,7 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	log.Printf("listening on %s routed=%t ttl=%s max_store_bytes=%d", listener.Addr(), cfg.routingIndex != nil, cfg.ttl, cfg.maxStoreBytes)
+	log.Printf("listening on %s routed=%t ttl=%s max_store_bytes=%d max_store_entries=%d", listener.Addr(), cfg.routingIndex != nil, cfg.ttl, cfg.maxStoreBytes, cfg.maxStoreEntries)
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	go func() {
@@ -106,7 +107,10 @@ func loadConfig() (config, error) {
 	if cfg.ttl, err = envDuration("STORE_TTL", 10*time.Minute); err != nil {
 		return config{}, err
 	}
-	if cfg.maxStoreBytes, err = envPositiveInt("STORE_MAX_BYTES", 200<<20); err != nil {
+	if cfg.maxStoreBytes, err = envNonNegativeInt("STORE_MAX_BYTES", 0); err != nil {
+		return config{}, err
+	}
+	if cfg.maxStoreEntries, err = envNonNegativeInt("STORE_MAX_ENTRIES", 100); err != nil {
 		return config{}, err
 	}
 	if cfg.maxRequestBytes, err = envPositiveInt("MAX_REQUEST_BYTES", 32<<20); err != nil {
@@ -170,6 +174,18 @@ func envPositiveInt(name string, fallback int64) (int64, error) {
 	n, err := strconv.ParseInt(raw, 10, 64)
 	if err != nil || n <= 0 {
 		return 0, fmt.Errorf("%s must be a positive integer", name)
+	}
+	return n, nil
+}
+
+func envNonNegativeInt(name string, fallback int64) (int64, error) {
+	raw := os.Getenv(name)
+	if raw == "" {
+		return fallback, nil
+	}
+	n, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil || n < 0 {
+		return 0, fmt.Errorf("%s must be a non-negative integer (0 means unlimited)", name)
 	}
 	return n, nil
 }

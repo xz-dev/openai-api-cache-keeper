@@ -215,7 +215,7 @@ func (t *responseTask) append(p []byte) error {
 	k.cacheMu.Lock()
 	defer k.cacheMu.Unlock()
 	_, history := k.store.stats()
-	if history+k.eventBytes+int64(len(p)) > k.cfg.maxStoreBytes {
+	if k.cfg.maxStoreBytes > 0 && history+k.eventBytes+int64(len(p)) > k.cfg.maxStoreBytes {
 		return errWorkSize
 	}
 	n, err := t.log.Write(p)

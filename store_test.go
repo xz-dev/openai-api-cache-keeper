@@ -124,7 +124,7 @@ func inspectStore(t *testing.T, s *store) (live, meta, pinned int64, nodes, alia
 	if err != nil {
 		t.Fatal(err)
 	}
-	if live > s.maxLive || meta > s.maxMeta || pinned > s.pinMax {
+	if (s.maxLive > 0 && live > s.maxLive) || meta > s.maxMeta || pinned > s.pinMax {
 		t.Fatalf("budgets exceeded: %d/%d/%d", live, meta, pinned)
 	}
 	return

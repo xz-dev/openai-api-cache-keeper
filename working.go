@@ -538,7 +538,7 @@ func (k *keeper) acceptDisk(ctx context.Context, t *diskTurn, id string, owner [
 	}
 	k.cacheMu.Lock()
 	defer k.cacheMu.Unlock()
-	if k.eventBytes > 0 {
+	if k.eventBytes > 0 && k.cfg.maxStoreBytes > 0 {
 		_, history := k.store.stats()
 		if history+k.eventBytes+encoded > k.cfg.maxStoreBytes {
 			return "", errWorkSize

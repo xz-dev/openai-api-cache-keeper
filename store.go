@@ -27,6 +27,7 @@ type store struct {
 	dir, path                           string
 	ttl                                 time.Duration
 	maxLive, maxMeta, pinMax, compactAt int64
+	maxEntries                          int64
 	now                                 func() time.Time
 }
 
@@ -80,8 +81,8 @@ func boltOptions() *bolt.Options {
 const initialMmapSize = 128 << 20
 
 func newStore(dir string, ttl time.Duration, maxLive, maxMeta, pinMax, compactAt int64) (*store, error) {
-	if dir == "" || maxLive <= 0 {
-		return nil, errors.New("store dir and positive maxLive required")
+	if dir == "" || maxLive < 0 {
+		return nil, errors.New("store dir and non-negative maxLive required")
 	}
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		return nil, err
@@ -124,11 +125,16 @@ func newStore(dir string, ttl time.Duration, maxLive, maxMeta, pinMax, compactAt
 	if maxMeta <= 0 {
 		maxMeta = 32 << 20
 	}
-	if pinMax <= 0 || pinMax > maxLive {
+	if maxLive > 0 && (pinMax <= 0 || pinMax > maxLive) {
 		pinMax = maxLive / 2
+	} else if pinMax <= 0 {
+		pinMax = 100 << 20
 	}
 	if compactAt <= 0 {
-		compactAt = maxLive * 2
+		compactAt = 400 << 20
+		if maxLive > 0 {
+			compactAt = maxLive * 2
+		}
 	}
 	return &store{db: db, lock: lock, dir: dir, path: path, ttl: ttl, maxLive: maxLive, maxMeta: maxMeta, pinMax: pinMax, compactAt: compactAt, now: time.Now}, nil
 }
@@ -515,12 +521,15 @@ func (s *store) accept(id string, owner [32]byte, next itemFactory, oldPin strin
 	var node, pin string
 	err = s.update(func(st *storeTx) error {
 		responses := st.tx.Bucket(bucketResponses)
+		entries := int64(responses.Stats().KeyN)
 		if registered {
 			if old := responses.Get([]byte(id)); old != nil {
 				n := st.tx.Bucket(bucketNodes).Get(old[:32])
 				if string(n[64:96]) != string(owner[:]) {
 					return errStoreOwner
 				}
+			} else {
+				entries++
 			}
 		}
 		if err := st.linkPlan(owner, plan, s.maxMeta); err != nil {
@@ -565,7 +574,7 @@ func (s *store) accept(id string, owner [32]byte, next itemFactory, oldPin strin
 		if st.pinned > s.pinMax {
 			return errStoreBudget
 		}
-		for st.live > s.maxLive || st.meta > s.maxMeta {
+		for (s.maxLive > 0 && st.live > s.maxLive) || st.meta > s.maxMeta || (s.maxEntries > 0 && entries > s.maxEntries) {
 			var victim []byte
 			var oldest int64
 			if err := responses.ForEach(func(k, v []byte) error {
@@ -586,6 +595,7 @@ func (s *store) accept(id string, owner [32]byte, next itemFactory, oldPin strin
 			if err := st.dropResponse(victim); err != nil {
 				return err
 			}
+			entries--
 		}
 		return nil
 	})

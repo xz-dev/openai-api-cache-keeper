@@ -37,6 +37,7 @@ func newKeeper(cfg config) *keeper {
 	if err != nil {
 		log.Fatalf("store: %v", err)
 	}
+	st.maxEntries = cfg.maxStoreEntries
 	if err := cleanupTransient(cfg.storeDir); err != nil {
 		st.close()
 		log.Fatalf("transient cleanup: %v", err)
