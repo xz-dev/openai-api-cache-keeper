@@ -101,7 +101,7 @@ func TestReview4SSEEmptyDataRawFrame(t *testing.T) {
 	e := readSSE(strings.NewReader(stream), func(f []byte) error {
 		frames = append(frames, string(f))
 		return nil
-	}, nil)
+	}, func([]byte) error { return nil })
 	if e != nil {
 		t.Fatal(e)
 	}

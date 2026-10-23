@@ -148,29 +148,23 @@ func readSSE(body io.Reader, onFrame func([]byte) error, onData func([]byte) err
 	var holdCR bool  // last byte was CR; a following LF completes its pair
 	var prefix int   // -1 = non-data line; 0-4 = matching "data"; 5 = saw ':', next byte may be a stripped space; 6 = value bytes
 
-	// appendDataByte records one value byte, joining multi-line data with
-	// '\n' per §9.2.6.
-	appendDataByte := func(b byte) error {
-		if !data.started {
-			data.started = true
-		} else if data.lastLine {
-			// A new data line's first byte joins with a newline.
-			if err := data.append([]byte{'\n'}, maxEventBytes); err != nil {
-				return err
-			}
-		}
-		data.lastLine = false
-		return data.append([]byte{b}, maxEventBytes)
-	}
-
+	// finishLine applies WHATWG §9.2.6 field processing: every data field —
+	// "data:v", "data:", or the colonless "data" — appends its value plus
+	// one LF to the event buffer. Empty values contribute only the LF. The
+	// dispatch step removes exactly the last LF, so empty-data events carry
+	// "" as their payload rather than disappearing.
 	finishLine := func() error {
 		if lineLen == 0 {
 			// Blank line: dispatch if the frame holds an event; otherwise
 			// the stray blank line is still forwarded in the next frame's
 			// raw bytes, keeping the stream byte-faithful.
 			if len(frame.data) > 0 {
-				if len(data.data) > 0 && !bytes.Equal(data.data, []byte("[DONE]")) {
-					if err := onData(data.data); err != nil {
+				payload := data.data
+				if len(payload) > 0 && payload[len(payload)-1] == '\n' {
+					payload = payload[:len(payload)-1] // strip the trailing LF added per field
+				}
+				if data.started && !bytes.Equal(payload, []byte("[DONE]")) {
+					if err := onData(payload); err != nil {
 						return err
 					}
 				}
@@ -185,19 +179,12 @@ func readSSE(body io.Reader, onFrame func([]byte) error, onData func([]byte) err
 			}
 			return nil
 		}
-		// Colonless "data" line (prefix==4, lineLen==4): name is the whole
-		// line, so the value is empty — contributes one line to the join.
-		if prefix == 4 && lineLen == 4 && data.started {
-			data.lastLine = true
-		}
-		// A completed data line marks the next data line for a '\n' join.
-		if prefix == 6 {
-			data.lastLine = true
-		}
-		// An empty value after "data:" (prefix==5, no bytes) is an empty
-		// line in the join: only marks lastLine when data already started.
-		if prefix == 5 && data.started {
-			data.lastLine = true
+		// A line whose field name is "data" — with or without a colon — is a
+		// data field: mark presence, then append the joining LF at line end.
+		isData := prefix == 6 || prefix == 5 || (prefix == 4 && lineLen == 4)
+		if isData {
+			data.started = true
+			return data.append([]byte{'\n'}, maxEventBytes)
 		}
 		return nil
 	}
@@ -282,13 +269,15 @@ func readSSE(body io.Reader, onFrame func([]byte) error, onData func([]byte) err
 				// First byte after ':': one optional space is stripped
 				// (§9.2.6). prefix 6 marks subsequent bytes as the value.
 				if b != ' ' {
-					if err := appendDataByte(b); err != nil {
+					data.started = true
+					if err := data.append([]byte{b}, maxEventBytes); err != nil {
 						return err
 					}
 				}
 				prefix = 6
 			case 6:
-				if err := appendDataByte(b); err != nil {
+				data.started = true
+				if err := data.append([]byte{b}, maxEventBytes); err != nil {
 					return err
 				}
 			case -1:
