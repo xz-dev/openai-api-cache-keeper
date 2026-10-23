@@ -58,19 +58,28 @@ func (t *wsHandshakeBody) RoundTrip(req *http.Request) (*http.Response, error) {
 	}
 	// Read into the spool while still returning the original stream to
 	// websocket.Dial, which consumes its own 1024-byte diagnostic prefix.
+	// A tee read or drain error marks capture failed: replaying the partial
+	// spool would silently present a truncated rejection as the real one.
 	orig := resp.Body
+	tee := io.TeeReader(io.LimitReader(orig, maxResponseBytes+1), struct{ io.Writer }{spool})
 	resp.Body = struct {
 		io.Reader
 		io.Closer
-	}{Reader: io.TeeReader(io.LimitReader(orig, maxResponseBytes+1), struct{ io.Writer }{spool}), Closer: closerFunc(func() error {
+	}{Reader: struct{ io.Reader }{tee}, Closer: closerFunc(func() error {
 		// Drain what Dial's diagnostic read did not, so the whole body is
-		// captured before serveWSNative replays it.
-		// Hide File.ReadFrom so the copy keeps the spool's byte accounting.
-		_, _ = io.Copy(struct{ io.Writer }{spool}, io.LimitReader(orig, maxResponseBytes+1-spool.size))
-		orig.Close()
-		if spool.size > maxResponseBytes {
+		// captured before serveWSNative replays it. TeeReader stops writing
+		// to the spool after its first write error, so io.Copy returning nil
+		// still leaves spool.size short of the real body — compare against
+		// the source, which is the only complete-length signal we have.
+		_, copyErr := io.Copy(struct{ io.Writer }{spool}, io.LimitReader(orig, maxResponseBytes+1-spool.size))
+		closeErr := orig.Close()
+		if copyErr != nil || closeErr != nil || spool.size > maxResponseBytes {
 			spool.Close()
-			body.overflow = true
+			if spool.size > maxResponseBytes {
+				body.overflow = true
+			} else {
+				body.failed = true
+			}
 			*t.keep = body
 			return nil
 		}
