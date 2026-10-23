@@ -73,7 +73,13 @@ func (t *wsHandshakeBody) RoundTrip(req *http.Request) (*http.Response, error) {
 		// the source, which is the only complete-length signal we have.
 		_, copyErr := io.Copy(struct{ io.Writer }{spool}, io.LimitReader(orig, maxResponseBytes+1-spool.size))
 		closeErr := orig.Close()
-		if copyErr != nil || closeErr != nil || spool.size > maxResponseBytes {
+		// The spool's byte accounting returns a short count on its own write
+		// failure (TeeReader then keeps reading without writing), so a nil
+		// copyErr can still mean the capture is short. When the upstream
+		// declared a length, anything less is a failed capture, never a
+		// complete rejection to replay.
+		incomplete := resp.ContentLength >= 0 && spool.size != resp.ContentLength
+		if copyErr != nil || closeErr != nil || incomplete || spool.size > maxResponseBytes {
 			spool.Close()
 			if spool.size > maxResponseBytes {
 				body.overflow = true
