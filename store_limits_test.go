@@ -79,6 +79,30 @@ func TestStoreEntryLimitEvictsLeastRecentlyUsed(t *testing.T) {
 	inspectStore(t, s)
 }
 
+func TestStoreEntryLimitProtectedOnlyTerminates(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		bytes   int64
+		wantErr error
+		wantN   int
+	}{
+		{"one protected alias fits", 0, nil, 1},
+		{"only protected alias exceeds byte budget", 1, errStoreBudget, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newTestStore(t, time.Hour, tc.bytes, 1<<20, 1<<19, 4<<20)
+			s.maxEntries = 1
+			if _, err := s.put("incoming", [32]byte{1}, "", items(`"X"`)); err != tc.wantErr {
+				t.Fatalf("protected admission error=%v want=%v", err, tc.wantErr)
+			}
+			if entries, _ := s.stats(); entries != tc.wantN {
+				t.Fatalf("aliases=%d want=%d", entries, tc.wantN)
+			}
+			inspectStore(t, s)
+		})
+	}
+}
+
 func TestStoreLimitsIndependent(t *testing.T) {
 	for _, tc := range []struct {
 		name           string
