@@ -128,6 +128,13 @@ func (c *collector) eventObj(obj map[string]json.RawMessage) error {
 	if collectEventCalls != nil {
 		collectEventCalls()
 	}
+	// Track the upstream event sequence so a locally generated terminal
+	// event continues it (OpenAI ResponseFailedEvent requires
+	// sequence_number).
+	var seq int64
+	if json.Unmarshal(obj["sequence_number"], &seq) == nil && seq >= 0 {
+		c.seq, c.seqSet = seq, true
+	}
 	switch kind {
 	case "response.output_item.done":
 		var index int

@@ -188,12 +188,12 @@ func (k *keeper) wsTurn(ctx context.Context, conn *websocket.Conn, header http.H
 		return conn.Write(ctx, websocket.MessageText, wire)
 	}, k.work)
 	if err == nil && !c.done && ctx.Err() == nil {
-		status = wsFailure(ctx, conn, c.responseID(), &apiError{status: 502, typ: "upstream_error", message: "upstream stream ended before terminal response"})
+		status = wsFailure(ctx, conn, c.responseID(), c.nextSeq(), &apiError{status: 502, typ: "upstream_error", message: "upstream stream ended before terminal response"})
 	}
 	if err != nil {
 		log.Printf("ws relay ended early: %v", err)
 		if ctx.Err() == nil && status == http.StatusOK && id == "" {
-			status = wsFailure(ctx, conn, c.responseID(), responseError(err))
+			status = wsFailure(ctx, conn, c.responseID(), c.nextSeq(), responseError(err))
 		}
 	}
 	return id, status, hasPrev
@@ -201,11 +201,11 @@ func (k *keeper) wsTurn(ctx context.Context, conn *websocket.Conn, header http.H
 
 // wsFailure ends a started response with response.failed; otherwise it is a
 // request-level error frame. The socket stays open for the next turn.
-func wsFailure(ctx context.Context, conn *websocket.Conn, started string, e *apiError) int {
+func wsFailure(ctx context.Context, conn *websocket.Conn, started string, seq int64, e *apiError) int {
 	if started == "" {
 		return wsError(ctx, conn, e)
 	}
-	frame, _ := json.Marshal(failureEvent(started, e))
+	frame, _ := json.Marshal(failureEvent(started, e, seq))
 	_ = conn.Write(ctx, websocket.MessageText, frame)
 	return e.status
 }

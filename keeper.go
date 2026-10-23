@@ -209,14 +209,24 @@ func writeAPIError(w http.ResponseWriter, e *apiError) {
 
 // failureEvent reports a keeper-side turn failure in Responses protocol terms:
 // a request-level error before any response exists, otherwise the terminal
-// response.failed, so every client sees the started response end.
-func failureEvent(started string, e *apiError) map[string]any {
+// response.failed, so every client sees the started response end. seq is the
+// next event sequence number (0 when the upstream numbered nothing).
+func failureEvent(started string, e *apiError, seq int64) map[string]any {
 	if started == "" {
 		return map[string]any{"type": "error", "error": e.object()}
 	}
-	return map[string]any{"type": "response.failed", "response": map[string]any{
+	return map[string]any{"type": "response.failed", "sequence_number": seq, "response": map[string]any{
 		"id": publicID(started), "object": "response", "status": "failed", "output": []any{}, "error": e.object(),
 	}}
+}
+
+// nextSeq returns the sequence number for a locally generated event,
+// continuing whatever the upstream last sent.
+func (c *collector) nextSeq() int64 {
+	if c.seqSet {
+		return c.seq + 1
+	}
+	return 0
 }
 
 // The cache is an optimization: a turn whose history cannot be retained is
@@ -319,6 +329,8 @@ type collector struct {
 	status  string
 	output  []json.RawMessage
 	done    bool
+	seq     int64 // last upstream sequence_number seen
+	seqSet  bool
 }
 
 // responseID is the upstream id of the response this turn produced, if any;
@@ -502,7 +514,7 @@ func (k *keeper) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			log.Printf("http relay ended early: %v", err)
 			if r.Context().Err() == nil && id == "" {
-				event := failureEvent(c.responseID(), responseError(err))
+				event := failureEvent(c.responseID(), responseError(err), c.nextSeq())
 				payload, _ := json.Marshal(event)
 				_, _ = fmt.Fprintf(w, "event: %s\ndata: %s\n\n", event["type"], payload)
 				_ = rc.Flush()
