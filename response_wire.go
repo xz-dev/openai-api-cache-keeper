@@ -5,7 +5,6 @@ import (
 	"bytes"
 	"encoding/json"
 	"io"
-	"strings"
 )
 
 func encodeResponse(v any) ([]byte, error) {
@@ -24,12 +23,23 @@ func rewritePayload(raw []byte, stored bool) ([]byte, error) {
 	}
 	return rewriteParsedPayload(obj, raw, stored)
 }
+// responseEventTypes are the known Responses lifecycle events whose payload
+// embeds a full Response object (OpenAI Responses streaming schema). Any
+// other response.* name — present or future vendor/namespace extension — is
+// relayed byte-for-byte even when it carries a nested response/id field.
+var responseEventTypes = map[string]bool{
+	"response.created":    true,
+	"response.queued":     true,
+	"response.in_progress": true,
+	"response.completed":  true,
+	"response.incomplete": true,
+	"response.failed":     true,
+}
+
 // isResponseEventType reports whether the event's type field names a known
-// Responses API event that carries (or is) a response object worth rewriting.
-// Unknown event types — including any vendor.* extension — are relayed
-// byte-for-byte even when they carry nested response/id fields.
+// response-bearing lifecycle event worth rewriting.
 func isResponseEventType(t string) bool {
-	return strings.HasPrefix(t, "response.")
+	return responseEventTypes[t]
 }
 
 func rewriteParsedPayload(obj map[string]json.RawMessage, raw []byte, stored bool) ([]byte, error) {
