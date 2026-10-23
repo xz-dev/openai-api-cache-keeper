@@ -6,7 +6,7 @@ Small Go reverse proxy that keeps OpenAI Responses API history in front of a sta
 API gateway -> openai-api-cache-keeper -> Responses upstream (no server-side state required)
 ```
 
-The API gateway in front remains the public and security boundary. It must authenticate, authorize, rate-limit, and validate requests before forwarding here. This service has no admin API, metrics, or user-selected target.
+The surrounding gateway deployment supplies the public security boundary, authentication, authorization, rate limits and isolation. Do not expose this service directly. It has no admin API, authentication, per-credential ownership in single-upstream mode, or user-selected target. In the front-of-Sub2API deployment below, caller credentials pass through to Sub2API; the deployment, not the keeper, is responsible for the required cache isolation.
 
 ## Why
 
@@ -14,21 +14,21 @@ Many OpenAI-compatible upstreams accept `/v1/responses` but ignore or reject `pr
 
 ## Behavior
 
-Paths: `POST /v1/responses` (or `/responses`), and `GET /v1/responses` with a WebSocket upgrade. Everything else returns 404.
+Cache paths: `POST /v1/responses` (or `/responses`), and `GET /v1/responses` with a WebSocket upgrade. In single-upstream mode other HTTP paths stream through unchanged; routed mode returns 404 for them.
 
 For each request:
 
 1. In routed mode, the keeper looks up the original top-level `model` before accessing history. It selects CPA or AISIX once per HTTP request or WebSocket turn; it never retries against another backend. Single-upstream mode skips classification.
 2. If `previous_response_id` is set, the keeper looks it up, prepends the stored history to `input`, and removes the field. An id the keeper stored but can no longer expand (expired, or a failed background checkpoint) returns `400` with `code: "previous_response_not_found"` — fail closed, so a delta is never sent without its history. A `previous_response_id` the keeper never recorded is not an error: in single-upstream mode the request (or WS frame) is forwarded byte-for-byte with the reference intact, because that id may be meaningful to the downstream's own cache; the turn is then downstream-owned and not recorded. In routed mode every turn is local and an unknown id fails with `previous_response_not_found`. Clients can then retry once with the full history.
 3. In single-upstream mode every turn whose full input is known — no parent, or a keeper-owned parent — is served locally and recorded like a routed turn: the response id is rewritten to a continuable `resp_` id, `store` is set to `true` when the history is retained, and `input + output` is stored under the returned id. This replaces the earlier passthrough behavior where only checkpoint ids were expanded and nothing else was recorded.
-4. The request is forwarded upstream with the caller's headers, except CPA uses the configured `CPA_API_KEY` in routed mode. Top-level `prompt_cache_retention` is removed on HTTP and WebSocket requests; nested fields and encoded input items are preserved. Upstream HTTP statuses and error bodies are preserved. Errors are not rewritten, truncated, retried, or put on a cooldown. Successful terminal responses are sent only after any required history storage and socket pin have been acquired.
-5. When the upstream finishes with `status: completed` or `incomplete`, the keeper stores `input + output` under the response id. Upstream ids that do not start with `resp_` (for example `msg_…` from Anthropic-style backends) are returned to the client as `resp_<id>` in SSE, JSON, and WebSocket frames, because some gateways only accept `resp_*` as `previous_response_id`. For a turn the keeper stores, the response object is returned with `store: true`, even when the stateless upstream reported `store: false`: the keeper is the store, and clients use that field to decide whether the response id can be continued later. `store: false` requests keep the upstream value.
+4. The request is forwarded upstream with the caller's headers, except CPA uses the configured `CPA_API_KEY` in routed mode. In routed mode top-level `prompt_cache_retention` is removed on HTTP and WebSocket requests; single-upstream mode preserves it. Nested fields and encoded input items are preserved. Upstream HTTP statuses and error bodies are preserved. Errors are not rewritten, truncated, retried, or put on a cooldown. Successful terminal responses are sent only after any required history storage and socket pin have been acquired.
+5. When the upstream finishes with `status: completed` or `incomplete`, the keeper stores `input + output` under the response id. Upstream ids that do not start with `resp_` (for example `msg_…` from Anthropic-style backends) are returned to the client as `resp_<id>` in SSE, JSON, and WebSocket frames, because some gateways only accept `resp_*` as `previous_response_id`. For a turn the keeper stores, the response object is returned with `store: true`, even when the stateless upstream reported `store: false`: the keeper is the store, and clients use that field to decide whether the response id can be continued later. `store: false` requests keep the upstream value unless `IGNORE_CLIENT_STORE_FALSE=true`.
 
 What is stored:
 
 - Raw Responses items exactly as received or returned, including reasoning `encrypted_content`, `function_call`, and `function_call_output`. No format conversion is done.
 - Each entry is the full history up to that turn. Any stored id can be continued, so rolling back one or two steps is a normal continuation from an older id.
-- In single-upstream mode there is no per-credential isolation: every stored id is continuable by any caller, because the surrounding architecture (Sub2API passthrough in front of the keeper) provides isolation and response ids are unguessable. In routed mode entries remain scoped to the SHA-256 of the credential Sub2API authenticates after hop-by-hop headers are removed: a case-insensitive `Bearer` token (trimmed), else `X-API-Key`, else `X-Goog-API-Key`. The digest only isolates entries; every task read or cancel is still revalidated upstream.
+- In single-upstream mode there is no per-credential isolation: every stored id is continuable by any caller, because the surrounding deployment provides the required isolation. Do not expose the keeper directly or treat unguessable response ids as authorization. In routed mode entries remain scoped to the SHA-256 of the credential Sub2API authenticates after hop-by-hop headers are removed: a case-insensitive `Bearer` token (trimmed), else `X-API-Key`, else `X-Goog-API-Key`. The digest only isolates entries; every task read or cancel is still revalidated upstream.
 - `store: false` requests are not stored. On a WebSocket, the most recent turn can still be continued on the same socket, like OpenAI's connection-local cache. With `IGNORE_CLIENT_STORE_FALSE=true` they are stored (and returned with `store: true`) like any other turn, for clients such as Codex that always send `store: false` but should still recover after a reconnect.
 
 Retained history is bounded by payload and metadata budgets. Entries expire `STORE_TTL` after creation; least-recently-used registered IDs can be evicted to make room. bbolt under `STORE_DIR` holds both content-addressed items and transactional references/accounting. Identical item bytes are stored once. Per-item prefix nodes share growing histories even when clients resend full history without a previous ID; no per-response growing hash manifest is retained. `STORE_META_MAX_BYTES` charges every prefix node/hash occurrence, unique item index, response alias (including ID length), and socket pin. `STORE_PIN_MAX_BYTES` bounds all live WebSocket pins, including registered turns kept alive on their original socket; each socket charges its history's unique payload bytes. Replacement uses the net pin charge, not old plus new.
@@ -65,11 +65,11 @@ These limits remove known concurrent full-history/body retention. They do not ma
 
 ### In front of Sub2API
 
-In the gateway chain the keeper sits **in front of** Sub2API, behind the public APISIX/keepalive hop: its `UPSTREAM_URL` is the `responses-ws-sse-bridge` service, which converts WebSocket turns to HTTP and forwards to Sub2API (auth only). The account's `base_url` does not point at the keeper; the keeper owns WS termination for the whole chain. See `docs/websocket-termination.md` in the AI-gateway repository for the decided architecture.
+In the gateway chain the keeper sits **in front of** Sub2API, behind the public APISIX/keepalive hop: its `UPSTREAM_URL` is the `responses-ws-sse-bridge` service, which converts WebSocket turns to HTTP and forwards to Sub2API (authentication, quotas and account selection). The account's `base_url` does not point at the keeper; the keeper owns WS termination for the whole chain. See [the AI-gateway decision and deployment record](https://github.com/xz-dev/AI-gateway/blob/main/docs/websocket-termination.md) for the deployed architecture.
 
 `IGNORE_CLIENT_STORE_FALSE=true` is **required** in this placement. Clients such as Codex send `store:false` on every turn; without the flag those turns are only pinned to their socket, so reconnecting loses all history. With the flag every turn — HTTP or native WS — registers in the shared store, is returned with `store:true`, and continues on a new socket or over HTTP. This is the same decision the HTTP path makes at `prepareDiskEnv` (working.go): the flag forces `t.store = true`, which is shared by both transports.
 
-(An earlier placement put the keeper behind Sub2API `passthrough`; it failed because passthrough itself injects `store:false` into every frame — same fix, same flag.)
+The earlier Sub2API `passthrough` → keeper → bridge placement failed because a request error poisoned Sub2API's socket lifecycle and WS-created ids could not continue over HTTP. Passthrough also injects `store:false`, but the initial reconnect failure was a stale keeper process without the flag, not a missing WS implementation.
 
 ### WebSocket mode
 
@@ -77,11 +77,17 @@ Routed mode terminates the socket: each `response.create` frame is expanded like
 
 Single-upstream mode keeps WebSocket end to end: the keeper accepts the client socket, dials a second socket to the upstream with the client's headers (minus hop-by-hop and `Sec-WebSocket-*`), and relays every frame. Only `response.create` text frames are inspected, once per turn:
 
-- A `previous_response_id` the keeper recorded for this caller is expanded to the full stored history and the field is removed, so the downstream only sees a self-contained request. The turn's events are collected and rewritten like an HTTP turn, and the produced id stays continuable on the same socket (pin) or a new one (store).
+- A `previous_response_id` the keeper recorded is expanded to the full stored history and the field is removed, so the downstream only sees a self-contained request. The turn's events are collected and rewritten like an HTTP turn, and the produced id stays continuable on the same socket (pin) or a new one (store).
 - No parent: the frame is forwarded semantically unchanged and the turn is recorded, so its id becomes continuable.
-- Any other `previous_response_id` is downstream-native: the frame and its response frames relay byte-for-byte, unrecorded and unrewritten. `generate:false` prewarm frames relay the same way unless they chain onto a keeper-owned parent.
+- Any other `previous_response_id` is downstream-native: the frame and its response frames relay byte-for-byte, unrecorded and unrewritten. `generate:false` prewarm turns with no parent or a keeper-owned parent are recorded too.
 
 Turns serialize in order; while a turn is in flight the socket queues at most one further `response.create`. Other frames — upstream events, non-create client messages, control frames — relay immediately. A non-101 upstream handshake is passed through with its status and body. Client close cancels the upstream request.
+
+### Turn logs
+
+Each native WS `response.create` logs exactly once at its terminal event, local rejection, or transport abort, not when its frame is forwarded. `duration` includes upstream streaming and storage acceptance; `previous` records whether the request supplied a parent. `stored=true` means the turn was accepted into the cache (registered or socket-pinned); `stored=false` means it was not retained. An accepted public id is passed internally to the logger, but the existing log format deliberately includes no response-id or payload field.
+
+`status` is the HTTP/relay outcome, as on the HTTP path: a delivered terminal protocol error can have `status=200 stored=false`; inspect the protocol error for its application code. A transport-aborted turn logs `status=502`. Opaque/non-create frames do not produce turn logs. Cache and wire behavior are unchanged by this logging fix.
 
 ### Capacity
 
