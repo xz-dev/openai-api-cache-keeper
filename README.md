@@ -63,9 +63,13 @@ Size refusals use `working_set_too_large` (413); exhausted/expired work or trans
 
 These limits remove known concurrent full-history/body retention. They do not make `GOMEMLIMIT` a hard cap or exclude mmap/dirty/file-cache pages from cgroup memory. Local diagnostic testing uses real 384-MiB memory, no swap, `GOMEMLIMIT=256MiB`, and a separately declared 512-MiB cache profile. That cache profile is **not** a recommendation to expand production storage. CPU quota enforcement and the full gateway protocol chain still need independent acceptance; no new deployment is authorized by local memory results.
 
-### Behind Sub2API
+### In front of Sub2API
 
-Point an OpenAI API-key account's `base_url` at the keeper. WebSocket modes terminate at Sub2API: the keeper dials its own upstream WebSocket and relays frames, so the account's `ctx_pool`, `passthrough` or `http_bridge` choice only changes what Sub2API does with frames that stay downstream-native. In single-upstream mode the keeper now terminates and relays each WS turn itself (see below), so the account mode does not need `ctx_pool` for continuation to work. Set `GATEWAY_OPENAI_WS_INGRESS_PREVIOUS_RESPONSE_RECOVERY_ENABLED=false` so that, when Sub2API's own cache loses a downstream-owned id, it fails with `previous_response_not_found` instead of silently retrying without the parent.
+In the gateway chain the keeper sits **in front of** Sub2API, behind the public APISIX/keepalive hop: its `UPSTREAM_URL` is the `responses-ws-sse-bridge` service, which converts WebSocket turns to HTTP and forwards to Sub2API (auth only). The account's `base_url` does not point at the keeper; the keeper owns WS termination for the whole chain. See `docs/websocket-termination.md` in the AI-gateway repository for the decided architecture.
+
+`IGNORE_CLIENT_STORE_FALSE=true` is **required** in this placement. Clients such as Codex send `store:false` on every turn; without the flag those turns are only pinned to their socket, so reconnecting loses all history. With the flag every turn — HTTP or native WS — registers in the shared store, is returned with `store:true`, and continues on a new socket or over HTTP. This is the same decision the HTTP path makes at `prepareDiskEnv` (working.go): the flag forces `t.store = true`, which is shared by both transports.
+
+(An earlier placement put the keeper behind Sub2API `passthrough`; it failed because passthrough itself injects `store:false` into every frame — same fix, same flag.)
 
 ### WebSocket mode
 

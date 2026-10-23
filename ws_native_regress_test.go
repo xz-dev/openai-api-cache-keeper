@@ -43,6 +43,69 @@ func TestRegressionStoreFalseSameSocket(t *testing.T) {
 	}
 }
 
+// Sub2API WS passthrough forces store:false on every response.create
+// (openai_gateway_request_body.go normalizeOpenAIResponsesWebSocketCompatibilityBody).
+// IGNORE_CLIENT_STORE_FALSE must apply on the native WS relay exactly as on
+// HTTP: the turn registers in the shared store, advertises store:true, and
+// continues on a fresh socket and over HTTP. Codex clients send store:false
+// themselves, so the flag is required wherever the keeper terminates WS.
+func TestRegressionWSNativeIgnoreClientStoreFalse(t *testing.T) {
+	up, srv, k := newWSNativeKeeper(t, func(c *config) { c.ignoreClientStoreFalse = true })
+	c1 := dialWS(t, srv, "Bearer a")
+	ev := wsCreate(t, c1, `{"type":"response.create","model":"m","input":"A","store":false}`)
+	if resp, _ := ev["response"].(map[string]any); resp["store"] != true {
+		t.Fatalf("ignored store:false must advertise store:true: %v", ev)
+	}
+	id := responseID(ev)
+	if !strings.HasPrefix(id, "resp_") {
+		t.Fatalf("id not rewritten for client: %v", ev)
+	}
+	if n, _ := k.store.stats(); n != 1 {
+		t.Fatalf("shared store entries = %d, want 1", n)
+	}
+	c1.Close(websocket.StatusNormalClosure, "")
+
+	// New socket continues from the registered turn.
+	c2 := dialWS(t, srv, "Bearer a")
+	ev = wsCreate(t, c2, `{"type":"response.create","model":"m","input":"B","store":false,"previous_response_id":"`+id+`"}`)
+	if ev["type"] != "response.completed" {
+		t.Fatalf("new-socket continuation = %v", ev)
+	}
+	if got := strings.Join(kinds(up.last()), ","); got != "user:A,reasoning,assistant,user:B" {
+		t.Fatalf("new-socket input = %s", got)
+	}
+	c2.Close(websocket.StatusNormalClosure, "")
+
+	// HTTP continues from the same turn; the stateless upstream rejects any
+	// forwarded previous_response_id, so a completed response proves
+	// expansion happened locally.
+	status, body, _ := post(t, srv, "Bearer a", `{"model":"m","input":"C","stream":true,"previous_response_id":"`+id+`"}`)
+	if status != http.StatusOK {
+		t.Fatalf("http continuation %d %s", status, body)
+	}
+	if completedID(t, body) == "" {
+		t.Fatalf("http continuation had no completed id: %s", body)
+	}
+}
+
+// Without the flag the store:false turn stays pinned to its socket: a new
+// socket sees previous_response_not_found.
+func TestRegressionWSNativeStoreFalsePinWithoutFlag(t *testing.T) {
+	_, srv, k := newWSNativeKeeper(t)
+	c1 := dialWS(t, srv, "Bearer a")
+	id := responseID(wsCreate(t, c1, `{"type":"response.create","model":"m","input":"A","store":false}`))
+	c1.Close(websocket.StatusNormalClosure, "")
+	if n, _ := k.store.stats(); n != 0 {
+		t.Fatalf("unflagged store:false must not register: entries=%d", n)
+	}
+	c2 := dialWS(t, srv, "Bearer a")
+	ev := wsCreate(t, c2, `{"type":"response.create","model":"m","input":"B","previous_response_id":"`+id+`"}`)
+	errObj, _ := ev["error"].(map[string]any)
+	if ev["type"] != "error" || errObj["code"] != "previous_response_not_found" {
+		t.Fatalf("unflagged store:false id must not continue cross-socket: %v", ev)
+	}
+}
+
 func TestRegressionDisconnectCleanup(t *testing.T) {
 	seen := make(chan struct{})
 	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
