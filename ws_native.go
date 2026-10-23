@@ -324,6 +324,14 @@ func (k *keeper) serveWSNative(w http.ResponseWriter, r *http.Request) {
 	var inflight *wsNativeInflight // recorded turn awaiting its terminal frame
 	var nativeOpen bool            // native create forwarded, terminal not seen
 	var queued *wsFrame            // one create frame held while a turn runs
+	var turnStart time.Time
+	var turnPrevious bool
+	finishLog := func(status int, storedID string) {
+		if !turnStart.IsZero() {
+			logTurn("ws", status, turnPrevious, storedID, turnStart, k.store)
+			turnStart = time.Time{}
+		}
+	}
 
 	// releaseInflight frees the recorded turn's spool and collector charge on
 	// every early exit; callers clear the pointer only after it returns.
@@ -345,6 +353,11 @@ func (k *keeper) serveWSNative(w http.ResponseWriter, r *http.Request) {
 	// not the select variables the handler nils on shutdown.
 	pumpUp, pumpCl := upCh, clCh
 	cleanup := func() {
+		storedID := ""
+		if inflight != nil {
+			storedID = inflight.id
+		}
+		finishLog(http.StatusBadGateway, storedID)
 		releaseInflight()
 		if queued != nil {
 			queued.spool.Close()
@@ -366,10 +379,16 @@ func (k *keeper) serveWSNative(w http.ResponseWriter, r *http.Request) {
 
 	processClient := func(f *wsFrame) {
 		start := time.Now()
+		create := f.typ == websocket.MessageText && isWSCreate(f.spool)
 		id, status, hasPrev := k.wsNativeClientFrame(ctx, conn, upstream, r, owner, f, sess, &inflight, &nativeOpen)
 		f.spool.Close()
 		<-k.work.turns
-		logTurn("ws", status, hasPrev, id, start, k.store)
+		if create {
+			turnStart, turnPrevious = start, hasPrev
+			if inflight == nil && !nativeOpen {
+				finishLog(status, id)
+			}
+		}
 	}
 	processUpstream := func(f *wsFrame) {
 		defer f.spool.Close()
@@ -381,6 +400,11 @@ func (k *keeper) serveWSNative(w http.ResponseWriter, r *http.Request) {
 		}
 		if inflight != nil {
 			if status := k.wsNativeUpstreamFrame(ctx, conn, f, sess, inflight); status != 0 {
+				if status == -1 {
+					finishLog(http.StatusBadGateway, inflight.id)
+				} else {
+					finishLog(status, inflight.id)
+				}
 				inflight = nil
 				if status == -1 {
 					cancel()
@@ -398,6 +422,7 @@ func (k *keeper) serveWSNative(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if terminal {
+			finishLog(http.StatusOK, "")
 			nativeOpen = false
 		}
 	}
