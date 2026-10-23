@@ -123,6 +123,29 @@ can still shorten retention. Startup deliberately wipes all aliases, so 24h is n
 a restart-persistence promise. Histories are plaintext on disk; expiry/eviction/wipe
 are logical deletions, not secure erasure of old pages.
 
+## Proposed production observation window (not executed)
+
+After separately authorized coordinator deployment, use exactly `STORE_TTL=24h`,
+`STORE_MAX_ENTRIES=10000`, `STORE_MAX_BYTES=0`. Preserve other safety budgets and
+all topology/authentication settings. Start with 30 minutes of normal traffic;
+this lane does not authorize extra production load, inference calls, or a reboot.
+Sample memory/disk/CPU every 5 seconds and stop expanding the experiment if any:
+
+- Cache directory logical usage reaches **1 GiB**, or filesystem free space drops
+  below **4 GiB**. Include database copies and spools, not just live payload counters.
+- Keeper RSS or its cgroup memory usage reaches **384 MiB**, or any OOM/restart occurs.
+- Keeper CPU averaged over 60 seconds exceeds **one logical core** (Docker 100%) or
+  **80% of an existing CPU quota**, whichever is lower. Quota must be freshly read
+  by the deployment owner; it was not inspected under this lane's read-only scope.
+- Any missing/truncated history, failed bounded continuation smoke, persistent cache
+  I/O errors, or service-health regression.
+
+These are external experiment stop gates, not replacements for zero-unlimited
+configuration semantics. Stop new test load, preserve diagnostics and use the
+coordinator's fresh-read/CAS keeper-only rollback if needed; do not stop the gateway
+or reboot the VM. A passed 30-minute window is not a 24-hour soak or cold-boot acceptance.
+Longer passive observation needs its own owner and resource budget.
+
 ## Evidence and reproduction receipts
 
 Local receipts (not production secrets):
@@ -133,6 +156,9 @@ All Go runs clear `CPA_API_KEY`; `TMPDIR` is under `/var/tmp`.
 
 Standard regression checks: `gofmt -l .`, `env -u CPA_API_KEY go test ./...`,
 `env -u CPA_API_KEY go test -race ./...`, and `env -u CPA_API_KEY go vet ./...`.
-Mutating out entry eviction or restoring the old zero-byte background check makes
-the new tests fail. The final unmutated suite passes. Image/CI and rollout instructions
+Mutating out entry eviction, restoring the old zero-byte background check, or
+accepting over-budget history when only the protected alias remains makes the new
+tests fail. The protected-only test also accepts one alias with `maxEntries=1`
+without looping; if no evictable victim can satisfy a byte budget, admission returns
+the existing budget error and rolls back. The final unmutated suite passes. Image/CI and rollout instructions
 are in the lane's final `REPORT.md`; production deployment remains separate.
