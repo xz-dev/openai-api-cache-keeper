@@ -168,171 +168,141 @@ func (k *keeper) prepareDisk(ctx context.Context, raw *spool, owner [32]byte, lo
 // prepareDiskEnv is prepareDisk; with wsEnvelope the rebuilt spool keeps a
 // `"type":"response.create"` field so the result is a valid upstream
 // WebSocket frame instead of a bare HTTP request body.
+// fieldSpan is one retained top-level request field's raw value span in the
+// request spool; values stream from the file, never through the heap.
+type fieldSpan struct {
+	key        string
+	start, end int64
+}
+
+// prepareDiskEnv is prepareDisk; with wsEnvelope the rebuilt spool keeps a
+// `"type":"response.create"` field so the result is a valid upstream
+// WebSocket frame instead of a bare HTTP request body. It scans the spooled
+// request one field at a time with the span scanner: input items and every
+// other field value stay file spans, so a multi-megabyte input never
+// materializes or re-encodes through the heap (REVIEW3 B6).
 func (k *keeper) prepareDiskEnv(ctx context.Context, raw *spool, owner [32]byte, lookup func(id string) (tip [32]byte, found bool), ws, wsEnvelope bool) (*diskTurn, *apiError) {
 	if err := ctx.Err(); err != nil {
 		return nil, workingError(err)
 	}
 	task, _ := ctx.Value(backgroundTaskKey{}).(*responseTask)
-	r := io.NewSectionReader(raw.File, raw.offset, raw.size)
-	dec := json.NewDecoder(r)
-	start, decodeErr := dec.Token()
-	if decodeErr != nil || start != json.Delim('{') {
-		return nil, &apiError{status: 400, typ: "invalid_request_error", message: "request must be a JSON object"}
-	}
 	t := &diskTurn{store: true}
 	var prevID string
-	var other map[string]json.RawMessage
-	fields := 0
-	// Input item spans are recorded as offsets in the RAW request file
-	// (dec.InputOffset is the end of the just-decoded value). Nothing is
-	// copied until expansion writes the upstream spool in history order.
+	// Field spans of everything forwarded to the upstream body, in file order;
+	// written back out sorted by key at the end.
+	var other []fieldSpan
+	seen := map[string]int{}
+	putOther := func(name string, start, end int64) {
+		if i, ok := seen[name]; ok {
+			other[i] = fieldSpan{name, start, end}
+			return
+		}
+		seen[name] = len(other)
+		other = append(other, fieldSpan{name, start, end})
+	}
+	// Input item spans recorded as offsets in the RAW request file; nothing
+	// is copied until expansion writes the upstream spool in history order.
 	var inSpans []itemSpan
-	var inStrings []string
 	var inputIsString bool
-	var inputStr string
-	for dec.More() {
-		if fields >= 256 {
-			return nil, workingError(errWorkSize)
-		}
-		fields++
-		key, e := dec.Token()
-		if e != nil {
-			return nil, &apiError{status: 400, typ: "invalid_request_error", message: "invalid request JSON"}
-		}
-		name, ok := key.(string)
-		if !ok || len(name) > 64<<10 {
-			return nil, workingError(errWorkSize)
-		}
+	var inputSpan fieldSpan
+	var inputNull, inputErr bool
+	scanErr := spoolScanner(raw).objectFields(raw.keySlice, func(name string, start, end int64) error {
 		switch name {
 		case "prompt_cache_retention":
 			// Routed mode drops this field on ordinary turns; the pure
 			// single-upstream cache is not a policy filter and forwards it.
 			if task != nil || k.cfg.upstream != nil {
-				var value json.RawMessage
-				if err := dec.Decode(&value); err != nil {
-					return nil, responseError(errUpstreamData)
-				}
-				if other == nil {
-					other = map[string]json.RawMessage{}
-				}
-				other[name] = value
-			} else if _, err := skipJSONValue(dec); err != nil {
-				return nil, &apiError{status: 400, typ: "invalid_request_error", message: "invalid request JSON"}
+				putOther(name, start, end)
 			}
 		case "input":
-			tok, err := dec.Token()
-			if err != nil {
-				return nil, &apiError{status: 400, typ: "invalid_request_error", param: "input", message: err.Error()}
+			b := raw.keySlice(start, min(end, start+1))
+			if len(b) == 0 {
+				inputErr = true
+				return nil
 			}
-			if delim, ok := tok.(json.Delim); ok && delim == '[' {
-				var last json.RawMessage
-				for dec.More() {
+			switch b[0] {
+			case '[':
+				// Item spans relative to the value's own start.
+				sub := newJSONScanner(raw.spanReader(start, end))
+				err := sub.arrayItems(func(vs, ve int64) error {
 					if len(inSpans) >= maxHistoryItems {
-						return nil, workingError(errWorkSize)
+						return errWorkSize
 					}
-					var item json.RawMessage
-					if err := dec.Decode(&item); err != nil {
-						return nil, &apiError{status: 400, typ: "invalid_request_error", param: "input", message: err.Error()}
-					}
-					// dec.InputOffset() is the offset AFTER item; the item's
-					// own start is len(item) bytes before it (RawMessage keeps
-					// raw encoding; whitespace may differ, so re-derive from
-					// the decoder's recorded offset minus raw length).
-					end := dec.InputOffset()
-					inSpans = append(inSpans, itemSpan{end - int64(len(item)), len(item)})
-					last = item
+					inSpans = append(inSpans, itemSpan{start + vs, int(ve - vs)})
+					return nil
+				})
+				if err != nil {
+					inputErr = true
 				}
-				_ = last
-				if _, err := dec.Token(); err != nil {
-					return nil, &apiError{status: 400, typ: "invalid_request_error", param: "input", message: err.Error()}
-				}
-			} else if s, ok := tok.(string); ok {
+			case '"':
 				inputIsString = true
-				inputStr = s
-			} else if tok == nil {
-				// null input
-			} else {
-				return nil, &apiError{status: 400, typ: "invalid_request_error", param: "input", message: "input must be a string or an array of items"}
+				inputSpan = fieldSpan{"input", start, end}
+			case 'n': // null
+				inputNull = true
+			default:
+				inputErr = true
 			}
 		case "previous_response_id":
-			var v json.RawMessage
-			if err := dec.Decode(&v); err != nil || string(v) == "null" {
-				continue
+			if v := raw.keySlice(start, end); v != nil && string(v) != "null" {
+				var id string
+				if json.Unmarshal(v, &id) != nil || id == "" {
+					inputErr = true
+					return nil
+				}
+				prevID = id
+				t.hasPrev = true
 			}
-			var id string
-			if json.Unmarshal(v, &id) != nil || id == "" {
-				return nil, &apiError{status: 400, typ: "invalid_request_error", param: "previous_response_id", message: "previous_response_id must be a non-empty string"}
-			}
-			prevID = id
-			t.hasPrev = true
 		case "type":
-			var v json.RawMessage
-			if err := dec.Decode(&v); err != nil {
-				return nil, &apiError{status: 400, typ: "invalid_request_error", message: "invalid request JSON"}
-			}
+			v := raw.keySlice(start, end)
 			if ws {
 				var kind string
 				_ = json.Unmarshal(v, &kind)
 				if kind != "response.create" {
-					return nil, &apiError{status: 400, typ: "invalid_request_error", param: "type", message: "unsupported event type"}
+					inputErr = true
+					return nil
 				}
 				if wsEnvelope {
-					if other == nil {
-						other = map[string]json.RawMessage{}
-					}
-					other[name] = v
+					putOther(name, start, end)
 				}
-				continue
+				return nil
 			}
-			if other == nil {
-				other = map[string]json.RawMessage{}
-			}
-			other[name] = v
+			putOther(name, start, end)
 		case "store":
-			var v json.RawMessage
-			if err := dec.Decode(&v); err != nil {
-				return nil, &apiError{status: 400, typ: "invalid_request_error", message: "invalid request JSON"}
+			if v := raw.keySlice(start, end); v != nil {
+				t.store = string(v) != "false"
 			}
-			t.store = string(v) != "false"
-			if other == nil {
-				other = map[string]json.RawMessage{}
-			}
-			other[name] = v
+			putOther(name, start, end)
 		default:
-			var v json.RawMessage
-			if err := dec.Decode(&v); err != nil {
-				return nil, &apiError{status: 400, typ: "invalid_request_error", message: "invalid request JSON"}
-			}
-			if other == nil {
-				other = map[string]json.RawMessage{}
-			}
-			other[name] = v
+			putOther(name, start, end)
 		}
-	}
-	if _, e := dec.Token(); e != nil {
+		return nil
+	})
+	if scanErr != nil {
+		if scanErr == errWorkSize {
+			return nil, workingError(errWorkSize)
+		}
 		return nil, &apiError{status: 400, typ: "invalid_request_error", message: "invalid request JSON"}
 	}
-	var trailing json.RawMessage
-	if e := dec.Decode(&trailing); e != io.EOF {
-		return nil, &apiError{status: 400, typ: "invalid_request_error", message: "request must contain one JSON object"}
+	if inputErr {
+		return nil, &apiError{status: 400, typ: "invalid_request_error", param: "input", message: "input must be a string or an array of items"}
 	}
+	_ = inputNull
+	// String input becomes a user item; stream {"role":"user","content":<raw string>}
+	// with the raw string bytes copied verbatim (already valid JSON), so a
+	// multi-megabyte string is never decoded or re-encoded through the heap.
 	if inputIsString {
-		var sb bytes.Buffer
-		enc := json.NewEncoder(&sb)
-		enc.SetEscapeHTML(false)
-		if err := enc.Encode(map[string]any{"role": "user", "content": inputStr}); err != nil {
-			return nil, &apiError{status: 400, typ: "invalid_request_error", param: "input", message: err.Error()}
-		}
-		inStrings = append(inStrings, string(bytes.TrimRight(sb.Bytes(), "\n")))
+		// handled below: write wrapper around the raw string span
 	}
+	// Synthesized fields not present as file spans (background removal,
+	// native-parent prev forwarding, ws stream injection) are tiny by
+	// construction and kept as raw JSON.
+	extra := map[string]json.RawMessage{}
+	drop := map[string]bool{}
 	if task != nil {
-		delete(other, "background")
+		drop["background"] = true
 		if prevID != "" {
 			if _, local := lookup(prevID); !local && !strings.HasPrefix(prevID, keeperResponsePrefix) {
-				if other == nil {
-					other = map[string]json.RawMessage{}
-				}
-				other["previous_response_id"], _ = json.Marshal(prevID)
+				extra["previous_response_id"], _ = json.Marshal(prevID)
 				prevID = ""
 				task.mu.Lock()
 				task.nativeParent = true
@@ -341,10 +311,7 @@ func (k *keeper) prepareDiskEnv(ctx context.Context, raw *spool, owner [32]byte,
 		}
 	}
 	if ws && !wsEnvelope {
-		if other == nil {
-			other = map[string]json.RawMessage{}
-		}
-		other["stream"] = json.RawMessage("true")
+		extra["stream"] = json.RawMessage("true")
 	}
 	fail := func(err error) (*diskTurn, *apiError) {
 		if t.file != nil {
@@ -401,19 +368,48 @@ func (k *keeper) prepareDiskEnv(ctx context.Context, raw *spool, owner [32]byte,
 		}
 	}
 	// Client input items: copy spans from the raw request file with a small
-	// buffer. String input already marshaled to inStrings[0].
+	// buffer. A string input wraps its raw bytes verbatim in the user-item
+	// envelope — the quoted string needs no decode/re-encode.
 	copyBuf := make([]byte, 32<<10)
-	for _, span := range inSpans {
+	copyItemSpan := func(r io.Reader) error {
 		if nItems >= maxHistoryItems {
-			return fail(errWorkSize)
+			return errWorkSize
 		}
+		if nItems > 0 {
+			if err := out.write([]byte(",")); err != nil {
+				return err
+			}
+		}
+		off := f.size
+		if _, err := io.CopyBuffer(struct{ io.Writer }{f}, r, copyBuf); err != nil {
+			return err
+		}
+		if f.size-off > maxHistoryBytes {
+			return errWorkSize
+		}
+		t.spans = append(t.spans, itemSpan{off, int(f.size - off)})
+		nItems++
+		return nil
+	}
+	for _, span := range inSpans {
+		if err := copyItemSpan(io.NewSectionReader(raw.File, raw.offset+span.off, int64(span.n))); err != nil {
+			return fail(err)
+		}
+	}
+	if inputIsString {
 		if nItems > 0 {
 			if err := out.write([]byte(",")); err != nil {
 				return fail(err)
 			}
 		}
 		off := f.size
-		if _, err := io.CopyBuffer(struct{ io.Writer }{f}, io.NewSectionReader(raw.File, raw.offset+span.off, int64(span.n)), copyBuf); err != nil {
+		if err := out.write([]byte(`{"content":`)); err != nil {
+			return fail(err)
+		}
+		if _, err := io.CopyBuffer(struct{ io.Writer }{f}, raw.spanReader(inputSpan.start, inputSpan.end), copyBuf); err != nil {
+			return fail(err)
+		}
+		if err := out.write([]byte(`,"role":"user"}`)); err != nil {
 			return fail(err)
 		}
 		if f.size-off > maxHistoryBytes {
@@ -422,17 +418,24 @@ func (k *keeper) prepareDiskEnv(ctx context.Context, raw *spool, owner [32]byte,
 		t.spans = append(t.spans, itemSpan{off, int(f.size - off)})
 		nItems++
 	}
-	for _, s := range inStrings {
-		if err := putItem([]byte(s)); err != nil {
-			return fail(err)
-		}
-	}
 	if err := out.write([]byte("]")); err != nil {
 		return fail(err)
 	}
-	keys := make([]string, 0, len(other))
-	for k := range other {
-		keys = append(keys, k)
+	keys := make([]string, 0, len(other)+len(extra))
+	spans := map[string]fieldSpan{}
+	for _, fs := range other {
+		if drop[fs.key] {
+			continue
+		}
+		if _, dup := spans[fs.key]; !dup {
+			spans[fs.key] = fs
+			keys = append(keys, fs.key)
+		}
+	}
+	for k := range extra {
+		if _, dup := spans[k]; !dup {
+			keys = append(keys, k)
+		}
 	}
 	sort.Strings(keys)
 	for _, key := range keys {
@@ -452,8 +455,18 @@ func (k *keeper) prepareDiskEnv(ctx context.Context, raw *spool, owner [32]byte,
 		if err := out.write([]byte(":")); err != nil {
 			return fail(err)
 		}
-		if err := out.write(other[key]); err != nil {
+		if v, ok := extra[key]; ok {
+			if err := out.write(v); err != nil {
+				return fail(err)
+			}
+			continue
+		}
+		fs := spans[key]
+		if _, err := io.CopyBuffer(struct{ io.Writer }{f}, raw.spanReader(fs.start, fs.end), copyBuf); err != nil {
 			return fail(err)
+		}
+		if f.size > maxHistoryBytes {
+			return fail(errWorkSize)
 		}
 	}
 	if err := out.write([]byte("}")); err != nil {

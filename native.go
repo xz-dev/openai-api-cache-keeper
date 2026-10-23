@@ -1,7 +1,7 @@
 package main
 
 import (
-	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -66,33 +66,72 @@ func isUpgradeRequest(r *http.Request) bool {
 }
 
 // nativePreviousID extracts the top-level previous_response_id from a request
-// body without buffering it, so local checkpoint selection needs no protocol
-// flag. ok=false means the field is absent or structurally invalid; those
-// requests keep native semantics.
+// body without materializing values, so local checkpoint selection needs no
+// protocol flag. ok=false means the field is absent or structurally invalid;
+// those requests keep native semantics. The span scanner skips large input
+// values as unread bytes — a multi-megabyte input never reaches the heap.
 func nativePreviousID(r io.Reader) (string, bool) {
-	dec := json.NewDecoder(r)
-	dec.UseNumber()
-	if t, err := dec.Token(); err != nil || t != json.Delim('{') {
+	src := &spanSource{r: r}
+	var id string
+	found := false
+	err := newJSONScanner(src).objectFields(src.slice, func(key string, start, end int64) error {
+		if key != "previous_response_id" {
+			return nil
+		}
+		if raw := src.slice(start, end); raw != nil {
+			if v, ok := readJSONString(raw); ok && v != "" {
+				id, found = v, true
+			}
+		}
+		return errStopScan
+	})
+	if err != nil && !errors.Is(err, errStopScan) {
 		return "", false
 	}
-	for dec.More() {
-		key, err := dec.Token()
-		if err != nil {
-			return "", false
-		}
-		if name, _ := key.(string); name != "previous_response_id" {
-			if _, err := skipJSONValue(dec); err != nil {
-				return "", false
-			}
-			continue
-		}
-		var id string
-		if err := dec.Decode(&id); err != nil || id == "" {
-			return "", false
-		}
-		return id, true
+	return id, found
+}
+
+var errStopScan = errors.New("scan complete")
+
+// spanSource backs objectFields' readSpan for non-seekable readers: key/id
+// spans are small and just-consumed, so a bounded rolling window suffices;
+// anything larger returns nil and degrades to an empty key — which never
+// matches previous_response_id.
+type spanSource struct {
+	r    io.Reader
+	seen []byte // rolling window of the last 128 KiB consumed
+	base int64  // absolute offset of seen[0]
+	off  int64  // absolute offset of next byte
+}
+
+func (s *spanSource) slice(start, end int64) []byte {
+	// Pull the scanner's underlying reader up to `end`; the scanner consumed
+	// these bytes already, so they must sit in the window.
+	if end < s.base || end-start > 64<<10 {
+		return nil
 	}
-	return "", false
+	b := make([]byte, end-start)
+	copy(b, s.seen[start-s.base:end-s.base])
+	return b
+}
+
+// feed records bytes the scanner consumed; jsonScanner reads through us.
+func (s *spanSource) Read(p []byte) (int, error) {
+	n, err := s.r.Read(p)
+	s.off += int64(n)
+	// Re-derive window: keep at most the tail that future slices need.
+	newBase := s.off - 128<<10
+	if newBase > s.base {
+		cut := int(newBase - s.base)
+		if cut >= len(s.seen) {
+			s.seen = s.seen[:0]
+		} else {
+			s.seen = append(s.seen[:0], s.seen[cut:]...)
+		}
+		s.base = newBase
+	}
+	s.seen = append(s.seen, p[:n]...)
+	return n, err
 }
 
 // ownedLocalPreviousID reports whether spool's top-level previous_response_id
