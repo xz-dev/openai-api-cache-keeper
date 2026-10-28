@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"runtime"
 	"strings"
 	"testing"
@@ -14,8 +15,8 @@ import (
 )
 
 // Streaming core: expanding a stored history must not copy the history into
-// heap. A ~60MiB, 2000-item turn must expand and accept with a small,
-// bounded heap delta independent of history size.
+// heap. A ~60MiB, 2000-item history plus a 4MiB client input with a late
+// model must expand with a bounded heap delta and emit model first.
 func TestStreamingExpansionHeapBound(t *testing.T) {
 	s := newTestStore(t, time.Hour, 256<<20, 64<<20, 32<<20, 4<<20)
 	o := [32]byte{1}
@@ -34,10 +35,13 @@ func TestStreamingExpansionHeapBound(t *testing.T) {
 	k2 := k
 	k2.store = s
 
+	input := strings.Repeat("x", 4<<20)
 	var b1, b2 runtime.MemStats
 	runtime.GC()
 	runtime.ReadMemStats(&b1)
-	raw, err := k2.spoolRequest(context.Background(), strings.NewReader(`{"model":"m","input":"new","previous_response_id":"big"}`))
+	raw, err := k2.spoolRequest(context.Background(), io.MultiReader(
+		strings.NewReader(`{"input":"`), strings.NewReader(input),
+		strings.NewReader(`","previous_response_id":"big","model":"m"}`)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -55,6 +59,14 @@ func TestStreamingExpansionHeapBound(t *testing.T) {
 	if delta > 8<<20 {
 		t.Fatalf("expansion allocated %d bytes for a ~60MiB history", delta)
 	}
+	prefix := make([]byte, len(`{"model":"m","input":[`))
+	if _, err := turn.file.ReadAt(prefix, 0); err != nil {
+		t.Fatal(err)
+	}
+	if string(prefix) != `{"model":"m","input":[` {
+		t.Fatalf("model is not first: %s", prefix)
+	}
+	t.Logf("4MiB input + ~60MiB history expansion allocated %d bytes", delta)
 	if len(turn.spans) != 2001 {
 		t.Fatalf("spans=%d", len(turn.spans))
 	}
@@ -70,6 +82,9 @@ func TestStreamingExpansionHeapBound(t *testing.T) {
 		if string(hist[i]) != string(full[i]) {
 			t.Fatalf("item %d differs", i)
 		}
+	}
+	if string(hist[2000]) != `{"content":"`+input+`","role":"user"}` {
+		t.Fatal("large client input changed")
 	}
 }
 

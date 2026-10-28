@@ -249,7 +249,7 @@ func TestRoutingStripsOnlyTopLevelRetentionGolden(t *testing.T) {
 			t.Fatalf("HTTP status=%d body=%s", status, result)
 		}
 		requests := f.snapshot()
-		want := `{"input":[` + item + `],"extra":` + extra + `,"model":"\u0063pa","stream":` + stream + `}`
+		want := `{"model":"\u0063pa","input":[` + item + `],"extra":` + extra + `,"stream":` + stream + `}`
 		if got := requests[len(requests)-1].body; got != want {
 			t.Fatalf("ws=%t\n got: %s\nwant: %s", ws, got, want)
 		}

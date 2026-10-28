@@ -62,7 +62,7 @@ func newEchoKeeper(t *testing.T) (*echoUpstream, *httptest.Server, *keeper) {
 // reaches the upstream byte-for-byte unchanged.
 func TestNativePostRawBodyUnknownFieldsAndPrevID(t *testing.T) {
 	up, srv, _ := newEchoKeeper(t)
-	const body = `{"model":"native","input":"B","previous_response_id":"native_1","future_field":{"nested":[1,2,null]},"weird":"<&>\u00e9"}`
+	const body = `{"input":"B","previous_response_id":"native_1","future_field":{"nested":[1,2,null]},"weird":"<&>\u00e9","model":"native"}`
 	status, got, _ := post(t, srv, "Bearer native", body)
 	if status != 200 || !strings.Contains(got, `"native_1"`) {
 		t.Fatalf("status=%d body=%s", status, got)
@@ -87,7 +87,7 @@ func TestLocalCheckpointContinuesOnCanonicalPath(t *testing.T) {
 	if status != 200 || !strings.Contains(got, `"status":"completed"`) {
 		t.Fatalf("continuation %d %s", status, got)
 	}
-	want := `{"input":["P1","P2",{"content":"B","role":"user"}],"model":"native"}`
+	want := `{"model":"native","input":["P1","P2",{"content":"B","role":"user"}]}`
 	if up.body(0) != want {
 		t.Fatalf("expanded history wrong:\n got: %s\nwant: %s", up.body(0), want)
 	}

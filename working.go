@@ -188,8 +188,8 @@ func (k *keeper) prepareDiskEnv(ctx context.Context, raw *spool, owner [32]byte,
 	task, _ := ctx.Value(backgroundTaskKey{}).(*responseTask)
 	t := &diskTurn{store: true}
 	var prevID string
-	// Field spans of everything forwarded to the upstream body, in file order;
-	// written back out sorted by key at the end.
+	// Field spans forwarded to the upstream body: model first, then input,
+	// then the remaining fields sorted by key.
 	var other []fieldSpan
 	seen := map[string]int{}
 	putOther := func(name string, start, end int64) {
@@ -319,14 +319,34 @@ func (k *keeper) prepareDiskEnv(ctx context.Context, raw *spool, owner [32]byte,
 		}
 		return nil, workingError(err)
 	}
-	// Upstream spool: {"input":[ <history> , <input items> ], ...fields }
+	// Upstream spool: {"model":..., "input":[ <history> , <input items> ], ...fields }
 	f, err := k.newSpool()
 	if err != nil {
 		return nil, workingError(err)
 	}
 	t.file = f
 	out := &spoolWriter{f: f, limit: maxHistoryBytes}
-	if err := out.write([]byte(`{"input":[`)); err != nil {
+	copyBuf := make([]byte, 32<<10)
+	if err := out.write([]byte(`{`)); err != nil {
+		return fail(err)
+	}
+	if i, ok := seen["model"]; ok {
+		if err := out.write([]byte(`"model":`)); err != nil {
+			return fail(err)
+		}
+		fs := other[i]
+		if _, err := io.CopyBuffer(struct{ io.Writer }{f}, raw.spanReader(fs.start, fs.end), copyBuf); err != nil {
+			return fail(err)
+		}
+		if f.size > maxHistoryBytes {
+			return fail(errWorkSize)
+		}
+		if err := out.write([]byte(`,`)); err != nil {
+			return fail(err)
+		}
+		drop["model"] = true
+	}
+	if err := out.write([]byte(`"input":[`)); err != nil {
 		return fail(err)
 	}
 	nItems := 0
@@ -370,7 +390,6 @@ func (k *keeper) prepareDiskEnv(ctx context.Context, raw *spool, owner [32]byte,
 	// Client input items: copy spans from the raw request file with a small
 	// buffer. A string input wraps its raw bytes verbatim in the user-item
 	// envelope — the quoted string needs no decode/re-encode.
-	copyBuf := make([]byte, 32<<10)
 	copyItemSpan := func(r io.Reader) error {
 		if nItems >= maxHistoryItems {
 			return errWorkSize
