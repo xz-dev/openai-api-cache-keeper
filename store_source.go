@@ -4,11 +4,10 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"io"
-	"log"
 
 	bolt "go.etcd.io/bbolt"
-	"golang.org/x/sys/unix"
 )
 
 type preparedStoreItem struct {
@@ -17,30 +16,17 @@ type preparedStoreItem struct {
 	hash   [32]byte
 }
 type preparedStoreSource struct {
-	file           *spool
-	plan           *chainPlan
-	items          []preparedStoreItem
-	mapped         []byte
-	credits        []func()
-	mappingRelease func()
-	store          *store
-	gen            *storeGeneration
-	stageNext      *preparedStoreSource
-	staging        bool
+	file      *spool
+	plan      *chainPlan
+	items     []preparedStoreItem
+	credits   []func()
+	store     *store
+	gen       *storeGeneration
+	stageNext *preparedStoreSource
+	staging   bool
 }
 
 func (p *preparedStoreSource) Close() {
-	if p.mapped != nil {
-		if err := unix.Munmap(p.mapped); err != nil {
-			log.Printf("prepared source unmap failed; mapping remains charged: %v", err)
-		} else {
-			p.mapped = nil
-		}
-	}
-	if p.mapped == nil && p.mappingRelease != nil {
-		p.mappingRelease()
-		p.mappingRelease = nil
-	}
 	if p.file != nil {
 		_ = p.file.Close()
 	}
@@ -71,16 +57,17 @@ func (p *preparedStoreSource) Close() {
 				break
 			}
 			err := s.update(func(st *storeTx) error {
-				refs, items := st.tx.Bucket(bucketItemRefs), st.tx.Bucket(bucketItems)
+				refs := st.tx.Bucket(bucketItemRefs)
 				for _, item := range p.items[start:end] {
 					r := refs.Get(item.hash[:])
-					if len(r) != 16 || number(r[8:]) != 0 || s.stagedItem(item.hash[:]) {
+					// No refs record: a chunked write that never completed.
+					if (r != nil && (len(r) != 16 || number(r[8:]) != 0)) || s.stagedItem(item.hash[:]) {
 						continue
 					}
 					if err := refs.Delete(item.hash[:]); err != nil {
 						return err
 					}
-					if err := items.Delete(item.hash[:]); err != nil {
+					if err := deleteStoredItem(st.tx, item.hash[:]); err != nil {
 						return err
 					}
 				}
@@ -114,7 +101,7 @@ func (s *store) stagedItem(key []byte) bool {
 
 // Caller item reads, validation, hashing and spool I/O must not run under the
 // DB mutation serializer or in a bbolt transaction.
-func (s *store) prepareStoreSource(ctx context.Context, owner [32]byte, source itemFactory) (_ *preparedStoreSource, err error) {
+func (s *store) prepareStoreSource(ctx context.Context, owner [32]byte, source itemStreamFactory) (_ *preparedStoreSource, err error) {
 	g, acquireErr := s.acquireGeneration()
 	if acquireErr != nil {
 		return nil, acquireErr
@@ -135,12 +122,13 @@ func (s *store) prepareStoreSource(ctx context.Context, owner [32]byte, source i
 	if err != nil {
 		return nil, err
 	}
-	window, err := s.inputWork.reserveInput(64 << 10)
+	// One small-item buffer plus the streaming validator of a large item.
+	window, err := s.inputWork.reserveInput(64<<10 + jsonValidateCredit)
 	if err != nil {
 		return nil, err
 	}
 	defer window()
-	buf := make([]byte, 0, 64<<10)
+	buf := make([]byte, 64<<10)
 	next := source()
 	var parent [32]byte
 	seenSpans := make(map[[32]byte]preparedStoreItem)
@@ -166,7 +154,7 @@ func (s *store) prepareStoreSource(ctx context.Context, owner [32]byte, source i
 		if err = ctx.Err(); err != nil {
 			return nil, err
 		}
-		item, e := next(buf[:0])
+		n, r, e := next()
 		if e == io.EOF {
 			break
 		}
@@ -176,70 +164,124 @@ func (s *store) prepareStoreSource(ctx context.Context, owner [32]byte, source i
 		if int64(len(p.items)+2)*nodeMetaOverhead > s.maxMeta {
 			return nil, errStoreBudget
 		}
-		if !json.Valid(item) {
-			return nil, errUpstreamData
+		if p.file.size+n > maxSpoolBytes {
+			return nil, errWorkSize
 		}
-		hash := sha256.Sum256(item)
+		var hash [32]byte
+		offset := p.file.size
+		if n <= int64(len(buf)) {
+			item := buf[:n]
+			if _, err = io.ReadFull(r, item); err != nil {
+				return nil, err
+			}
+			if !json.Valid(item) {
+				return nil, errUpstreamData
+			}
+			hash = sha256.Sum256(item)
+			if _, seen := seenSpans[hash]; !seen {
+				if _, err = p.file.Write(item); err != nil {
+					return nil, err
+				}
+			}
+		} else {
+			// A large item streams through the validator into the spool;
+			// a duplicate's copy stays unused there (disk only, in budget).
+			h := sha256.New()
+			if err = validJSONStream(ctx, io.TeeReader(io.LimitReader(r, n), io.MultiWriter(h, p.file))); err != nil {
+				if errors.Is(err, errJSONSyntax) {
+					err = errUpstreamData
+				}
+				return nil, err
+			}
+			if p.file.size-offset != n {
+				return nil, io.ErrUnexpectedEOF
+			}
+			h.Sum(hash[:0])
+		}
 		if err = addNode(hash); err != nil {
 			return nil, err
 		}
 		span, exists := seenSpans[hash]
 		if !exists {
-			if p.file.size+int64(len(item)) > maxSpoolBytes {
-				return nil, errWorkSize
-			}
-			p.plan.charge += int64(len(item))
+			p.plan.charge += n
 			p.plan.newItems[hash] = true
-			span = preparedStoreItem{offset: p.file.size, size: len(item), hash: hash}
-			if _, err = p.file.Write(item); err != nil {
-				return nil, err
-			}
+			span = preparedStoreItem{offset: offset, size: int(n), hash: hash}
 			seenSpans[hash] = span
 		}
 		p.items = append(p.items, span)
 	}
 	p.plan.tip = parent
-	free, e := s.inputWork.reserveInput(p.file.offset + p.file.size)
-	if e != nil {
-		return nil, e
-	}
-	p.mappingRelease = free
-	if p.file.offset+p.file.size == 0 {
-		return p, nil // an empty history has nothing to map
-	}
-	p.mapped, err = unix.Mmap(int(p.file.File.Fd()), 0, int(p.file.offset+p.file.size), unix.PROT_READ, unix.MAP_PRIVATE)
-	if err != nil {
-		return nil, err
-	}
 	return p, nil
 }
 
+// storePiece is one bounded Put: a whole small item, or one chunk of a
+// large one (chunk >= 0).
+type storePiece struct {
+	hash        [32]byte
+	off         int64
+	n           int
+	chunk       int64
+	size        int64 // whole item size, recorded with the last piece
+	last, small bool
+}
+
+// storeWriteCredit is the heap one staging write may use: the payload slab
+// plus bbolt's commit copies (leaf node buffer and overflow page
+// allocation; TestStoreLargeItemHeapBounded measures about 10 MiB per
+// transaction including the slab).
+const storeWriteCredit int64 = 3 * (storeWriteBatch + itemChunkBytes)
+
 // Only actual immutable payload mutations remain here. Data is validated,
 // hashed and owned before entering the writer; no caller source can park it.
+// Each write transaction carries at most storeWriteBatch (+ one chunk) of
+// payload read from the prepared spool into one charged slab.
 func (s *store) writePreparedItems(ctx context.Context, p *preparedStoreSource) error {
-	const batch = 4 << 20
-	var staged []preparedStoreItem
+	var staged []storePiece
 	var size int
 	seen := make(map[[32]byte]bool)
+	var slab []byte
 	commit := func() error {
 		if len(staged) == 0 {
 			return nil
+		}
+		if slab == nil {
+			free, err := s.inputWork.reserveInput(storeWriteCredit)
+			if err != nil {
+				return err
+			}
+			p.credits = append(p.credits, free)
+			slab = make([]byte, storeWriteBatch+itemChunkBytes)
+		}
+		data := make([][]byte, len(staged))
+		used := 0
+		for i, piece := range staged {
+			data[i] = slab[used : used+piece.n]
+			used += piece.n
+			if _, err := p.file.ReadAt(data[i], piece.off); err != nil {
+				return err
+			}
 		}
 		if err := s.acquireMutation(ctx); err != nil {
 			return err
 		}
 		// Select the current DB under mu: compaction copied protected stages.
+		// bbolt keeps each Put's value slice until commit: slab is reused after.
 		err := s.db.Update(func(tx *bolt.Tx) error {
-			items, refs := tx.Bucket(bucketItems), tx.Bucket(bucketItemRefs)
-			for _, item := range staged {
-				if refs.Get(item.hash[:]) != nil {
+			items, chunks, refs := tx.Bucket(bucketItems), tx.Bucket(bucketItemChunks), tx.Bucket(bucketItemRefs)
+			for i, piece := range staged {
+				if refs.Get(piece.hash[:]) != nil {
 					continue
 				}
-				start := p.file.offset + item.offset
-				if err := items.Put(item.hash[:], p.mapped[start:start+int64(item.size)]); err != nil {
-					return err
+				var err error
+				if piece.small {
+					err = items.Put(piece.hash[:], data[i])
+				} else {
+					err = chunks.Put(chunkKey(piece.hash[:], piece.chunk), data[i])
 				}
-				if err := refs.Put(item.hash[:], append(encoded(int64(item.size)), encoded(0)...)); err != nil {
+				if err == nil && piece.last {
+					err = refs.Put(piece.hash[:], append(encoded(piece.size), encoded(0)...))
+				}
+				if err != nil {
 					return err
 				}
 			}
@@ -254,6 +296,14 @@ func (s *store) writePreparedItems(ctx context.Context, p *preparedStoreSource) 
 		}
 		return err
 	}
+	add := func(piece storePiece) error {
+		staged = append(staged, piece)
+		size += piece.n
+		if size >= storeWriteBatch {
+			return commit()
+		}
+		return nil
+	}
 	for _, item := range p.items {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -262,10 +312,17 @@ func (s *store) writePreparedItems(ctx context.Context, p *preparedStoreSource) 
 			continue
 		}
 		seen[item.hash] = true
-		staged = append(staged, item)
-		size += item.size
-		if size >= batch {
-			if err := commit(); err != nil {
+		whole := int64(item.size)
+		if whole <= itemChunkBytes {
+			if err := add(storePiece{hash: item.hash, off: item.offset, n: item.size, size: whole, last: true, small: true}); err != nil {
+				return err
+			}
+			continue
+		}
+		for i := int64(0); i*itemChunkBytes < whole; i++ {
+			n := min(itemChunkBytes, whole-i*itemChunkBytes)
+			last := (i+1)*itemChunkBytes >= whole
+			if err := add(storePiece{hash: item.hash, off: item.offset + i*itemChunkBytes, n: int(n), chunk: i, size: whole, last: last}); err != nil {
 				return err
 			}
 		}

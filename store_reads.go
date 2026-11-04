@@ -81,15 +81,14 @@ func (s *store) writeHistoryTo(hashes [][32]byte, write func(item []byte) error)
 			batched += 1 << 20 // pessimistic; item size unknown until tx
 		}
 		err := s.view(func(tx *bolt.Tx) error {
-			its := tx.Bucket(bucketItems)
 			for _, h := range hashes[start:end] {
 				var zero [32]byte
 				if h == zero {
 					continue
 				}
-				item := its.Get(h[:])
-				if item == nil {
-					return errMissingItem
+				item, err := loadStoredItem(tx, h[:])
+				if err != nil {
+					return err
 				}
 				if err := write(item); err != nil {
 					return err
@@ -119,11 +118,11 @@ func readHistory(tx *bolt.Tx, node []byte, owner [32]byte) ([]json.RawMessage, e
 			return nil, errMissingItem
 		}
 		if string(v[32:64]) != string(zero[:]) {
-			item := tx.Bucket(bucketItems).Get(v[32:64])
-			if item == nil {
-				return nil, errMissingItem
+			item, err := loadStoredItem(tx, v[32:64])
+			if err != nil {
+				return nil, err
 			}
-			out = append(out, append(json.RawMessage(nil), item...))
+			out = append(out, item)
 		}
 		node = v[:32]
 	}

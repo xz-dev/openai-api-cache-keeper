@@ -202,10 +202,24 @@ type diskTurn struct {
 	spanFree       func()
 }
 
-// itemReader streams each span through a small reusable buffer.
-func (t *diskTurn) itemSource() itemFactory {
-	return func() itemSource { return t.itemReader() }
+// itemStream streams each span off the spool, never through a whole-item
+// buffer: one large item costs the store a 64 KiB window, not its size.
+func (t *diskTurn) itemStream() itemStreamFactory {
+	return func() itemStream {
+		i := 0
+		return func() (int64, io.Reader, error) {
+			if i >= len(t.spans) {
+				return 0, nil, io.EOF
+			}
+			span := t.spans[i]
+			i++
+			return int64(span.n), t.file.section(span.off, int64(span.n)), nil
+		}
+	}
 }
+
+// itemReader materializes each span through a reusable charged buffer
+// (tests only; the store reads itemStream).
 
 func (t *diskTurn) itemReader() itemSource {
 	i := 0
@@ -747,7 +761,7 @@ type diskAcceptance struct {
 
 func (p *diskAcceptance) close() { p.state.Close() }
 func (p *diskAcceptance) commit(ctx context.Context) (string, error) {
-	_, handle, err := p.k.store.acceptWithBudget(ctx, p.id, p.owner, p.turn.itemSource(), p.oldPin, p.turn.store, p.pin, func() (int64, func()) { return p.k.reserveHistoryCache(p.encoded) })
+	_, handle, err := p.k.store.acceptStream(ctx, p.id, p.owner, p.turn.itemStream(), p.oldPin, p.turn.store, p.pin, func() (int64, func()) { return p.k.reserveHistoryCache(p.encoded) })
 	return handle, err
 }
 func (k *keeper) acceptDisk(ctx context.Context, t *diskTurn, id string, owner [32]byte, output []json.RawMessage, oldPin string, pin bool) (string, error) {

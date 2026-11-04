@@ -260,12 +260,9 @@ func (r *snapshotItemReader) Read(dst []byte) (int, error) {
 	}
 	var n int
 	err := r.history.gen.db.View(func(tx *bolt.Tx) error {
-		item := tx.Bucket(bucketItems).Get(r.hash[:])
-		if int64(len(item)) != r.size {
-			return errMissingItem
-		}
-		n = copy(dst, item[r.offset:])
-		return nil
+		var err error
+		n, err = readStoredItem(tx, r.hash[:], r.offset, dst[:min(int64(len(dst)), r.size-r.offset)])
+		return err
 	})
 	r.offset += int64(n)
 	return n, err
@@ -282,12 +279,9 @@ func (h *historySnapshot) each(ctx context.Context, fn func(int64, io.Reader) er
 		}
 		var size int64
 		if err := h.gen.db.View(func(tx *bolt.Tx) error {
-			item := tx.Bucket(bucketItems).Get(hash[:])
-			if item == nil {
-				return errMissingItem
-			}
-			size = int64(len(item))
-			return nil
+			var err error
+			size, err = storedItemSize(tx, hash[:])
+			return err
 		}); err != nil {
 			return err
 		}

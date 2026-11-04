@@ -100,14 +100,20 @@ func inspectStore(t *testing.T, s *store) (live, meta, pinned int64, nodes, alia
 			}
 			return nil
 		})
+		_ = tx.Bucket(bucketItemChunks).ForEach(func(k, v []byte) error {
+			if tx.Bucket(bucketItemRefs).Get(k[:32]) == nil || len(v) > itemChunkBytes {
+				t.Errorf("orphan or oversized chunk: %x", k)
+			}
+			return nil
+		})
 		_ = tx.Bucket(bucketItemRefs).ForEach(func(k, v []byte) error {
 			live += number(v[:8])
 			meta += hashMetaOverhead
 			if itemRefs[string(k)] != number(v[8:]) || number(v[8:]) == 0 {
 				t.Errorf("item reference/content mismatch: %x", k)
 			}
-			if tx.Bucket(bucketItems).Get(k) == nil {
-				t.Errorf("refs record without payload: %x", k)
+			if item, err := loadStoredItem(tx, k); err != nil || int64(len(item)) != number(v[:8]) || !json.Valid(item) {
+				t.Errorf("refs record without its payload: %x %v", k, err)
 			}
 			delete(itemRefs, string(k))
 			return nil

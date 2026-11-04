@@ -117,7 +117,7 @@ func newStore(dir string, ttl time.Duration, maxLive, maxMeta, pinMax, compactAt
 		return nil, err
 	} // corrupt cache: fail safely, never unlink on failed Open
 	err = db.Update(func(tx *bolt.Tx) error {
-		for _, name := range [][]byte{bucketItems, bucketItemRefs, bucketNodes, bucketResponses, bucketPins, bucketCounts} {
+		for _, name := range [][]byte{bucketItems, bucketItemChunks, bucketItemRefs, bucketNodes, bucketResponses, bucketPins, bucketCounts} {
 			if tx.Bucket(name) != nil {
 				if err := tx.DeleteBucket(name); err != nil {
 					return err
@@ -257,7 +257,7 @@ func (st *storeTx) ref(id []byte, delta int64) error {
 					if err := refs.Delete(h); err != nil {
 						return err
 					}
-					if err := st.tx.Bucket(bucketItems).Delete(h); err != nil {
+					if err := deleteStoredItem(st.tx, h); err != nil {
 						return err
 					}
 				}
@@ -462,7 +462,7 @@ func (st *storeTx) sweepOrphans() error {
 			if err := refs.Delete(k); err != nil {
 				return err
 			}
-			if err := st.tx.Bucket(bucketItems).Delete(k); err != nil {
+			if err := deleteStoredItem(st.tx, k); err != nil {
 				return err
 			}
 		}
@@ -554,6 +554,10 @@ func (s *store) acceptContext(ctx context.Context, id string, owner [32]byte, so
 }
 
 func (s *store) acceptWithBudget(ctx context.Context, id string, owner [32]byte, source itemFactory, oldPin string, registered, pinned bool, reserve func() (int64, func())) (string, string, error) {
+	return s.acceptStream(ctx, id, owner, streamItems(source), oldPin, registered, pinned, reserve)
+}
+
+func (s *store) acceptStream(ctx context.Context, id string, owner [32]byte, source itemStreamFactory, oldPin string, registered, pinned bool, reserve func() (int64, func())) (string, string, error) {
 	prepared, err := s.prepareStoreSource(ctx, owner, source)
 	if err != nil {
 		return "", "", err
