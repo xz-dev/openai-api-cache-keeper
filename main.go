@@ -58,6 +58,9 @@ func main() {
 			log.Fatal(err)
 		}
 	}
+	if err := checkSpoolDir(cfg.storeDir); err != nil {
+		log.Fatal(err)
+	}
 	k := newKeeper(cfg)
 	srv := &http.Server{Addr: cfg.listen, Handler: k, ReadHeaderTimeout: 10 * time.Second}
 	listener, err := net.Listen("tcp", cfg.listen)

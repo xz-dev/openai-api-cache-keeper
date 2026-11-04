@@ -15,6 +15,8 @@ import (
 	"sync/atomic"
 	"unicode/utf8"
 	"unsafe"
+
+	"golang.org/x/sys/unix"
 )
 
 // Bounds for the unchanged 384-MiB envelope. Slow upstreams retain disk files,
@@ -28,11 +30,14 @@ const (
 	// object (itself bounded by maxResponseBytes) so its slice header is a
 	// fixed term of responseScratch. History and request input have no item
 	// cap (design D5).
-	maxResponseItems         = 8192
-	maxResponseBytes         = 8 << 20 // per object, event or non-stream body
-	maxCollectedBytes        = 16 << 20
-	maxTaskStreamBytes       = 8 << 20 // cumulative task-log re-parse budget; SSE relay itself is unbounded
-	maxSpoolBytes      int64 = 1 << 30
+	maxResponseItems   = 8192
+	maxResponseBytes   = 8 << 20 // per object, event or non-stream body
+	maxCollectedBytes  = 16 << 20
+	maxTaskStreamBytes = 8 << 20 // cumulative task-log re-parse budget; SSE relay itself is unbounded
+	// maxSpoolBytes is keeper's transient disk byte budget: one maximum
+	// turn holds its raw request and its rebuilt upstream spool (k_disk 2,
+	// design D4) with room for concurrent small turns.
+	maxSpoolBytes int64 = 4 * maxHistoryBytes
 )
 
 var errWorkSize = errors.New("encoded history or response exceeds working limit")
@@ -66,6 +71,7 @@ type workingSet struct {
 	disk          int64
 	output        int64
 	input         int64
+	statfs        func(fd int, st *unix.Statfs_t) error // free-space source; nil = unix.Fstatfs
 }
 
 func newWorkingSet() *workingSet { return &workingSet{} }
@@ -92,6 +98,10 @@ func workingError(err error) *apiError {
 	}
 	if errors.As(err, &named) {
 		return &apiError{status: 413, typ: "invalid_request_error", code: named.code, message: named.Error()}
+	}
+	var floor *storageFloorError
+	if errors.As(err, &floor) {
+		return &apiError{status: http.StatusInsufficientStorage, typ: "server_error", code: "insufficient_storage", message: floor.Error()}
 	}
 	if errors.Is(err, errWorkSize) {
 		return &apiError{status: 413, typ: "invalid_request_error", code: "working_set_too_large", message: err.Error()}
@@ -547,7 +557,7 @@ func (k *keeper) prepareDiskSnapshot(ctx context.Context, raw *spool, owner [32]
 		return nil
 	}
 	for _, span := range inSpans {
-		if err := copyItemSpan(io.NewSectionReader(raw.File, raw.offset+span.off, int64(span.n))); err != nil {
+		if err := copyItemSpan(raw.section(span.off, int64(span.n))); err != nil {
 			return fail(err)
 		}
 	}

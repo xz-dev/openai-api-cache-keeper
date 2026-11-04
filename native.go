@@ -144,7 +144,7 @@ func (k *keeper) ownedLocalPreviousID(spool *spool, owner [32]byte) (id string, 
 		return "", false, workingError(err)
 	}
 	defer release()
-	id, present := nativePreviousID(io.NewSectionReader(spool.File, spool.offset, spool.size))
+	id, present := nativePreviousID(spool.section(0, spool.size))
 	if !present {
 		return "", false, nil
 	}

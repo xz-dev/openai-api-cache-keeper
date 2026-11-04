@@ -42,7 +42,7 @@ func (m *workingSet) freeInput(n int64) {
 // validSpoolJSON validates the complete body in constant memory: the spool
 // is streamed through validJSONStream, never mapped or decoded whole.
 func validSpoolJSON(ctx context.Context, raw *spool) error {
-	return validJSONStream(ctx, io.NewSectionReader(raw.File, raw.offset, raw.size))
+	return validJSONStream(ctx, raw.section(0, raw.size))
 }
 
 // inputParseCredit is the fixed scan skeleton (design D2). It does not grow

@@ -529,7 +529,7 @@ func readJSONString(raw []byte) (string, bool) {
 // spoolScanner adapts the scanner onto a spool; spans are spool-relative
 // offsets usable with ReadAt.
 func spoolScanner(f *spool) *jsonScanner {
-	return newJSONScanner(io.NewSectionReader(f.File, f.offset, f.size))
+	return newJSONScanner(f.section(0, f.size))
 }
 
 // keySlice re-reads a bounded span (keys/ids); oversized spans return nil.
@@ -557,6 +557,6 @@ func (f *spool) spanBytes(start, end int64) ([]byte, error) {
 }
 
 // spanReader returns a bounded reader over one span for streaming copies.
-func (f *spool) spanReader(start, end int64) *io.SectionReader {
-	return io.NewSectionReader(f.File, f.offset+start, end-start)
+func (f *spool) spanReader(start, end int64) io.Reader {
+	return f.section(start, end-start)
 }

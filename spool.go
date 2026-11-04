@@ -127,6 +127,7 @@ type spool struct {
 	*os.File
 	mem                     *workingSet
 	size, offset, diskBytes int64
+	dropped                 int64 // file offset below which written pages were synced and evicted
 	mu                      sync.Mutex
 	refs                    int
 	ownerClosed             bool
@@ -176,15 +177,35 @@ func (f *spool) Write(p []byte) (int, error) {
 	}
 	f.mem.disk += int64(len(p))
 	f.mem.mu.Unlock()
-	n, err := f.File.Write(p)
+	n, err := 0, checkDiskFloor(f.mem, f.File, int64(len(p)))
+	if err == nil {
+		n, err = f.File.Write(p)
+	}
 	f.size += int64(n)
 	f.diskBytes += int64(n)
 	f.mem.mu.Lock()
 	f.mem.disk -= int64(len(p) - n)
 	f.mem.mu.Unlock()
+	if end := f.offset + f.size; end-f.dropped >= spoolCacheWindow {
+		dropCache(f.File, f.dropped, end-f.dropped, true)
+		f.dropped = end
+	}
 	return n, err
 }
-func (f *spool) ReadAt(p []byte, off int64) (int, error) { return f.File.ReadAt(p, off+f.offset) }
+
+// ReadAt evicts large reads at once (design D3 read-side fadvise).
+func (f *spool) ReadAt(p []byte, off int64) (int, error) {
+	n, err := f.File.ReadAt(p, off+f.offset)
+	if int64(n) >= 1<<20 {
+		dropCache(f.File, off+f.offset, int64(n), false)
+	}
+	return n, err
+}
+
+// section streams [off, off+n) of the payload with read-side eviction.
+func (f *spool) section(off, n int64) io.Reader {
+	return newCacheDropReader(f.File, f.offset+off, n)
+}
 func (f *spool) Close() error {
 	if f == nil {
 		return nil
@@ -240,9 +261,22 @@ func (f *spool) releaseLocked() error {
 // returns early. Handler completion alone cannot close/uncharge its open file.
 type spoolBody struct {
 	*io.SectionReader
-	spool *spool
-	once  sync.Once
-	err   error
+	spool   *spool
+	file    *os.File
+	dropped int64 // payload offset below which read pages were evicted
+	once    sync.Once
+	err     error
+}
+
+// Read evicts each sent window (design D3 read-side fadvise).
+func (b *spoolBody) Read(p []byte) (int, error) {
+	n, err := b.SectionReader.Read(p)
+	pos, _ := b.SectionReader.Seek(0, io.SeekCurrent)
+	if pos-b.dropped >= spoolCacheWindow || (err != nil && pos > b.dropped) {
+		dropCache(b.file, b.spool.offset+b.dropped, pos-b.dropped, false)
+		b.dropped = pos
+	}
+	return n, err
 }
 
 func (f *spool) requestBody() (*spoolBody, error) {
@@ -252,7 +286,7 @@ func (f *spool) requestBody() (*spoolBody, error) {
 		return nil, os.ErrClosed
 	}
 	f.refs++
-	return &spoolBody{SectionReader: io.NewSectionReader(f.File, f.offset, f.size), spool: f}, nil
+	return &spoolBody{SectionReader: io.NewSectionReader(f.File, f.offset, f.size), spool: f, file: f.File}, nil
 }
 func (b *spoolBody) Close() error {
 	b.once.Do(func() { b.spool.mu.Lock(); defer b.spool.mu.Unlock(); b.err = b.spool.releaseLocked() })
