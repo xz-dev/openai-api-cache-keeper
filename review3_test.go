@@ -339,9 +339,17 @@ func TestReview3UpstreamUTF8(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 	_ = c.Write(ctx, websocket.MessageText, []byte(`{"type":"response.create","previous_response_id":"resp_native","input":[]}`))
+	// The open turn first ends with an explicit, valid-UTF-8 error event
+	// (design D7: never a bare close); then the socket closes with 1007.
 	_, b, e := c.Read(ctx)
 	if e == nil && !utf8.Valid(b) {
 		t.Fatalf("keeper forwarded invalid UTF8 upstream text to client: %x", b)
+	}
+	if e == nil {
+		if !strings.Contains(string(b), `"type":"error"`) {
+			t.Fatalf("first frame is not the turn error event: %s", b)
+		}
+		_, b, e = c.Read(ctx)
 	}
 	if websocket.CloseStatus(e) != websocket.StatusInvalidFramePayloadData {
 		t.Fatalf("got %v (%x), expected 1007", e, b)

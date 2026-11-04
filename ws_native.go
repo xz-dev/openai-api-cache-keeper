@@ -326,6 +326,16 @@ func (k *keeper) serveWSNative(w http.ResponseWriter, r *http.Request) {
 	var queued *wsFrame            // one create frame held while a turn runs
 	var turnStart time.Time
 	var turnPrevious bool
+	reqID := requestIDOf(r)
+	end := turnEnd{side: "keeper", code: -1, cause: "handler ended"}
+	// endTurn records the cause and, while a turn is open, ends it with an
+	// explicit error event before the client socket closes (never bare).
+	endTurn := func(e turnEnd, tellClient bool) {
+		end = e
+		if tellClient && (inflight != nil || nativeOpen) {
+			failOpenTurn(r.Context(), conn, inflight, e)
+		}
+	}
 	finishLog := func(status int, storedID string) {
 		if !turnStart.IsZero() {
 			logTurn("ws", status, turnPrevious, storedID, turnStart, k.store)
@@ -356,6 +366,9 @@ func (k *keeper) serveWSNative(w http.ResponseWriter, r *http.Request) {
 		storedID := ""
 		if inflight != nil {
 			storedID = inflight.id
+		}
+		if !turnStart.IsZero() {
+			logTurnEnd(end, reqID, storedID)
 		}
 		finishLog(http.StatusBadGateway, storedID)
 		releaseInflight()
@@ -391,6 +404,7 @@ func (k *keeper) serveWSNative(w http.ResponseWriter, r *http.Request) {
 		defer f.spool.Close()
 		if f.typ != websocket.MessageText {
 			if err := k.wsRelayFrame(ctx, conn, f.spool, f.typ); err != nil {
+				endTurn(endFromErr("client", err), false)
 				cancel()
 			}
 			return
@@ -398,6 +412,7 @@ func (k *keeper) serveWSNative(w http.ResponseWriter, r *http.Request) {
 		if inflight != nil {
 			if status := k.wsNativeUpstreamFrame(ctx, conn, f, sess, inflight); status != 0 {
 				if status == -1 {
+					logTurnEnd(turnEnd{side: "keeper", code: -1, cause: "upstream frame could not be relayed"}, reqID, inflight.id)
 					finishLog(http.StatusBadGateway, inflight.id)
 				} else {
 					finishLog(status, inflight.id)
@@ -415,6 +430,7 @@ func (k *keeper) serveWSNative(w http.ResponseWriter, r *http.Request) {
 			terminal = wsNativeTerminal(f.spool)
 		}
 		if err := k.wsRelayFrame(ctx, conn, f.spool, f.typ); err != nil {
+			endTurn(endFromErr("client", err), false)
 			cancel()
 			return
 		}
@@ -442,6 +458,7 @@ func (k *keeper) serveWSNative(w http.ResponseWriter, r *http.Request) {
 			if !ok {
 				// Channel closed after pump return without an error result;
 				// treat like a transport EOF.
+				endTurn(endFromErr("upstream", nil), true)
 				upCh = nil
 				conn.CloseNow()
 				upstream.CloseNow()
@@ -451,6 +468,7 @@ func (k *keeper) serveWSNative(w http.ResponseWriter, r *http.Request) {
 			if res.err != nil {
 				// Propagate the downstream close status to the client when
 				// it was a clean close handshake (RFC 6455 §7.1).
+				endTurn(endFromErr("upstream", res.err), true)
 				var ce websocket.CloseError
 				switch {
 				case errors.As(res.err, &ce):
@@ -468,6 +486,7 @@ func (k *keeper) serveWSNative(w http.ResponseWriter, r *http.Request) {
 			processUpstream(&f)
 		case res, ok := <-clCh:
 			if !ok {
+				endTurn(endFromErr("client", nil), false)
 				clCh = nil
 				conn.CloseNow()
 				upstream.CloseNow()
@@ -475,6 +494,7 @@ func (k *keeper) serveWSNative(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			if res.err != nil {
+				endTurn(endFromErr("client", res.err), false)
 				var ce websocket.CloseError
 				if errors.As(res.err, &ce) {
 					_ = upstream.Close(ce.Code, ce.Reason)
@@ -495,6 +515,7 @@ func (k *keeper) serveWSNative(w http.ResponseWriter, r *http.Request) {
 			// evict the held create.
 			if !isWSCreate(f.spool) {
 				if err := k.wsRelayFrame(ctx, upstream, f.spool, f.typ); err != nil {
+					endTurn(endFromErr("upstream", err), true)
 					f.spool.Close()
 					clCh = nil
 					conn.CloseNow()
@@ -522,6 +543,9 @@ func (k *keeper) serveWSNative(w http.ResponseWriter, r *http.Request) {
 			// carried by that result is released, never processed.
 			select {
 			case res := <-upCh:
+				if res.err != nil {
+					endTurn(endFromErr("upstream", res.err), true)
+				}
 				var ce websocket.CloseError
 				if errors.As(res.err, &ce) {
 					_ = conn.Close(ce.Code, ce.Reason)
@@ -531,6 +555,9 @@ func (k *keeper) serveWSNative(w http.ResponseWriter, r *http.Request) {
 			}
 			select {
 			case res := <-clCh:
+				if res.err != nil {
+					endTurn(endFromErr("client", res.err), false)
+				}
 				var ce websocket.CloseError
 				if errors.As(res.err, &ce) {
 					_ = upstream.Close(ce.Code, ce.Reason)
