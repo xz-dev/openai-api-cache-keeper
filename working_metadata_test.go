@@ -8,8 +8,9 @@ import (
 )
 
 func TestRequestMetadataBoundBeforeGrowth(t *testing.T) {
-	if _, err := inputItems([]byte("[" + strings.Repeat("{},", maxHistoryItems) + "{}]")); err != errWorkSize {
-		t.Fatalf("item count not bounded: %v", err)
+	// No item-count cap (design D5): 8193 items are accepted.
+	if items, err := inputItems([]byte("[" + strings.Repeat("{},", 8192) + "{}]")); err != nil || len(items) != 8193 {
+		t.Fatalf("item count capped: n=%d err=%v", len(items), err)
 	}
 	_, _, k := newTestKeeper(t)
 	var request strings.Builder

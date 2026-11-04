@@ -13,9 +13,6 @@ func (s *store) snapshotHashes(tx *bolt.Tx, tip [32]byte, owner [32]byte) ([][32
 			return nil, nil, errMissingItem
 		}
 		count++
-		if count > maxHistoryItems+1 {
-			return nil, nil, errWorkSize
-		}
 		copy(node[:], record[:32])
 	}
 	release := func() {}

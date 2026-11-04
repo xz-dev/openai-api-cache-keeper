@@ -187,12 +187,12 @@ func (s *store) getPinned(pin string, owner [32]byte) ([]json.RawMessage, bool) 
 
 // boundedGet keeps the old slice-based bounded lookup for tests.
 func (s *store) boundedGet(id string, owner [32]byte, pinned bool) ([]json.RawMessage, bool, error) {
-	return s.getLimited(id, owner, pinned, maxHistoryBytes, maxHistoryItems)
+	return s.getLimited(id, owner, pinned, maxHistoryBytes)
 }
 
 // Count encoded occurrences, not unique payload bytes: a tiny deduplicated
 // store can otherwise expand to an enormous request. Check before copying.
-func (s *store) getLimited(id string, owner [32]byte, pinned bool, maxBytes int64, maxItems int) (out []json.RawMessage, found bool, err error) {
+func (s *store) getLimited(id string, owner [32]byte, pinned bool, maxBytes int64) (out []json.RawMessage, found bool, err error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	err = s.db.View(func(tx *bolt.Tx) error {
@@ -208,7 +208,6 @@ func (s *store) getLimited(id string, owner [32]byte, pinned bool, maxBytes int6
 		copy(node[:], entry[:32])
 		var zero [32]byte
 		var size int64 = 2
-		count := 0
 		for n := node; n != zero; {
 			v := tx.Bucket(bucketNodes).Get(n[:])
 			if len(v) != 104 || string(v[64:96]) != string(owner[:]) {
@@ -222,8 +221,7 @@ func (s *store) getLimited(id string, owner [32]byte, pinned bool, maxBytes int6
 					return errMissingItem
 				}
 				size += number(r[:8]) + 1
-				count++
-				if size > maxBytes || count > maxItems {
+				if size > maxBytes {
 					return errWorkSize
 				}
 			}

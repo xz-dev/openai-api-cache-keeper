@@ -19,9 +19,13 @@ import (
 // Bounds for the unchanged 384-MiB envelope. Slow upstreams retain disk files,
 // while simultaneously materialized scratch is admitted by actual byte credits.
 const (
-	maxHistoryBytes    int64 = 64 << 20
-	maxHistoryItems          = 8192
-	maxEventBytes            = 1 << 20
+	maxHistoryBytes int64 = 64 << 20
+	maxEventBytes         = 1 << 20
+	// maxResponseItems bounds the output array of ONE upstream response
+	// object (itself bounded by maxResponseBytes) so its slice header is a
+	// fixed term of responseScratch. History and request input have no item
+	// cap (design D5).
+	maxResponseItems         = 8192
 	maxResponseBytes         = 8 << 20 // per object, event or non-stream body
 	maxCollectedBytes        = 16 << 20
 	maxTaskStreamBytes       = 8 << 20 // cumulative task-log re-parse budget; SSE relay itself is unbounded
@@ -259,12 +263,18 @@ func (k *keeper) prepareDiskSnapshot(ctx context.Context, raw *spool, owner [32]
 				// Item spans relative to the value's own start.
 				sub := newJSONScanner(raw.spanReader(start, end))
 				err := sub.arrayItems(func(vs, ve int64) error {
-					if len(inSpans) >= maxHistoryItems {
-						return errWorkSize
+					next, _, err := growSpans(inSpans, raw)
+					if err != nil {
+						return err
 					}
-					inSpans = append(inSpans, itemSpan{start + vs, int(ve - vs)})
+					inSpans = append(next, itemSpan{start + vs, int(ve - vs)})
 					return nil
 				})
+				if errors.Is(err, errWorkSize) {
+					// A working-capacity refusal is not malformed input.
+					readErr = err
+					return err
+				}
 				if err != nil {
 					inputErr = true
 				}
@@ -433,7 +443,7 @@ func (k *keeper) prepareDiskSnapshot(ctx context.Context, raw *spool, owner [32]
 			if nItems > 0 {
 				separator = 1
 			}
-			if nItems >= maxHistoryItems || f.size+size+separator > maxHistoryBytes {
+			if f.size+size+separator > maxHistoryBytes {
 				return errWorkSize
 			}
 			if nItems > 0 {
@@ -463,9 +473,6 @@ func (k *keeper) prepareDiskSnapshot(ctx context.Context, raw *spool, owner [32]
 	// buffer. A string input wraps its raw bytes verbatim in the user-item
 	// envelope — the quoted string needs no decode/re-encode.
 	copyItemSpan := func(r io.Reader) error {
-		if nItems >= maxHistoryItems {
-			return errWorkSize
-		}
 		if nItems > 0 {
 			if err := out.write([]byte(",")); err != nil {
 				return err
@@ -635,7 +642,7 @@ func (k *keeper) prepareAcceptDisk(ctx context.Context, t *diskTurn, id string, 
 	for _, item := range output {
 		encoded += int64(len(item)) + 1
 	}
-	if encoded > maxHistoryBytes || len(t.spans)+len(output) > maxHistoryItems {
+	if encoded > maxHistoryBytes {
 		return nil, errWorkSize
 	}
 	// Output items are appended to the turn spool so accept replays everything
@@ -654,9 +661,6 @@ func (k *keeper) prepareAcceptDisk(ctx context.Context, t *diskTurn, id string, 
 				return nil, err
 			}
 		}
-	}
-	if len(t.spans) > maxHistoryItems {
-		return nil, errWorkSize
 	}
 	state, err := k.work.state(int64(512+len(id)+len(oldPin)), nil)
 	if err != nil {

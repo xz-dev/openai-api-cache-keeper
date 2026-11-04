@@ -29,7 +29,7 @@ func TestResponseScratchCoversRealAllocation(t *testing.T) {
 	bare := func(id, extra, output string) string {
 		return `{"id":"` + id + `","object":"response","status":"completed","store":false` + extra + `,"output":[` + output + `]}`
 	}
-	many := strings.TrimSuffix(strings.Repeat(text(strings.Repeat("y", 200))+",", maxHistoryItems), ",")
+	many := strings.TrimSuffix(strings.Repeat(text(strings.Repeat("y", 200))+",", maxResponseItems), ",")
 	nested := `{"type":"message","content":[` + strings.TrimSuffix(strings.Repeat(`{"type":"output_text","text":"z","annotations":[{"a":[[[{"b":"`+strings.Repeat("q", 2000)+`"}]]]}]},`, 900), ",") + `]}`
 	var keys strings.Builder
 	for i := range 120 {

@@ -300,9 +300,6 @@ func inputItems(raw json.RawMessage) ([]json.RawMessage, error) {
 		return nil, errors.New("input must be a string or an array of items")
 	}
 	for dec.More() {
-		if len(items) >= maxHistoryItems {
-			return nil, errWorkSize
-		}
 		var item json.RawMessage
 		if err := dec.Decode(&item); err != nil {
 			return nil, err

@@ -82,7 +82,7 @@ func responseItems(raw []byte) ([]json.RawMessage, error) {
 	}
 	var items []json.RawMessage
 	err := arraySpans(raw, func(start, end int) error {
-		if len(items) >= maxHistoryItems {
+		if len(items) >= maxResponseItems {
 			return errWorkSize
 		}
 		items = append(items, raw[start:end:end])
@@ -103,7 +103,7 @@ func cloneItems(raw []byte) ([]json.RawMessage, error) {
 	}
 	count, size := 0, 0
 	if err := arraySpans(raw, func(start, end int) error {
-		if count >= maxHistoryItems {
+		if count >= maxResponseItems {
 			return errWorkSize
 		}
 		count, size = count+1, size+end-start
@@ -321,13 +321,13 @@ func (c *collector) release(m *workingSet) {
 // event map, its exactly decoded keys (<= 5n/4 with rounding) and slots.
 // Reserved BEFORE parse/rewrite, not inferred from output afterward.
 func responseScratch(n int) int64 {
-	return int64(n)*9/4 + maxHistoryItems*24 + 512<<10
+	return int64(n)*9/4 + maxResponseItems*24 + 512<<10
 }
 
 // decodeScratch is the legacy reservation for paths that still fully decode
 // and re-encode a document (background log records, error frames).
 func decodeScratch(n int) int64 {
-	return 8*int64(n) + 2*maxHistoryItems*24 + 256*128
+	return 8*int64(n) + 2*maxResponseItems*24 + 256*128
 }
 func (c *collector) collect(raw []byte, m *workingSet, event bool) error {
 	scratch := responseScratch(len(raw))
