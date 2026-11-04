@@ -14,6 +14,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 )
 
 const keeperResponsePrefix = "resp_ck_"
@@ -47,6 +48,9 @@ type responseTask struct {
 	readyOnce                          sync.Once
 	finished                           chan struct{}
 	timer                              *time.Timer
+	readStop                           context.Context
+	stopReads                          context.CancelFunc
+	state                              *stateLease
 }
 
 func (t *responseTask) signal() {
@@ -58,6 +62,17 @@ func (k *keeper) startBackground(w http.ResponseWriter, r *http.Request) {
 	if err := r.Context().Err(); err != nil {
 		return
 	}
+	state, err := k.work.state(taskStateBytes(r.Header), &k.work.activeTasks)
+	if err != nil {
+		writeAPIError(w, workingError(err))
+		return
+	}
+	published := false
+	defer func() {
+		if !published {
+			state.Close()
+		}
+	}()
 	body, err := r.Body.(*spoolBody).spool.requestBody()
 	if err != nil {
 		writeAPIError(w, workingError(err))
@@ -70,23 +85,19 @@ func (k *keeper) startBackground(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ctx, cancel := context.WithCancel(context.WithoutCancel(r.Context()))
-	t := &responseTask{keeper: k, id: keeperResponsePrefix + rand.Text(), owner: k.ownerOf(r), cancel: cancel,
+	t := &responseTask{keeper: k, state: state, id: keeperResponsePrefix + rand.Text(), owner: k.ownerOf(r), cancel: cancel,
 		log: log, readers: 1, changed: make(chan struct{}), ready: make(chan struct{}), finished: make(chan struct{})}
 	k.cacheMu.Lock()
-	if len(k.tasks) >= maxTurns {
-		k.cacheMu.Unlock()
-		body.Close()
-		log.Close()
-		cancel()
-		writeAPIError(w, workingError(errors.New("task limit")))
-		return
-	}
 	k.tasks[t.id] = t
 	k.cacheMu.Unlock()
+	published = true
+	_ = state.retain() // initial creator reader; released by unsubscribe
+	producerFree := state.retain()
 	req := r.Clone(context.WithValue(ctx, backgroundTaskKey{}, t))
 	req.Body = body
 	stripUntrustedForwarding(req.Header)
 	go func() {
+		defer producerFree()
 		defer close(t.finished)
 		defer body.Close()
 		defer cancel()
@@ -115,11 +126,9 @@ func (k *keeper) startBackground(w http.ResponseWriter, r *http.Request) {
 			t.expire()
 		} else if discard {
 			if !t.nativeParent {
-				k.cacheMu.Lock()
 				if err := k.store.forget(t.id); err != nil {
 					logNotRetained(err)
 				}
-				k.cacheMu.Unlock()
 			}
 			if !attached {
 				t.discard()
@@ -157,6 +166,9 @@ func stripUntrustedForwarding(header http.Header) {
 }
 
 func (t *responseTask) unsubscribe() {
+	if t.state != nil {
+		defer t.state.drop()
+	}
 	t.mu.Lock()
 	t.readers--
 	abandonedHTTP := t.readers == 0 && t.done && !t.stream
@@ -183,17 +195,23 @@ func (t *responseTask) discard() {
 	if t.log == nil {
 		return
 	}
-	t.keeper.cacheMu.Lock()
 	if err := t.log.Close(); err == nil {
+		t.keeper.cacheMu.Lock()
 		t.keeper.eventBytes -= t.log.size
+		t.keeper.cacheMu.Unlock()
 	}
-	t.keeper.cacheMu.Unlock()
 	t.log = nil
 }
 
 func (t *responseTask) expire() {
+	if t.state != nil {
+		defer t.state.Close()
+	}
 	t.mu.Lock()
 	t.expired = true
+	if t.stopReads != nil {
+		t.stopReads()
+	}
 	if t.timer != nil {
 		t.timer.Stop()
 	}
@@ -206,7 +224,7 @@ func (t *responseTask) expire() {
 	t.discard()
 }
 
-// Caller holds task.mu; both retained histories and event files share cacheMu.
+// Caller holds task.mu; cacheMu protects reservations, never log I/O.
 func (t *responseTask) append(p []byte) error {
 	if t.log == nil || t.expired || t.err != nil {
 		return io.ErrClosedPipe
@@ -216,24 +234,28 @@ func (t *responseTask) append(p []byte) error {
 	}
 	k := t.keeper
 	k.cacheMu.Lock()
-	defer k.cacheMu.Unlock()
 	_, history := k.store.stats()
-	if k.cfg.maxStoreBytes > 0 && history+k.eventBytes+int64(len(p)) > k.cfg.maxStoreBytes {
+	if k.cfg.maxStoreBytes > 0 && max(history, k.cacheHistoryReserve)+k.eventBytes+k.cachePending+int64(len(p)) > k.cfg.maxStoreBytes {
+		k.cacheMu.Unlock()
 		return errWorkSize
 	}
+	k.cachePending += int64(len(p))
+	k.cacheMu.Unlock()
 	n, err := t.log.Write(p)
+	k.cacheMu.Lock()
+	k.cachePending -= int64(len(p))
 	k.eventBytes += int64(n)
+	k.cacheMu.Unlock()
 	return err
 }
 
 // parsed, when non-nil, is raw's already decoded top level (see responseFrameParsed).
 func (t *responseTask) record(ctx context.Context, raw []byte, parsed map[string]json.RawMessage) error {
-	leave, err := t.keeper.work.enter(ctx)
-	if err != nil {
+	if err := ctx.Err(); err != nil {
 		return err
 	}
-	defer leave()
-	scratch := responseScratch(len(raw))
+	var err error
+	scratch := decodeScratch(len(raw))
 	if !t.keeper.work.reserveOutput(scratch) {
 		return errWorkSize
 	}
@@ -307,6 +329,12 @@ func (t *responseTask) record(ctx context.Context, raw []byte, parsed map[string
 			if other := t.keeper.tasks[upstreamID]; other != nil && other != t {
 				t.keeper.cacheMu.Unlock()
 				return errStoreOwner
+			}
+			if upstreamID != t.id {
+				if err := t.state.extend(t.keeper.work, int64(len(upstreamID))); err != nil {
+					t.keeper.cacheMu.Unlock()
+					return err
+				}
 			}
 			delete(t.keeper.tasks, t.id)
 			t.id = upstreamID
@@ -399,6 +427,13 @@ func (w *taskWriter) Flush() {}
 
 func (t *responseTask) follow(w http.ResponseWriter, r *http.Request, after int, framed bool) error {
 	t.mu.Lock()
+	if t.readStop == nil {
+		t.readStop, t.stopReads = context.WithCancel(context.Background())
+	}
+	if t.cancelled || t.expired {
+		t.stopReads()
+	}
+	readStop := t.readStop
 	if t.log == nil {
 		t.mu.Unlock()
 		return io.ErrUnexpectedEOF
@@ -409,10 +444,36 @@ func (t *responseTask) follow(w http.ResponseWriter, r *http.Request, after int,
 		return err
 	}
 	defer body.Close()
+	const copyWindow = 32 << 10
+	// Copy-window credit is owned only while events are actually being sent;
+	// an idle follower waiting for future data must hold no wire capacity.
+	var copyBuffer []byte
+	releaseCopy := func() {
+		if copyBuffer == nil {
+			return
+		}
+		copyBuffer = nil
+		t.keeper.work.freeOutput(copyWindow)
+	}
+	defer releaseCopy()
+	acquireCopy := func() bool {
+		if copyBuffer != nil {
+			return true
+		}
+		if !t.keeper.work.reserveOutput(copyWindow) {
+			return false
+		}
+		copyBuffer = make([]byte, copyWindow)
+		return true
+	}
 	var offset int64
 	sequence := 0
 	controller := http.NewResponseController(w)
-	defer controller.SetWriteDeadline(time.Time{})
+	finishWrites, err := interruptCancelledWrites(w, r.Context(), readStop)
+	if err != nil {
+		return err
+	}
+	defer finishWrites()
 	for {
 		t.mu.Lock()
 		if t.cancelled || t.expired {
@@ -438,9 +499,17 @@ func (t *responseTask) follow(w http.ResponseWriter, r *http.Request, after int,
 				}
 			}
 			if !framed || sequence > after {
-				_ = controller.SetWriteDeadline(time.Now().Add(workWait))
-				if _, err := io.CopyN(w, io.NewSectionReader(body.spool.File, body.spool.offset+offset, n), n); err != nil {
+				if !acquireCopy() {
+					return errWorkSize
+				}
+				// Hide optional ReaderFrom/WriterTo paths: this window is the
+				// only send-copy buffer and remains charged through blocked writes.
+				copied, err := io.CopyBuffer(struct{ io.Writer }{w}, struct{ io.Reader }{io.NewSectionReader(body.spool.File, body.spool.offset+offset, n)}, copyBuffer)
+				if err != nil {
 					return err
+				}
+				if copied != n {
+					return io.ErrUnexpectedEOF
 				}
 				if err := controller.Flush(); err != nil {
 					return err
@@ -460,6 +529,8 @@ func (t *responseTask) follow(w http.ResponseWriter, r *http.Request, after int,
 		if done {
 			return nil
 		}
+		// No data to send: give the copy window back before waiting for more.
+		releaseCopy()
 		select {
 		case <-r.Context().Done():
 			return r.Context().Err()
@@ -488,44 +559,13 @@ func (k *keeper) taskOperation(w http.ResponseWriter, r *http.Request) bool {
 			return false
 		}
 	}
-	// One task's reconnect storm cannot hold the shared socket pool that other
-	// tasks need to reattach (storm and recovery reads are indistinguishable).
-	// Reads are counted per task before validation takes a shared slot; cancel
-	// is never refused by this per-task bound.
-	var admitted *responseTask // holds one pending count until it becomes a reader
-	if len(parts) == 1 {
-		k.cacheMu.Lock()
-		pending := k.tasks[parts[0]]
-		k.cacheMu.Unlock()
-		// Only the owner's credential spends this task's budget, so unauthenticated
-		// or foreign callers cannot target it (digest isolates, billing still decides).
-		if pending != nil && pending.owner == k.ownerOf(r) {
-			pending.mu.Lock()
-			full := pending.readers+pending.pending >= maxTaskReaders
-			if !full {
-				pending.pending++
-				admitted = pending
-			}
-			pending.mu.Unlock()
-			if full {
-				writeAPIError(w, errNativeSocketLimit)
-				return true
-			}
-			defer func() {
-				if admitted != nil {
-					admitted.mu.Lock()
-					admitted.pending--
-					admitted.mu.Unlock()
-				}
-			}()
-		}
-	}
-	// Local reads and authentication work share the existing socket ceiling.
-	if !trySlot(k.work.sockets) {
-		writeAPIError(w, errNativeSocketLimit)
+	// Each authenticated operation owns its request/reader state, not a slot.
+	operation, stateErr := k.work.state(readerStateBytes(r.Header), &k.work.activeSockets)
+	if stateErr != nil {
+		writeAPIError(w, workingError(stateErr))
 		return true
 	}
-	defer func() { <-k.work.sockets }()
+	defer operation.Close()
 	// Authentication is revalidated for every local operation; hashes only
 	// isolate owners and are never used as proof that a key remains valid.
 	target := *k.cfg.upstream
@@ -568,6 +608,9 @@ func (k *keeper) taskOperation(w http.ResponseWriter, r *http.Request) bool {
 	t.mu.Lock()
 	if len(parts) == 2 && !t.done {
 		t.cancelled = true
+		if t.stopReads != nil {
+			t.stopReads()
+		}
 		t.cancel()
 		t.signal()
 	}
@@ -592,16 +635,8 @@ func (k *keeper) taskOperation(w http.ResponseWriter, r *http.Request) bool {
 			return true
 		}
 	}
-	// The pending count above already admitted this read; recheck attached
-	// readers. Cancel was applied above; its short final reply is not refused.
-	if len(parts) == 1 && t.readers >= maxTaskReaders {
-		t.mu.Unlock()
-		writeAPIError(w, errNativeSocketLimit)
-		return true
-	}
-	if admitted == t {
-		t.pending-- // converted to an attached reader under the same lock
-		admitted = nil
+	if t.state != nil {
+		_ = t.state.retain()
 	}
 	t.readers++
 	if !t.done && t.timer != nil {
@@ -618,33 +653,77 @@ func (k *keeper) taskOperation(w http.ResponseWriter, r *http.Request) bool {
 		}
 		return true
 	}
-	// Final response materialization is short and shares the existing work gate.
-	leave, err := k.work.enter(r.Context())
-	if err != nil {
-		writeAPIError(w, workingError(err))
+	// Retain the selected file, not the task mutex, through decode and output.
+	t.mu.Lock()
+	if t.expired {
+		t.mu.Unlock()
+		writeAPIError(w, &apiError{status: 404, typ: "invalid_request_error", message: "Response not found."})
 		return true
 	}
-	defer leave()
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	w.Header().Set("Content-Type", "application/json")
+	if t.readStop == nil {
+		t.readStop, t.stopReads = context.WithCancel(context.Background())
+	}
+	readStop, final, id := t.readStop, t.final, t.id
+	var body *spoolBody
 	if t.complete && t.log != nil {
+		body, err = t.log.requestBody()
+	}
+	status := "in_progress"
+	if t.cancelled {
+		status = "cancelled"
+	} else if t.err != nil {
+		status = "failed"
+	}
+	t.mu.Unlock()
+	if err != nil {
+		writeAPIError(w, responseError(err))
+		return true
+	}
+	if body != nil {
+		defer body.Close()
+	}
+	var n int64
+	credit := int64(32 << 10)
+	if body != nil {
 		var length [8]byte
-		_, err := t.log.ReadAt(length[:], t.final)
-		n := int64(binary.BigEndian.Uint64(length[:]))
+		_, err = body.spool.ReadAt(length[:], final)
+		n = int64(binary.BigEndian.Uint64(length[:]))
 		if err != nil || n <= 0 || n > maxEventBytes {
 			writeAPIError(w, responseError(errUpstreamData))
 			return true
 		}
-		var response json.RawMessage
-		err = readSSE(io.NewSectionReader(t.log.File, t.log.offset+t.final+8, n), nil, func(data []byte) error {
-			var event struct {
+		credit = n // RawMessage's retained copy cannot exceed the framed event.
+	}
+	if !k.work.reserveOutput(credit) {
+		writeAPIError(w, workingError(errWorkSize))
+		return true
+	}
+	defer k.work.freeOutput(credit)
+	contexts := []context.Context{r.Context()}
+	// A cancellation acknowledgement must not inherit the stream it just stopped.
+	if body != nil && len(parts) == 1 {
+		contexts = append(contexts, readStop)
+	}
+	finishWrites, err := interruptCancelledWrites(w, contexts...)
+	if err != nil {
+		writeCancellationError(w, err)
+		return true
+	}
+	defer finishWrites()
+	w.Header().Set("Content-Type", "application/json")
+	if body != nil {
+		response := make(json.RawMessage, 0, n)
+		err = readSSE(io.NewSectionReader(body.spool.File, body.spool.offset+final+8, n), nil, func(data []byte) error {
+			event := struct {
 				Response json.RawMessage `json:"response"`
-			}
+			}{Response: response}
 			if err := json.Unmarshal(data, &event); err != nil {
 				return err
 			}
 			response = event.Response
+			if len(response) == 0 {
+				return errUpstreamData
+			}
 			return nil
 		}, k.work)
 		if err != nil {
@@ -654,12 +733,34 @@ func (k *keeper) taskOperation(w http.ResponseWriter, r *http.Request) bool {
 		_, _ = w.Write(response)
 		return true
 	}
-	status := "in_progress"
-	if t.cancelled {
-		status = "cancelled"
-	} else if t.err != nil {
-		status = "failed"
+	if err := writeTaskStatus(w, id, status); err != nil && r.Context().Err() == nil {
+		panic(http.ErrAbortHandler)
 	}
-	_ = json.NewEncoder(w).Encode(map[string]any{"id": t.id, "object": "response", "background": true, "status": status, "output": []any{}})
 	return true
+}
+
+// Quote bounded UTF-8 chunks with the standard encoder; no full-ID wire copy.
+func writeTaskStatus(w io.Writer, id, status string) error {
+	if !utf8.ValidString(id) {
+		return errUpstreamData
+	}
+	if _, err := io.WriteString(w, `{"id":"`); err != nil {
+		return err
+	}
+	for len(id) != 0 {
+		n := min(len(id), 1024)
+		for n < len(id) && !utf8.RuneStart(id[n]) {
+			n--
+		}
+		quoted, err := json.Marshal(id[:n])
+		if err != nil {
+			return err
+		}
+		if _, err := w.Write(quoted[1 : len(quoted)-1]); err != nil {
+			return err
+		}
+		id = id[n:]
+	}
+	_, err := io.WriteString(w, `","object":"response","background":true,"status":"`+status+`","output":[]}`+"\n")
+	return err
 }

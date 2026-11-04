@@ -15,7 +15,6 @@ import (
 	"strings"
 	"sync"
 	"testing"
-	"time"
 )
 
 func TestResponseMetadataRejectsBeforeGrowth(t *testing.T) {
@@ -132,15 +131,15 @@ func TestEscapedRewriteBudgetAndPhaseLifetime(t *testing.T) {
 			if charge > maxCollectedBytes {
 				t.Error("global response budget exceeded")
 			}
-			// Caller can own a wire buffer (or block writing it) without owning phase.
-			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-			defer cancel()
-			leave, err := k.work.enter(ctx)
+			// A retained wire does not exclude another fitting materializer.
+			var other collector
+			_, free, err := k.responseFrame(context.Background(), &other, []byte(`{"id":"parallel","status":"completed","output":[]}`), false, false, nil)
 			if err != nil {
-				t.Error("response phase retained across writer")
+				t.Errorf("fitting materialization excluded by retained wire: %v", err)
 				return
 			}
-			leave()
+			free()
+			other.release(k.work)
 		})
 	}
 	wg.Wait()

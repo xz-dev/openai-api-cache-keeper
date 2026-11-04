@@ -219,45 +219,38 @@ func skipJSONValue(dec *json.Decoder) (json.Token, error) {
 }
 
 func routingMetadata(raw *spool, ws bool) (string, bool, *apiError) {
-	dec := json.NewDecoder(io.NewSectionReader(raw.File, raw.offset, raw.size))
-	dec.UseNumber()
-	start, err := dec.Token()
-	if err != nil || start != json.Delim('{') {
+	release, err := raw.mem.reserveInput(inputParseCredit(raw))
+	if err != nil {
+		return "", false, workingError(err)
+	}
+	defer release()
+	if err := validSpoolJSON(context.Background(), raw); err != nil {
 		return "", false, invalidRoutingRequest()
 	}
 	var model string
 	var stream bool
-	for fields := 0; dec.More(); fields++ {
-		if fields >= 256 {
-			return "", stream, workingError(errWorkSize)
-		}
-		token, err := dec.Token()
-		if err != nil {
-			return "", stream, invalidRoutingRequest()
-		}
-		key, ok := token.(string)
-		if !ok || len(key) > 64<<10 {
-			return "", stream, workingError(errWorkSize)
-		}
-		value, err := skipJSONValue(dec)
-		if err != nil {
-			return "", stream, invalidRoutingRequest()
-		}
+	var typeError *apiError
+	err = spoolScanner(raw).objectFields(raw.keySlice, func(key string, start, end int64) error {
 		switch key {
 		case "model":
-			model, _ = value.(string)
+			model, _ = readJSONString(raw.keySlice(start, end))
 		case "stream":
-			stream, _ = value.(bool)
+			stream = string(raw.keySlice(start, end)) == "true"
 		case "type":
-			if ws && value != "response.create" {
-				return "", stream, &apiError{status: 400, typ: "invalid_request_error", param: "type", message: "unsupported event type"}
+			kind, _ := readJSONString(raw.keySlice(start, end))
+			if ws && kind != "response.create" {
+				typeError = &apiError{status: 400, typ: "invalid_request_error", param: "type", message: "unsupported event type"}
 			}
 		}
+		return nil
+	})
+	if err == errWorkSize {
+		return "", stream, workingError(err)
 	}
-	if _, err := dec.Token(); err != nil {
-		return "", stream, invalidRoutingRequest()
+	if typeError != nil {
+		return "", stream, typeError
 	}
-	if _, err := dec.Token(); err != io.EOF || model == "" || len(model) > maxModelBytes {
+	if err != nil || model == "" || len(model) > maxModelBytes {
 		return "", stream, invalidRoutingRequest()
 	}
 	return model, stream, nil
@@ -267,12 +260,7 @@ func (k *keeper) routeRequest(ctx context.Context, raw *spool, ws bool) (*url.UR
 	if k.routing == nil {
 		return k.cfg.upstream, false, nil
 	}
-	leave, err := k.work.enter(ctx)
-	if err != nil {
-		return nil, false, workingError(err)
-	}
 	model, stream, apiErr := routingMetadata(raw, ws)
-	leave()
 	if apiErr != nil {
 		return nil, stream, apiErr
 	}

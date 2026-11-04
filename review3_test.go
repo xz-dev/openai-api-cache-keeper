@@ -65,9 +65,9 @@ func TestReview3CancelledHandlerReleasesSockets(t *testing.T) {
 	select {
 	case <-ended:
 	case <-time.After(time.Second):
-		t.Fatalf("cancelled handler stuck in cleanup: occupied socket slots=%d", len(k.work.sockets))
+		t.Fatalf("cancelled handler stuck in cleanup: occupied socket slots=%d", k.work.activeSockets.Load())
 	}
-	if slots := len(k.work.sockets); slots != 0 {
+	if slots := k.work.activeSockets.Load(); slots != 0 {
 		t.Fatalf("socket slot leaked after handler exit: %d", slots)
 	}
 }
@@ -98,10 +98,10 @@ func TestReview3DisconnectReleasesSocketSlots(t *testing.T) {
 		cancel()
 	}
 	deadline := time.Now().Add(2 * time.Second)
-	for len(k.work.sockets) != 0 && time.Now().Before(deadline) {
+	for k.work.activeSockets.Load() != 0 && time.Now().Before(deadline) {
 		time.Sleep(10 * time.Millisecond)
 	}
-	if slots := len(k.work.sockets); slots != 0 {
+	if slots := k.work.activeSockets.Load(); slots != 0 {
 		t.Fatalf("idle abrupt disconnect leaks %d socket slots", slots)
 	}
 }
@@ -212,6 +212,7 @@ func TestReview3ProbeMetadataHeapBound(t *testing.T) {
 	runtime.ReadMemStats(&a)
 	p := probeWSFrame(data)
 	runtime.ReadMemStats(&b)
+	p.close()
 	if p.prev != "resp_native" {
 		t.Fatalf("unexpected metadata: %+v", p)
 	}

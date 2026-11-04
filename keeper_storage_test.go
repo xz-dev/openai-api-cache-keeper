@@ -96,7 +96,7 @@ func TestStorageTransactionFailureVisibleOnAllTransports(t *testing.T) {
 				closeErr := k.store.db.Close()
 				db, err := bolt.Open(k.store.path, 0600, boltOptions())
 				if err == nil {
-					k.store.db = db
+					k.store.publishGeneration(db)
 				}
 				k.store.mu.Unlock()
 				if closeErr != nil {

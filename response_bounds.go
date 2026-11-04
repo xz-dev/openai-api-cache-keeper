@@ -6,71 +6,121 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"slices"
+	"unicode/utf8"
 )
 
 var errUpstreamData = errors.New("malformed upstream response")
 
-// Decode only bounded object metadata. Raw nested values remain encoded; arrays
-// that become retained collections are decoded separately, one item at a time.
+// responseObject decodes only the top-level keys; values alias raw (cap-limited),
+// so the map is valid exactly as long as raw and owns no value bytes.
 func responseObject(raw []byte) (map[string]json.RawMessage, error) {
-	d := json.NewDecoder(bytes.NewReader(raw))
-	first, err := d.Token()
-	if err != nil || first != json.Delim('{') {
-		return nil, errUpstreamData
+	ms, err := objectMembers(raw)
+	if err != nil {
+		return nil, err
 	}
-	obj := make(map[string]json.RawMessage)
-	for fields := 0; d.More(); fields++ {
-		if fields >= 256 {
-			return nil, errWorkSize
+	obj := make(map[string]json.RawMessage, len(ms))
+	for _, m := range ms {
+		var key string
+		if bytes.IndexByte(m.key, '\\') < 0 {
+			key = string(m.key[1 : len(m.key)-1])
+		} else {
+			var ok bool
+			if key, ok = decodeJSONString(m.key); !ok {
+				return nil, errUpstreamData
+			}
 		}
-		token, err := d.Token()
-		if err != nil {
-			return nil, errUpstreamData
-		}
-		key, ok := token.(string)
-		if !ok || len(key) > 64<<10 {
-			return nil, errWorkSize
-		}
-		var value json.RawMessage
-		if d.Decode(&value) != nil {
-			return nil, errUpstreamData
-		}
-		obj[key] = value
-	}
-	if _, err := d.Token(); err != nil {
-		return nil, errUpstreamData
-	}
-	if _, err := d.Token(); err != io.EOF {
-		return nil, errUpstreamData
+		obj[key] = raw[m.vs:m.ve:m.ve]
 	}
 	return obj, nil
 }
+
+// mapCharge bounds the live memory of a responseObject map whose values alias
+// already charged bytes: key strings with allocation rounding plus table slots
+// and the member index built with it (~100 + ~100 bytes per member, measured).
+func mapCharge(obj map[string]json.RawMessage) int64 {
+	if obj == nil {
+		return 0
+	}
+	n := int64(4096 + 256*len(obj))
+	for key := range obj {
+		n += heapBytes(len(key))
+	}
+	return n
+}
+
+// heapBytes bounds the real allocation of one n-byte object: size classes
+// waste < 1/4 (+16 for tiny objects); objects over 32 KiB are whole 8 KiB pages.
+func heapBytes(n int) int64 {
+	if n > 32<<10 {
+		return int64(n+8191) &^ 8191
+	}
+	return int64(n)*5/4 + 16
+}
+
+// arraySpans validates raw as one JSON array and yields its element spans.
+func arraySpans(raw []byte, fn func(start, end int) error) error {
+	if !json.Valid(raw) {
+		return errUpstreamData
+	}
+	s := sliceScanner(raw)
+	s.skipWS()
+	if b, _ := s.peek(); b != '[' {
+		return errUpstreamData
+	}
+	err := s.arrayItems(func(start, end int64) error { return fn(int(start), int(end)) })
+	if errors.Is(err, errJSONSyntax) || errors.Is(err, io.ErrUnexpectedEOF) {
+		return errUpstreamData
+	}
+	return err
+}
+
+// responseItems returns the elements as cap-limited aliases of raw.
 func responseItems(raw []byte) ([]json.RawMessage, error) {
 	if len(raw) == 0 || bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
 		return nil, nil
 	}
-	d := json.NewDecoder(bytes.NewReader(raw))
-	first, err := d.Token()
-	if err != nil || first != json.Delim('[') {
-		return nil, errUpstreamData
-	}
 	var items []json.RawMessage
-	for d.More() {
+	err := arraySpans(raw, func(start, end int) error {
 		if len(items) >= maxHistoryItems {
-			return nil, errWorkSize
+			return errWorkSize
 		}
-		var item json.RawMessage
-		if d.Decode(&item) != nil {
-			return nil, errUpstreamData
+		items = append(items, raw[start:end:end])
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+// cloneItems is responseItems with ONE independent copy: a counting pass sizes
+// the header slice and a single byte buffer exactly; items are subslices whose
+// caps sum to the buffer's real capacity.
+func cloneItems(raw []byte) ([]json.RawMessage, error) {
+	if len(raw) == 0 || bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+		return nil, nil
+	}
+	count, size := 0, 0
+	if err := arraySpans(raw, func(start, end int) error {
+		if count >= maxHistoryItems {
+			return errWorkSize
 		}
-		items = append(items, item)
+		count, size = count+1, size+end-start
+		return nil
+	}); err != nil || count == 0 {
+		return nil, err
 	}
-	if _, err := d.Token(); err != nil {
-		return nil, errUpstreamData
-	}
-	if _, err := d.Token(); err != io.EOF {
-		return nil, errUpstreamData
-	}
+	items := make([]json.RawMessage, 0, count)
+	buf := slices.Grow([]byte(nil), size)
+	_ = arraySpans(raw, func(start, end int) error {
+		off := len(buf)
+		buf = append(buf, raw[start:end]...)
+		items = append(items, buf[off:len(buf):len(buf)])
+		return nil
+	})
+	last := len(items) - 1
+	items[last] = buf[len(buf)-len(items[last]) : len(buf) : cap(buf)]
 	return items, nil
 }
 func responseString(raw []byte) (string, error) {
@@ -83,27 +133,72 @@ func responseString(raw []byte) (string, error) {
 	}
 	return s, nil
 }
+
+// keptID decodes an id the collector keeps: one exact allocation no
+// larger than the token (covered by the parse scratch reserved before it);
+// raw invalid UTF-8 is malformed upstream data, never expanded.
+func keptID(raw []byte) (string, error) {
+	if len(raw) == 0 || string(raw) == "null" {
+		return "", nil
+	}
+	id, ok := decodeJSONString(raw)
+	if !ok {
+		return "", errUpstreamData
+	}
+	return id, nil
+}
+
+// longProtocolName stands in for a type/status token too long to equal any
+// protocol name; it is never decoded.
+const longProtocolName = "\x00long"
+
+// protocolString decodes a type/status token for comparison. Only tokens
+// that could decode to <= 64 bytes are decoded (a bounded allocation); any
+// longer string is longProtocolName. Invalid UTF-8 or a non-string fails.
+func protocolString(raw []byte) (string, error) {
+	if len(raw) == 0 || string(raw) == "null" {
+		return "", nil
+	}
+	if raw[0] != '"' || !utf8.Valid(raw) {
+		return "", errUpstreamData
+	}
+	if len(raw) > 6*64+2 {
+		return longProtocolName, nil
+	}
+	s, ok := decodeJSONString(raw)
+	if !ok {
+		return "", errUpstreamData
+	}
+	return s, nil
+}
+
+// smallInt decodes an integer field; a token longer than any int64 cannot
+// decode, so it is refused without the stdlib's string copy.
+func smallInt(raw []byte, v any) bool {
+	return len(raw) <= 20 && json.Unmarshal(raw, v) == nil
+}
+
 func (c *collector) response(raw []byte) error {
-	obj, err := responseObject(raw)
+	ms, err := objectMembers(raw)
 	if err != nil {
 		return err
 	}
-	id, err := responseString(obj["id"])
+	id, err := keptID(memberValue(raw, ms, "id"))
 	if err != nil {
 		return err
 	}
-	status, err := responseString(obj["status"])
+	status, err := protocolString(memberValue(raw, ms, "status"))
 	if err != nil {
 		return err
 	}
 	terminal := status == "completed" || status == "incomplete"
-	if string(obj["object"]) == `"response"` && (status == "" || id == "") {
+	if string(memberValue(raw, ms, "object")) == `"response"` && (status == "" || id == "") {
 		return errUpstreamData
 	}
 	if terminal && id == "" {
 		return errUpstreamData
 	}
-	output, err := responseItems(obj["output"])
+	output, err := cloneItems(memberValue(raw, ms, "output"))
 	if err != nil {
 		return err
 	}
@@ -111,18 +206,18 @@ func (c *collector) response(raw []byte) error {
 	return nil
 }
 func (c *collector) event(raw []byte) error {
-	obj, err := responseObject(raw)
+	ms, err := objectMembers(raw)
 	if err != nil {
 		return err
 	}
-	return c.eventObj(obj)
+	return c.eventFields(raw, ms)
 }
 
 // collectEventCalls is a test hook fired once per event decode.
 var collectEventCalls func()
 
-func (c *collector) eventObj(obj map[string]json.RawMessage) error {
-	kind, err := responseString(obj["type"])
+func (c *collector) eventFields(raw []byte, ms []jsonMember) error {
+	kind, err := protocolString(memberValue(raw, ms, "type"))
 	if err != nil || kind == "" {
 		return errUpstreamData
 	}
@@ -133,37 +228,44 @@ func (c *collector) eventObj(obj map[string]json.RawMessage) error {
 	// event continues it (OpenAI ResponseFailedEvent requires
 	// sequence_number).
 	var seq int64
-	if json.Unmarshal(obj["sequence_number"], &seq) == nil && seq >= 0 {
+	if smallInt(memberValue(raw, ms, "sequence_number"), &seq) && seq >= 0 {
 		c.seq, c.seqSet = seq, true
 	}
 	switch kind {
 	case "response.output_item.done":
 		var index int
-		if json.Unmarshal(obj["output_index"], &index) != nil || index < 0 || index >= 4096 || len(obj["item"]) == 0 {
+		item := memberValue(raw, ms, "item")
+		if !smallInt(memberValue(raw, ms, "output_index"), &index) || index < 0 || index >= 4096 || len(item) == 0 {
 			return errUpstreamData
 		}
 		for len(c.items) <= index {
 			c.items = append(c.items, nil)
 		}
-		c.items[index] = obj["item"]
+		c.items[index] = bytes.Clone(item)
 	case "response.created", "response.in_progress":
 		// Remember the started response so a later local failure can terminate it.
-		if response, err := responseObject(obj["response"]); err == nil {
-			if id, err := responseString(response["id"]); err == nil && id != "" {
+		response := memberValue(raw, ms, "response")
+		if rms, err := objectMembers(response); err == nil {
+			idRaw := memberValue(response, rms, "id")
+			if !utf8.Valid(idRaw) {
+				return errUpstreamData
+			}
+			if id, err := keptID(idRaw); err == nil && id != "" {
 				c.started = id
 			}
 		}
 	case "response.completed", "response.incomplete":
 		// Validate the event/response pairing before mutating accepted collection.
-		response, err := responseObject(obj["response"])
+		response := memberValue(raw, ms, "response")
+		rms, err := objectMembers(response)
 		if err != nil {
 			return err
 		}
-		status, err := responseString(response["status"])
+		status, err := protocolString(memberValue(response, rms, "status"))
 		if err != nil || "response."+status != kind {
 			return errUpstreamData
 		}
-		return c.response(obj["response"])
+		return c.response(response)
 	}
 	return nil
 }
@@ -186,7 +288,7 @@ func (m *workingSet) reserveOutput(n int64) bool {
 }
 func (m *workingSet) freeOutput(n int64) { m.mu.Lock(); m.output -= n; m.mu.Unlock() }
 func (c *collector) bytes() int64 {
-	n := int64(512 + len(c.id) + len(c.started) + len(c.status) + (cap(c.items)+cap(c.output))*24)
+	n := c.idBytes() + int64((cap(c.items)+cap(c.output))*24)
 	for _, v := range c.items {
 		n += int64(cap(v))
 	}
@@ -195,58 +297,77 @@ func (c *collector) bytes() int64 {
 	}
 	return n
 }
-func (c *collector) release(m *workingSet) { m.freeOutput(c.charged); c.charged = 0 }
+
+// idBytes charges the kept identity strings; a suspended collector's state
+// lease holds exactly this amount (suspendOutput).
+func (c *collector) idBytes() int64 {
+	return 512 + heapBytes(len(c.id)) + heapBytes(len(c.started)) + int64(len(c.status))
+}
+
+func (c *collector) release(m *workingSet) {
+	m.freeOutput(c.charged)
+	if c.pendingState != nil {
+		c.pendingState.Close()
+	}
+	*c = collector{}
+}
+
+// responseScratch upper-bounds the real allocation of ONE phase over an n-byte
+// frame (TestResponseScratchCoversRealAllocation): parse decodes nothing but
+// the kept id(s) (one exact copy each, invalid UTF-8 refused) and short
+// type/status tokens, so it keeps at most one rounded copy of disjoint value
+// spans (<= 5n/4) plus member/item headers; materializing compares type/id
+// tokens undecoded and allocates one wire copy (<= n) plus, for an escaping
+// event map, its exactly decoded keys (<= 5n/4 with rounding) and slots.
+// Reserved BEFORE parse/rewrite, not inferred from output afterward.
 func responseScratch(n int) int64 {
-	// Decoder/RawMessage copies, encoder buffer+copy, and bounded field/item
-	// metadata. Reserved BEFORE parse/rewrite, not inferred from output afterward.
+	return int64(n)*9/4 + maxHistoryItems*24 + 512<<10
+}
+
+// decodeScratch is the legacy reservation for paths that still fully decode
+// and re-encode a document (background log records, error frames).
+func decodeScratch(n int) int64 {
 	return 8*int64(n) + 2*maxHistoryItems*24 + 256*128
 }
 func (c *collector) collect(raw []byte, m *workingSet, event bool) error {
-	_, held, err := c.collectParsed(raw, m, event)
-	m.freeOutput(held)
-	return err
-}
-
-// collectParsed also returns an event's decoded top level for reuse. While the
-// map lives, a frame-sized part of the parse scratch stays reserved as held
-// bytes; the caller frees held once the map is dropped. No per-map size
-// estimate is attempted.
-func (c *collector) collectParsed(raw []byte, m *workingSet, event bool) (map[string]json.RawMessage, int64, error) {
 	scratch := responseScratch(len(raw))
-	if len(raw) > maxResponseBytes || !m.reserveOutput(scratch) {
-		return nil, 0, errWorkSize
+	// A suspended collector's ids are held by its input-pool state lease, and
+	// bytes() counts them again: their output charge is reserved up front and
+	// the lease is released only after that transfer succeeds.
+	if c.pendingState != nil {
+		scratch += c.idBytes()
 	}
-	var obj map[string]json.RawMessage
+	if len(raw) > maxResponseBytes || !m.reserveOutput(scratch) {
+		return errWorkSize
+	}
 	var err error
 	if event {
-		if obj, err = responseObject(raw); err == nil {
-			err = c.eventObj(obj)
-		}
+		err = c.event(raw)
 	} else {
 		err = c.response(raw)
 	}
 	if err != nil {
 		m.freeOutput(scratch)
-		return nil, 0, err
+		return err
 	}
 	actual := c.bytes()
 	rest := scratch + c.charged - actual // what the collector did not keep
+	if rest < 0 {
+		// The scratch bound was violated: keep exactly what is held charged
+		// and fail, never charging past the reservation.
+		c.charged += scratch
+		return errWorkSize
+	}
 	c.charged = actual
-	// Keep the frame-sized part of scratch (8x the frame) with the map; its
-	// copied values/keys plus allocator slack and <=256 entries stay far below.
-	var held int64
-	if obj != nil {
-		held = min(rest, 8*int64(len(raw))+256*128)
+	if c.pendingState != nil {
+		c.pendingState.Close()
+		c.pendingState = nil
 	}
-	if held <= 0 {
-		obj, held = nil, 0 // never return a map without its reservation
-	}
-	m.freeOutput(rest - held)
+	m.freeOutput(rest)
 	if actual > maxResponseBytes {
-		m.freeOutput(held)
-		return nil, 0, errWorkSize
+		return errWorkSize
 	}
-	return obj, held, nil
+	return nil
 }
 func (c *collector) boundedEvent(raw []byte, m *workingSet) error    { return c.collect(raw, m, true) }
 func (c *collector) boundedResponse(raw []byte, m *workingSet) error { return c.collect(raw, m, false) }
@@ -307,8 +428,8 @@ func readResponseBody(r io.Reader, m *workingSet) (*responseBuffer, error) {
 	}
 }
 
-// Parsing and rewriting share the existing SHORT phase with input/commit.
-// Return an independently charged wire buffer; no phase spans network I/O.
+// Parsing and rewriting reserve their complete scratch before materializing.
+// Return an independently charged wire buffer; byte-pressure admission never waits.
 // accept reports whether the turn's history was retained; a terminal response
 // that was not retained keeps the upstream store value, so clients never
 // continue from an id the keeper does not hold.
@@ -317,68 +438,106 @@ func (k *keeper) responseFrame(ctx context.Context, c *collector, raw []byte, ev
 	return wire, release, err
 }
 
-// responseFrameParsed decodes an event's top level once. The decoded object is
-// returned (and stays charged until release) only when it still describes the
-// returned wire bytes, so a background log can reuse it.
+// responseFrameParsed collects once; pending terminal frames rematerialize only
+// after acceptance. The returned map stays charged until release and describes
+// the returned bytes, so a background log can reuse it.
 func (k *keeper) responseFrameParsed(ctx context.Context, c *collector, raw []byte, event, stored bool, accept func() (bool, error)) ([]byte, func(), map[string]json.RawMessage, error) {
-	leave, err := k.work.enter(ctx)
-	if err != nil {
-		return nil, nil, nil, err
-	}
-	defer leave()
-	obj, held, err := c.collectParsed(raw, k.work, event)
-	if err != nil {
-		return nil, nil, nil, err
-	}
-	// The parse scratch held with the map stays reserved through acceptance and
-	// also covers the rewrite's encoder buffers (as one scratch always did).
-	retained := true
+	var prepare prepareResponseAcceptance
 	if accept != nil {
-		var err error
-		retained, err = accept()
-		if err != nil {
-			k.work.freeOutput(held)
-			return nil, nil, nil, err
+		prepare = func() (*responseAcceptance, error) { return &responseAcceptance{commit: accept}, nil }
+	}
+	body := &responseBuffer{data: raw, work: k.work}
+	raw = nil
+	return k.responseFrameProcess(ctx, c, body, false, event, stored, prepare, nil)
+}
+
+func (k *keeper) responseFrameProcess(ctx context.Context, c *collector, body *responseBuffer, ownsRaw, event, stored bool, prepare prepareResponseAcceptance, suspend suspendResponseFrame) ([]byte, func(), map[string]json.RawMessage, error) {
+	raw := body.data
+	if err := ctx.Err(); err != nil {
+		return nil, nil, nil, err
+	}
+	if err := c.collect(raw, k.work, event); err != nil {
+		return nil, nil, nil, err
+	}
+	retained := true
+	if prepare != nil {
+		acceptance, e := prepare()
+		if e != nil {
+			return nil, nil, nil, e
+		}
+		if acceptance != nil && acceptance.commit == nil {
+			retained = false
+		}
+		if acceptance != nil && acceptance.commit != nil {
+			if acceptance.close != nil {
+				defer acceptance.close()
+			}
+			pending, e := k.savePendingResponse(raw)
+			if e != nil {
+				return nil, nil, nil, e
+			}
+			defer pending.Close()
+			if e := c.suspendOutput(k.work); e != nil {
+				return nil, nil, nil, e
+			}
+			raw = nil
+			if ownsRaw {
+				body.close()
+			} else {
+				body.data = nil
+			}
+			var resume func() error
+			if suspend != nil {
+				resume, e = suspend()
+				if e != nil {
+					return nil, nil, nil, e
+				}
+			}
+			retained, e = acceptance.commit()
+			if e != nil {
+				return nil, nil, nil, e
+			}
+			if e = ctx.Err(); e != nil {
+				return nil, nil, nil, e
+			}
+			if resume != nil {
+				if e = resume(); e != nil {
+					return nil, nil, nil, e
+				}
+			}
+			restored, e := readResponseBody(pending.spanReader(0, pending.size), k.work)
+			if e != nil {
+				return nil, nil, nil, e
+			}
+			defer restored.close()
+			raw = restored.data
 		}
 		stored = stored && retained
 	}
+	// Materialization (latch scan, splice or copy, escaping map) has its own
+	// scratch, reserved before any of it allocates.
+	budget := responseScratch(len(raw))
+	if !k.work.reserveOutput(budget) {
+		return nil, nil, nil, errWorkSize
+	}
 	// The public id is decided once, at the first response-bearing event:
 	// a turn that intends recording advertises the resp_ alias from that
 	// point on and never switches back to the upstream id mid-turn, even if
 	// the terminal accept later fails (REVIEW3: one response, one id).
 	// c.rewrite latches the decision; non-storing turns never latch, so a
 	// store:false turn keeps its upstream id as before.
-	// The public id is decided once, at the first response-bearing event:
-	// a turn that intends recording advertises the resp_ alias from that
-	// point on and never switches back to the upstream id mid-turn, even if
-	// the terminal accept later fails (REVIEW3: one response, one id).
-	// c.rewrite latches the decision; non-storing turns never latch, so a
-	// store:false turn keeps its upstream id as before.
-	if accept != nil && event && obj != nil && stored {
-		if _, hasResp := obj["response"]; hasResp && isResponseEventType(responseTypeOf(obj)) {
-			c.rewrite = true
-		}
+	if prepare != nil && event && stored && responseEventFrame(raw) {
+		c.rewrite = true
 	}
 	// Non-event calls publish a single bare Response object: rewrite exactly
 	// when it is a stored (recorded) turn's response.
-	rewrite := accept == nil || c.rewrite
+	rewrite := prepare == nil || c.rewrite
 	if !event {
 		rewrite = stored
 	}
-	budget := held
-	if obj == nil {
-		budget = responseScratch(len(raw))
-		if !k.work.reserveOutput(budget) {
-			return nil, nil, nil, errWorkSize
-		}
-	}
-	var wire []byte
-	if !rewrite {
-		wire = raw
-		err = nil
-	} else if obj != nil {
-		wire, err = rewriteParsedPayload(obj, raw, stored)
-	} else {
+	wire := raw
+	var err error
+	if rewrite {
 		wire, err = rewritePayload(raw, stored)
 	}
 	if err == nil && len(wire) > maxResponseBytes {
@@ -388,16 +547,21 @@ func (k *keeper) responseFrameParsed(ctx context.Context, c *collector, raw []by
 		k.work.freeOutput(budget)
 		return nil, nil, nil, err
 	}
-	// The returned copy is independent of the raw read buffer and remains
-	// charged while the network writer is blocked. An escaping map keeps the
-	// whole budget until release.
-	owned := append([]byte(nil), wire...)
-	keep := int64(cap(owned))
-	if obj != nil && bytes.Equal(wire, raw) {
-		keep = max(keep, budget)
-	} else {
-		obj = nil
+	// The returned bytes are independent of the raw read buffer and remain
+	// charged while the network writer is blocked. A splice is already a
+	// fresh exact buffer; unchanged bytes are copied once. An unchanged
+	// event's map (values alias owned) stays charged until release.
+	owned := wire
+	var obj map[string]json.RawMessage
+	if sameBytes(wire, raw) {
+		owned = append([]byte(nil), raw...)
+		if event {
+			// No map (the recorder decodes on its own scratch) when a key is
+			// not strictly decodable; the bytes still pass through.
+			obj, _ = responseObject(owned)
+		}
 	}
+	keep := int64(cap(owned)) + mapCharge(obj)
 	if keep > budget {
 		if !k.work.reserveOutput(keep - budget) {
 			k.work.freeOutput(budget)
@@ -409,8 +573,14 @@ func (k *keeper) responseFrameParsed(ctx context.Context, c *collector, raw []by
 	release := func() { k.work.freeOutput(keep) }
 	return owned, release, obj, nil
 }
+
+// sameBytes reports whether a is b itself (rewrite returned its input).
+func sameBytes(a, b []byte) bool {
+	return len(a) == len(b) && (len(a) == 0 || &a[0] == &b[0])
+}
 func readDiscard(ctx context.Context, r io.Reader) error {
-	_, err := io.CopyBuffer(io.Discard, r, make([]byte, 32<<10))
+	// This control-path window is covered by the live socket's state lease.
+	_, err := io.CopyBuffer(struct{ io.Writer }{io.Discard}, contextReader{ctx, r}, make([]byte, 1024))
 	if err == nil {
 		err = ctx.Err()
 	}

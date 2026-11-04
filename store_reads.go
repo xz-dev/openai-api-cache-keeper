@@ -9,12 +9,10 @@ import (
 // resolveID locates the tip node for a response alias or socket pin without
 // copying any history payload. Returns (tip, charge, found).
 func (s *store) resolveID(id string, owner [32]byte, pinned bool) ([32]byte, int64, bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	var tip [32]byte
 	var charge int64
 	found := false
-	_ = s.db.View(func(tx *bolt.Tx) error {
+	_ = s.view(func(tx *bolt.Tx) error {
 		bucket := bucketResponses
 		if pinned {
 			bucket = bucketPins
@@ -30,14 +28,19 @@ func (s *store) resolveID(id string, owner [32]byte, pinned bool) ([32]byte, int
 		found = true
 		return nil
 	})
-	if found && !pinned {
-		// LRU touch; failure must not turn a readable id into a miss.
-		_ = s.db.Update(func(tx *bolt.Tx) error {
-			b := tx.Bucket(bucketResponses)
-			v := append([]byte(nil), b.Get([]byte(id))...)
+	if found && !pinned && s.mu.tryLock() {
+		// Best-effort LRU never queues a reader behind staging or compaction.
+		_ = s.update(func(st *storeTx) error {
+			b := st.tx.Bucket(bucketResponses)
+			current := b.Get([]byte(id))
+			if len(current) < 48 || string(current[:32]) != string(tip[:]) {
+				return nil
+			}
+			v := append([]byte(nil), current...)
 			copy(v[40:], encoded(s.now().UnixNano()))
 			return b.Put([]byte(id), v)
 		})
+		s.mu.Unlock()
 	}
 	return tip, charge, found
 }
@@ -77,7 +80,7 @@ func (s *store) writeHistoryTo(hashes [][32]byte, write func(item []byte) error)
 			end++
 			batched += 1 << 20 // pessimistic; item size unknown until tx
 		}
-		err := s.db.View(func(tx *bolt.Tx) error {
+		err := s.view(func(tx *bolt.Tx) error {
 			its := tx.Bucket(bucketItems)
 			for _, h := range hashes[start:end] {
 				var zero [32]byte
@@ -248,10 +251,8 @@ func (s *store) getLimited(id string, owner [32]byte, pinned bool, maxBytes int6
 
 // tipHashes resolves a tip node to ordered item hashes under the store mutex.
 func (s *store) tipHashes(tip [32]byte, owner [32]byte) ([][32]byte, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	var hashes [][32]byte
-	err := s.db.View(func(tx *bolt.Tx) error {
+	err := s.view(func(tx *bolt.Tx) error {
 		var err error
 		hashes, err = s.historyHashes(tx, tip, owner)
 		return err

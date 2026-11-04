@@ -18,15 +18,17 @@ import (
 )
 
 type keeper struct {
-	cfg        config
-	store      *store
-	client     *http.Client
-	routing    *routingClient
-	work       *workingSet
-	native     *httputil.ReverseProxy
-	cacheMu    sync.Mutex
-	tasks      map[string]*responseTask
-	eventBytes int64
+	cfg                 config
+	store               *store
+	client              *http.Client
+	routing             *routingClient
+	work                *workingSet
+	native              *httputil.ReverseProxy
+	cacheMu             sync.Mutex
+	tasks               map[string]*responseTask
+	eventBytes          int64
+	cachePending        int64 // event-log bytes reserved before slow I/O
+	cacheHistoryReserve int64 // active writer's complete replacement live-byte ceiling
 }
 
 func newKeeper(cfg config) *keeper {
@@ -54,6 +56,7 @@ func newKeeper(cfg config) *keeper {
 		tasks:   make(map[string]*responseTask),
 		client:  &http.Client{Transport: transport, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }},
 	}
+	st.inputWork = k.work
 	if cfg.upstream != nil {
 		k.native = k.newNativeProxy()
 	}
@@ -138,11 +141,12 @@ func (k *keeper) serveLocalTurn(w http.ResponseWriter, r *http.Request) {
 // the native proxy. The returned release keeps the spool alive until the
 // chosen handler finishes with the body.
 func (k *keeper) localCheckpointTurn(w http.ResponseWriter, r *http.Request) (release func(), local bool, background bool, handled bool) {
-	if !trySlot(k.work.turns) {
-		writeAPIError(w, workingError(errors.New("turn limit")))
+	lease, err := k.work.state(turnStateBytes(r.Header), &k.work.activeTurns)
+	if err != nil {
+		writeAPIError(w, workingError(err))
 		return nil, false, false, true
 	}
-	defer func() { <-k.work.turns }()
+	defer lease.Close()
 	if r.ContentLength > k.cfg.maxRequestBytes {
 		writeAPIError(w, workingError(errWorkSize))
 		return nil, false, false, true
@@ -152,19 +156,8 @@ func (k *keeper) localCheckpointTurn(w http.ResponseWriter, r *http.Request) (re
 		writeAPIError(w, workingError(err))
 		return nil, false, false, true
 	}
-	leave, err := k.work.enter(r.Context())
-	if err != nil {
-		raw.Close()
-		writeAPIError(w, workingError(err))
-		return nil, false, false, true
-	}
-	var flags struct {
-		Stream     json.RawMessage `json:"stream"`
-		Background json.RawMessage `json:"background"`
-	}
-	decodeErr := json.NewDecoder(io.NewSectionReader(raw.File, raw.offset, raw.size)).Decode(&flags)
+	streamFlag, backgroundFlag, decodeErr := spoolFlags(r.Context(), raw)
 	prevID, owned, apiErr := k.ownedLocalPreviousID(raw, k.ownerOf(r))
-	leave()
 	if apiErr != nil {
 		writeAPIError(w, apiErr)
 		raw.Close()
@@ -177,12 +170,13 @@ func (k *keeper) localCheckpointTurn(w http.ResponseWriter, r *http.Request) (re
 		return nil, false, false, true
 	}
 	r.Body = body
-	background = decodeErr == nil && string(flags.Stream) == "true" && string(flags.Background) == "true"
+	background = decodeErr == nil && streamFlag && backgroundFlag
 	// A turn is local when the keeper can replay its full input: either it
 	// carries no parent at all, or it names one the keeper stored for this
 	// owner. Any other previous_response_id is an opaque native reference and
 	// the request keeps native semantics end to end.
-	return func() { body.Close(); raw.Close() }, owned || prevID == "", background, false
+	endState := lease.retain()
+	return func() { body.Close(); raw.Close(); endState() }, owned || prevID == "", background, false
 }
 
 // apiError renders as an OpenAI-shaped error object.
@@ -280,7 +274,7 @@ func expandInput(doc map[string]json.RawMessage, lookup lookupFunc) ([]json.RawM
 		}
 		history, found := lookup(id)
 		if !found {
-			return nil, &apiError{status: http.StatusBadRequest, typ: "invalid_request_error", code: "previous_response_not_found", param: "previous_response_id", message: fmt.Sprintf("Previous response with id '%s' not found.", id)}
+			return nil, previousNotFound(id)
 		}
 		input = append(append(make([]json.RawMessage, 0, len(history)+len(input)), history...), input...)
 	}
@@ -323,16 +317,17 @@ func inputItems(raw json.RawMessage) ([]json.RawMessage, error) {
 
 // collector reconstructs the final response from SSE events or a JSON body.
 type collector struct {
-	charged int64
-	items   []json.RawMessage // response.output_item.done, by output_index
-	id      string
-	started string // id from response.created/in_progress
-	status  string
-	output  []json.RawMessage
-	done    bool
-	seq     int64 // last upstream sequence_number seen
-	seqSet  bool
-	rewrite bool // latched at first response event: this turn publishes resp_ ids
+	pendingState *stateLease
+	charged      int64
+	items        []json.RawMessage // response.output_item.done, by output_index
+	id           string
+	started      string // id from response.created/in_progress
+	status       string
+	output       []json.RawMessage
+	done         bool
+	seq          int64 // last upstream sequence_number seen
+	seqSet       bool
+	rewrite      bool // latched at first response event: this turn publishes resp_ ids
 }
 
 // responseID is the upstream id of the response this turn produced, if any;
@@ -374,6 +369,7 @@ func (k *keeper) forwardReader(ctx context.Context, upstream *url.URL, path, raw
 	target := *upstream
 	target.Path = strings.TrimRight(target.Path, "/") + path
 	target.RawQuery = rawQuery
+	body = retainRequestState(ctx, body)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, target.String(), body)
 	if err != nil {
 		if closer, ok := body.(io.Closer); ok {
@@ -399,11 +395,13 @@ func (k *keeper) forwardReader(ctx context.Context, upstream *url.URL, path, raw
 func (k *keeper) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	task, _ := r.Context().Value(backgroundTaskKey{}).(*responseTask)
 	start := time.Now()
-	if !trySlot(k.work.turns) {
-		writeAPIError(w, workingError(errors.New("turn limit")))
+	lease, err := k.work.state(turnStateBytes(r.Header), &k.work.activeTurns)
+	if err != nil {
+		writeAPIError(w, workingError(err))
 		return
 	}
-	defer func() { <-k.work.turns }()
+	defer lease.Close()
+	r = r.WithContext(context.WithValue(r.Context(), requestStateKey{}, lease))
 	raw, err := k.spoolRequest(r.Context(), http.MaxBytesReader(w, r.Body, k.cfg.maxRequestBytes))
 	if err != nil {
 		writeAPIError(w, workingError(err))
@@ -415,17 +413,10 @@ func (k *keeper) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		writeRoutingError(w, routeErr, stream)
 		return
 	}
-	leave, err := k.work.enter(r.Context())
-	if err != nil {
-		writeAPIError(w, workingError(err))
-		return
-	}
 	owner := k.ownerOf(r)
-	t, apiErr := k.prepareDisk(r.Context(), raw, owner, func(id string) ([32]byte, bool) {
-		tip, _, ok := k.store.resolveID(id, owner, false)
-		return tip, ok
-	}, false)
-	leave()
+	t, apiErr := k.prepareDiskSnapshot(r.Context(), raw, owner, func(id string) (*historySnapshot, error) {
+		return k.store.snapshotID(r.Context(), id, owner, false)
+	}, false, false)
 	raw.Close()
 	if apiErr != nil {
 		writeAPIError(w, apiErr)
@@ -440,20 +431,45 @@ func (k *keeper) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer resp.Body.Close()
+	if task == nil {
+		finishWrites, err := interruptCancelledWrites(w, r.Context())
+		if err != nil {
+			writeCancellationError(w, err)
+			return
+		}
+		defer finishWrites()
+	}
+	if task != nil && task.state != nil {
+		if err := task.state.extend(k.work, retainedHeaderBytes(resp.Header)); err != nil {
+			writeAPIError(w, workingError(err))
+			return
+		}
+	} else {
+		headers, err := k.work.state(retainedHeaderBytes(resp.Header), nil)
+		if err != nil {
+			writeAPIError(w, workingError(err))
+			return
+		}
+		defer headers.Close()
+	}
 	copyHeader(w.Header(), resp.Header)
 	w.Header().Del("Content-Length")
 	var c collector
 	defer c.release(k.work)
 	id := ""
-	accept := func() (bool, error) {
+	prepare := func() (*responseAcceptance, error) {
 		if task != nil {
 			rid := c.responseID()
 			task.mu.Lock()
 			if rid != "" && task.upstreamID != "" && task.upstreamID != rid {
 				task.mu.Unlock()
-				return false, errUpstreamData
+				return nil, errUpstreamData
 			}
-			if rid != "" {
+			if rid != "" && task.upstreamID == "" {
+				if err := task.state.extend(k.work, int64(len(rid))); err != nil {
+					task.mu.Unlock()
+					return nil, err
+				}
 				task.upstreamID = rid
 			}
 			task.mu.Unlock()
@@ -461,20 +477,28 @@ func (k *keeper) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		if rid, output, ok := c.final(); ok && t.store && id == "" {
 			if task != nil {
 				if !task.stream || c.status != "completed" {
-					return false, nil
+					return &responseAcceptance{}, nil
 				}
 				rid = task.id
 			}
 			if err := r.Context().Err(); err != nil {
-				return false, err
+				return nil, err
 			}
-			if _, err := k.acceptDisk(r.Context(), t, publicID(rid), owner, output, "", false); err != nil {
+			pending, err := k.prepareAcceptDisk(r.Context(), t, publicID(rid), owner, output, "", false)
+			if err != nil {
 				logNotRetained(err)
-				return false, nil
+				return &responseAcceptance{}, nil
 			}
-			id = publicID(rid)
+			return &responseAcceptance{close: pending.close, commit: func() (bool, error) {
+				if _, err := pending.commit(r.Context()); err != nil {
+					logNotRetained(err)
+					return false, nil
+				}
+				id = "stored" // Only a success sentinel; the owned alias is in storage.
+				return true, nil
+			}}, nil
 		}
-		return true, nil
+		return nil, nil
 	}
 	if resp.StatusCode == http.StatusOK && strings.Contains(resp.Header.Get("Content-Type"), "text/event-stream") {
 		w.WriteHeader(resp.StatusCode)
@@ -482,7 +506,7 @@ func (k *keeper) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		var wire []byte
 		var parsed map[string]json.RawMessage
 		var release func()
-		err = readSSE(resp.Body, func(frame []byte) error {
+		err = readSSEOwned(resp.Body, func(frame []byte) error {
 			if release != nil {
 				defer release()
 				defer func() { wire, parsed, release = nil, nil, nil }()
@@ -497,19 +521,15 @@ func (k *keeper) serveHTTP(w http.ResponseWriter, r *http.Request) {
 				return err
 			}
 			return rc.Flush()
-		}, func(data []byte) error {
+		}, func(data *responseBuffer, suspend suspendResponseFrame) error {
 			var e error
-			if task == nil {
-				wire, release, e = k.responseFrame(r.Context(), &c, data, true, t.store, accept)
-				return e
-			}
-			wire, release, parsed, e = k.responseFrameParsed(r.Context(), &c, data, true, t.store, accept)
-			if e == nil && task.nativeParent && parsed == nil {
-				// Native parents keep upstream bytes; the decoded object no longer matches wire.
-				wire = data
+			wire, release, parsed, e = k.responseFrameOwned(r.Context(), &c, data, true, t.store, prepare, suspend)
+			if e == nil && task != nil && task.nativeParent && parsed == nil {
+				// Native parents keep upstream bytes, never a partial local chain.
+				wire = data.data
 			}
 			return e
-		}, k.work)
+		}, k, k.work)
 		if err == nil && !c.done {
 			err = io.ErrUnexpectedEOF
 		}
@@ -535,7 +555,7 @@ func (k *keeper) serveHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		defer body.close()
-		wire, release, err := k.responseFrame(r.Context(), &c, body.data, false, t.store, accept)
+		wire, release, _, err := k.responseFrameOwned(r.Context(), &c, body, false, t.store, prepare, nil)
 		if err != nil {
 			writeAPIError(w, responseError(err))
 			return

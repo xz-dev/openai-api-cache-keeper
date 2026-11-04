@@ -12,15 +12,13 @@ import (
 	"sort"
 	"strings"
 	"sync"
-	"time"
+	"sync/atomic"
+	"unicode/utf8"
 )
 
-// Bounds for the measured 384-MiB envelope. Materialization is a short phase,
-// never a whole streamed turn. Slow upstreams retain disk files, not histories.
+// Bounds for the unchanged 384-MiB envelope. Slow upstreams retain disk files,
+// while simultaneously materialized scratch is admitted by actual byte credits.
 const (
-	maxTurns                 = 64
-	maxSockets               = 64
-	maxTaskReaders           = 4 // concurrent local readers per background task
 	maxHistoryBytes    int64 = 64 << 20
 	maxHistoryItems          = 8192
 	maxEventBytes            = 1 << 20
@@ -28,53 +26,38 @@ const (
 	maxCollectedBytes        = 16 << 20
 	maxTaskStreamBytes       = 8 << 20 // cumulative task-log re-parse budget; SSE relay itself is unbounded
 	maxSpoolBytes      int64 = 1 << 30
-	workWait                 = 8 * time.Second
 )
 
 var errWorkSize = errors.New("encoded history or response exceeds working limit")
 
-// One short materialization phase serializes input, commit and response
-// parse/rewrite. Response buffers/scratch also reserve explicit byte capacity;
-// the phase token itself is NOT a byte allocator or an RSS guarantee.
+// Output and input scratch have independent, non-waiting byte accounting.
+// Fixed connection admission remains until its lifecycle-credit slice lands.
 type workingSet struct {
-	phase   chan struct{}
-	turns   chan struct{}
-	sockets chan struct{}
-	mu      sync.Mutex
-	disk    int64
-	output  int64
+	activeTurns   atomic.Int64
+	activeSockets atomic.Int64
+	activeTasks   atomic.Int64
+	mu            sync.Mutex
+	disk          int64
+	output        int64
+	input         int64
 }
 
-func newWorkingSet() *workingSet {
-	return &workingSet{phase: make(chan struct{}, 1), turns: make(chan struct{}, maxTurns), sockets: make(chan struct{}, maxSockets)}
-}
-func (m *workingSet) enter(ctx context.Context) (func(), error) {
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	timer := time.NewTimer(workWait)
-	defer timer.Stop()
-	select {
-	case m.phase <- struct{}{}:
-		if err := ctx.Err(); err != nil {
-			<-m.phase
-			return nil, err
+func newWorkingSet() *workingSet { return &workingSet{} }
+
+// previousNotFound never echoes an unbounded client id: the message carries
+// at most a 64-byte UTF-8-safe prefix (the lookup itself used the full id).
+func previousNotFound(id string) *apiError {
+	if len(id) > 64 {
+		cut := 64
+		for cut > 0 && !utf8.RuneStart(id[cut]) {
+			cut--
 		}
-		return func() { <-m.phase }, nil
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	case <-timer.C:
-		return nil, errors.New("working-set wait exceeded")
+		id = id[:cut] + "..."
 	}
+	return &apiError{status: http.StatusBadRequest, typ: "invalid_request_error", code: "previous_response_not_found", param: "previous_response_id",
+		message: fmt.Sprintf("Previous response with id '%s' not found.", id)}
 }
-func trySlot(ch chan struct{}) bool {
-	select {
-	case ch <- struct{}{}:
-		return true
-	default:
-		return false
-	}
-}
+
 func workingError(err error) *apiError {
 	var tooLarge *http.MaxBytesError
 	if errors.Is(err, errWorkSize) || errors.As(err, &tooLarge) {
@@ -84,12 +67,17 @@ func workingError(err error) *apiError {
 }
 
 func (k *keeper) spoolRequest(ctx context.Context, r io.Reader) (*spool, error) {
+	release, err := k.work.reserveInput(requestCopyCredit)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
 	f, err := k.newSpool()
 	if err != nil {
 		return nil, err
 	}
 	// Hide os.File.ReadFrom so CopyBuffer cannot bypass byte accounting.
-	n, err := io.CopyBuffer(struct{ io.Writer }{f}, io.LimitReader(r, k.cfg.maxRequestBytes+1), make([]byte, 32<<10))
+	n, err := io.CopyBuffer(struct{ io.Writer }{f}, io.LimitReader(contextReader{ctx, r}, k.cfg.maxRequestBytes+1), make([]byte, 32<<10))
 	if err == nil && n > k.cfg.maxRequestBytes {
 		err = errWorkSize
 	}
@@ -115,6 +103,7 @@ type diskTurn struct {
 	spans          []itemSpan
 	store, hasPrev bool
 	outStart       int // index of first output span; spans[:outStart] is input
+	spanFree       func()
 }
 
 // itemReader streams each span through a small reusable buffer.
@@ -124,20 +113,38 @@ func (t *diskTurn) itemSource() itemFactory {
 
 func (t *diskTurn) itemReader() itemSource {
 	i := 0
-	buf := make([]byte, 0, 64<<10)
+	var buf []byte
+	var free func()
+	finish := func() {
+		buf = nil
+		if free != nil {
+			free()
+			free = nil
+		}
+	}
 	return func(dst []byte) ([]byte, error) {
 		if i >= len(t.spans) {
+			finish()
 			return nil, io.EOF
 		}
 		span := t.spans[i]
 		i++
-		need := buf
-		if cap(need) < span.n {
-			need = make([]byte, span.n)
-			buf = need
+		if cap(buf) < span.n {
+			release, err := t.file.mem.reserveInput(int64(span.n))
+			if err != nil {
+				finish()
+				return nil, err
+			}
+			next := make([]byte, span.n)
+			finish()
+			buf, free = next, release
+			t.file.mu.Lock()
+			t.file.inputCredits = append(t.file.inputCredits, release)
+			t.file.mu.Unlock()
 		}
-		need = need[:span.n]
+		need := buf[:span.n]
 		if _, err := t.file.ReadAt(need, span.off); err != nil {
+			finish()
 			return nil, err
 		}
 		return need, nil
@@ -182,12 +189,39 @@ type fieldSpan struct {
 // other field value stay file spans, so a multi-megabyte input never
 // materializes or re-encodes through the heap (REVIEW3 B6).
 func (k *keeper) prepareDiskEnv(ctx context.Context, raw *spool, owner [32]byte, lookup func(id string) (tip [32]byte, found bool), ws, wsEnvelope bool) (*diskTurn, *apiError) {
+	return k.prepareDiskSnapshot(ctx, raw, owner, func(id string) (*historySnapshot, error) {
+		tip, found := lookup(id)
+		if !found {
+			return nil, errMissingItem
+		}
+		return k.store.snapshotTip(ctx, tip, owner)
+	}, ws, wsEnvelope)
+}
+
+func (k *keeper) prepareDiskSnapshot(ctx context.Context, raw *spool, owner [32]byte, lookup func(string) (*historySnapshot, error), ws, wsEnvelope bool) (*diskTurn, *apiError) {
+	releaseInput, err := k.work.reserveInput(inputParseCredit(raw))
+	if err != nil {
+		return nil, workingError(err)
+	}
+	defer releaseInput()
+	if err := validSpoolJSON(ctx, raw); err != nil {
+		return nil, &apiError{status: 400, typ: "invalid_request_error", message: "invalid request JSON"}
+	}
 	if err := ctx.Err(); err != nil {
 		return nil, workingError(err)
 	}
 	task, _ := ctx.Value(backgroundTaskKey{}).(*responseTask)
 	t := &diskTurn{store: true}
 	var prevID string
+	var prevStart, prevEnd int64 // the client's previous_response_id token span
+	var readErr error
+	var prevErr bool
+	var selected *historySnapshot
+	defer func() {
+		if selected != nil {
+			_ = selected.Close()
+		}
+	}()
 	// Field spans forwarded to the upstream body: model first, then input,
 	// then the remaining fields sorted by key.
 	var other []fieldSpan
@@ -243,15 +277,23 @@ func (k *keeper) prepareDiskEnv(ctx context.Context, raw *spool, owner [32]byte,
 				inputErr = true
 			}
 		case "previous_response_id":
-			if v := raw.keySlice(start, end); v != nil && string(v) != "null" {
-				var id string
-				if json.Unmarshal(v, &id) != nil || id == "" {
-					inputErr = true
-					return nil
-				}
-				prevID = id
-				t.hasPrev = true
+			// Any-size ID decoded straight from the spool (no raw copy, invalid
+			// UTF-8 refused): the id plus the store lookup's key copy fit
+			// inputParseCredit (2*raw).
+			if end-start == 4 && string(raw.keySlice(start, end)) == "null" {
+				return nil
 			}
+			id, ok, err := raw.decodeJSONSpan(start, end)
+			if err != nil {
+				readErr = err
+				return err
+			}
+			if !ok || id == "" {
+				prevErr = true
+				return nil
+			}
+			prevID, prevStart, prevEnd = id, start, end
+			t.hasPrev = true
 		case "type":
 			v := raw.keySlice(start, end)
 			if ws {
@@ -277,14 +319,21 @@ func (k *keeper) prepareDiskEnv(ctx context.Context, raw *spool, owner [32]byte,
 		}
 		return nil
 	})
+	if readErr != nil {
+		return nil, workingError(readErr)
+	}
 	if scanErr != nil {
 		if scanErr == errWorkSize {
 			return nil, workingError(errWorkSize)
 		}
 		return nil, &apiError{status: 400, typ: "invalid_request_error", message: "invalid request JSON"}
 	}
-	if inputErr {
-		return nil, &apiError{status: 400, typ: "invalid_request_error", param: "input", message: "input must be a string or an array of items"}
+	if inputErr || prevErr {
+		param := "input"
+		if !inputErr {
+			param = "previous_response_id"
+		}
+		return nil, &apiError{status: 400, typ: "invalid_request_error", param: param, message: "input must be a string or an array of items"}
 	}
 	_ = inputNull
 	// String input becomes a user item; stream {"role":"user","content":<raw string>}
@@ -301,8 +350,24 @@ func (k *keeper) prepareDiskEnv(ctx context.Context, raw *spool, owner [32]byte,
 	if task != nil {
 		drop["background"] = true
 		if prevID != "" {
-			if _, local := lookup(prevID); !local && !strings.HasPrefix(prevID, keeperResponsePrefix) {
-				extra["previous_response_id"], _ = json.Marshal(prevID)
+			var err error
+			selected, err = lookup(prevID)
+			if err != nil && !errors.Is(err, errMissingItem) {
+				return nil, workingError(err)
+			}
+			if errors.Is(err, errMissingItem) && !strings.HasPrefix(prevID, keeperResponsePrefix) {
+				// Forward the client's token itself (already valid JSON, never
+				// re-encoded), re-read under its own credit while it is held.
+				freeToken, err := k.work.reserveInput(heapBytes(int(prevEnd - prevStart)))
+				if err != nil {
+					return nil, workingError(err)
+				}
+				defer freeToken()
+				token, err := raw.spanBytes(prevStart, prevEnd)
+				if err != nil {
+					return nil, workingError(err)
+				}
+				extra["previous_response_id"] = token
 				prevID = ""
 				task.mu.Lock()
 				task.nativeParent = true
@@ -350,41 +415,48 @@ func (k *keeper) prepareDiskEnv(ctx context.Context, raw *spool, owner [32]byte,
 		return fail(err)
 	}
 	nItems := 0
-	putItem := func(item []byte) error {
-		if nItems >= maxHistoryItems {
-			return errWorkSize
-		}
-		if nItems > 0 {
-			if err := out.write([]byte(",")); err != nil {
-				return err
-			}
-		}
-		off := f.size
-		if err := out.write(item); err != nil {
-			return err
-		}
-		t.spans = append(t.spans, itemSpan{off, len(item)})
-		nItems++
-		return nil
-	}
 	if prevID != "" {
-		tip, found := lookup(prevID)
-		if !found {
-			f.Close()
-			return nil, &apiError{status: 400, typ: "invalid_request_error", code: "previous_response_not_found", param: "previous_response_id", message: fmt.Sprintf("Previous response with id '%s' not found.", prevID)}
+		history := selected
+		var err error
+		if history == nil {
+			history, err = lookup(prevID)
 		}
-		hashes, err := k.store.tipHashes(tip, owner)
-		if err == errMissingItem {
-			// A foreign owner's alias resolves but its chain does not.
+		if errors.Is(err, errMissingItem) {
 			f.Close()
-			return nil, &apiError{status: 400, typ: "invalid_request_error", code: "previous_response_not_found", param: "previous_response_id", message: fmt.Sprintf("Previous response with id '%s' not found.", prevID)}
+			return nil, previousNotFound(prevID)
 		}
 		if err != nil {
 			return fail(err)
 		}
-		// Stream stored items from mmap into the spool via short read txs.
-		if _, _, err := k.store.writeHistoryTo(hashes, putItem); err != nil {
+		err = history.each(ctx, func(size int64, item io.Reader) error {
+			var separator int64
+			if nItems > 0 {
+				separator = 1
+			}
+			if nItems >= maxHistoryItems || f.size+size+separator > maxHistoryBytes {
+				return errWorkSize
+			}
+			if nItems > 0 {
+				if err := out.write([]byte(",")); err != nil {
+					return err
+				}
+			}
+			off := f.size
+			if _, err := io.CopyBuffer(struct{ io.Writer }{f}, item, copyBuf); err != nil {
+				return err
+			}
+			if err := t.addSpan(itemSpan{off, int(size)}); err != nil {
+				return err
+			}
+			nItems++
+			return nil
+		})
+		closeErr := history.Close()
+		if err != nil {
 			return fail(err)
+		}
+		if closeErr != nil {
+			return fail(closeErr)
 		}
 	}
 	// Client input items: copy spans from the raw request file with a small
@@ -406,7 +478,9 @@ func (k *keeper) prepareDiskEnv(ctx context.Context, raw *spool, owner [32]byte,
 		if f.size-off > maxHistoryBytes {
 			return errWorkSize
 		}
-		t.spans = append(t.spans, itemSpan{off, int(f.size - off)})
+		if err := t.addSpan(itemSpan{off, int(f.size - off)}); err != nil {
+			return err
+		}
 		nItems++
 		return nil
 	}
@@ -434,7 +508,9 @@ func (k *keeper) prepareDiskEnv(ctx context.Context, raw *spool, owner [32]byte,
 		if f.size-off > maxHistoryBytes {
 			return fail(errWorkSize)
 		}
-		t.spans = append(t.spans, itemSpan{off, int(f.size - off)})
+		if err := t.addSpan(itemSpan{off, int(f.size - off)}); err != nil {
+			return fail(err)
+		}
 		nItems++
 	}
 	if err := out.write([]byte("]")); err != nil {
@@ -521,11 +597,36 @@ func (w *spoolWriter) write(p []byte) error {
 // acceptDisk streams the turn's history spans through the store's plan/link
 // path. The encoded history (spans + separators + 2) must fit the replay
 // limit BEFORE staging/linking; overflow rejects the turn so a published
-// alias/pin can always be expanded on the next call. Caller holds the short
-// materialization phase; no nested acquisition.
+// alias/pin can always be expanded on the next call. Input bytes have independent
+// credits; actual store mutation is serialized with cancellable queued admission.
+type diskAcceptance struct {
+	k       *keeper
+	turn    *diskTurn
+	id      string
+	owner   [32]byte
+	oldPin  string
+	pin     bool
+	encoded int64
+	state   *stateLease
+}
+
+func (p *diskAcceptance) close() { p.state.Close() }
+func (p *diskAcceptance) commit(ctx context.Context) (string, error) {
+	_, handle, err := p.k.store.acceptWithBudget(ctx, p.id, p.owner, p.turn.itemSource(), p.oldPin, p.turn.store, p.pin, func() (int64, func()) { return p.k.reserveHistoryCache(p.encoded) })
+	return handle, err
+}
 func (k *keeper) acceptDisk(ctx context.Context, t *diskTurn, id string, owner [32]byte, output []json.RawMessage, oldPin string, pin bool) (string, error) {
-	if err := ctx.Err(); err != nil {
+	p, err := k.prepareAcceptDisk(ctx, t, id, owner, output, oldPin, pin)
+	output = nil
+	if err != nil {
 		return "", err
+	}
+	defer p.close()
+	return p.commit(ctx)
+}
+func (k *keeper) prepareAcceptDisk(ctx context.Context, t *diskTurn, id string, owner [32]byte, output []json.RawMessage, oldPin string, pin bool) (*diskAcceptance, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 	var encoded int64 = 2
 	for _, span := range t.spans {
@@ -535,7 +636,7 @@ func (k *keeper) acceptDisk(ctx context.Context, t *diskTurn, id string, owner [
 		encoded += int64(len(item)) + 1
 	}
 	if encoded > maxHistoryBytes || len(t.spans)+len(output) > maxHistoryItems {
-		return "", errWorkSize
+		return nil, errWorkSize
 	}
 	// Output items are appended to the turn spool so accept replays everything
 	// from disk. Spans already cover input+history; output extends them.
@@ -547,24 +648,21 @@ func (k *keeper) acceptDisk(ctx context.Context, t *diskTurn, id string, owner [
 			}
 			off := t.file.size
 			if _, err := t.file.Write(item); err != nil {
-				return "", err
+				return nil, err
 			}
-			t.spans = append(t.spans, itemSpan{off, len(item)})
+			if err := t.addSpan(itemSpan{off, len(item)}); err != nil {
+				return nil, err
+			}
 		}
 	}
 	if len(t.spans) > maxHistoryItems {
-		return "", errWorkSize
+		return nil, errWorkSize
 	}
-	k.cacheMu.Lock()
-	defer k.cacheMu.Unlock()
-	if k.eventBytes > 0 && k.cfg.maxStoreBytes > 0 {
-		_, history := k.store.stats()
-		if history+k.eventBytes+encoded > k.cfg.maxStoreBytes {
-			return "", errWorkSize
-		}
+	state, err := k.work.state(int64(512+len(id)+len(oldPin)), nil)
+	if err != nil {
+		return nil, err
 	}
-	_, handle, err := k.store.accept(id, owner, t.itemSource(), oldPin, t.store, pin)
-	return handle, err
+	return &diskAcceptance{k: k, turn: t, id: strings.Clone(id), owner: owner, oldPin: strings.Clone(oldPin), pin: pin, encoded: encoded, state: state}, nil
 }
 
 func (k *keeper) forwardDisk(ctx context.Context, upstream *url.URL, path, rawQuery string, header http.Header, t *diskTurn) (*http.Response, error) {

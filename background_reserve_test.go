@@ -71,7 +71,7 @@ func TestBackgroundStormKeepsRecoverySlots(t *testing.T) {
 	}
 	var wg sync.WaitGroup
 	var accepted, rejected atomic.Int32
-	for range maxSockets {
+	for range 65 {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -84,8 +84,8 @@ func TestBackgroundStormKeepsRecoverySlots(t *testing.T) {
 		}()
 	}
 	wg.Wait()
-	if rejected.Load() == 0 {
-		t.Fatalf("storm was not bounded: accepted=%d", accepted.Load())
+	if accepted.Load() != 65 || rejected.Load() != 0 {
+		t.Fatalf("fitting readers hit an arbitrary count gate: accepted=%d rejected=%d", accepted.Load(), rejected.Load())
 	}
 	if status := open(idB); status != http.StatusOK {
 		t.Fatalf("storm on A blocked first reattachment of B: %d (storm accepted=%d rejected=%d)", status, accepted.Load(), rejected.Load())

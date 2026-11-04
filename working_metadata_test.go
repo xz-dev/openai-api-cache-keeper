@@ -23,11 +23,6 @@ func TestRequestMetadataBoundBeforeGrowth(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer raw.Close()
-	leave, err := k.work.enter(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer leave()
 	turn, apiErr := k.prepareDisk(context.Background(), raw, [32]byte{1}, func(string) ([32]byte, bool) { return [32]byte{}, false }, false)
 	if turn != nil {
 		turn.file.Close()

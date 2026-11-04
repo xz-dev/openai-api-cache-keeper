@@ -131,9 +131,21 @@ type spool struct {
 	refs                    int
 	ownerClosed             bool
 	info                    os.FileInfo
+	inputCredits            []func()
+	state                   *stateLease
+	frameState              *stateLease
 }
 
-func (k *keeper) newSpool() (*spool, error) {
+func (k *keeper) newSpool() (_ *spool, err error) {
+	state, err := k.work.state(spoolStateBytes(k.cfg.storeDir), nil)
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		if err != nil {
+			state.Close()
+		}
+	}()
 	ns, marker, err := spoolNamespace(k.cfg.storeDir)
 	if err != nil {
 		return nil, err
@@ -148,7 +160,7 @@ func (k *keeper) newSpool() (*spool, error) {
 		os.Remove(file.Name())
 		return nil, err
 	}
-	f := &spool{File: file, mem: k.work, refs: 1, info: info, offset: int64(len(marker))}
+	f := &spool{File: file, state: state, mem: k.work, refs: 1, info: info, offset: int64(len(marker))}
 	if _, err := f.Write(marker); err != nil {
 		f.Close()
 		return nil, err
@@ -193,6 +205,18 @@ func (f *spool) releaseLocked() error {
 	file := f.File
 	f.File = nil
 	closeErr := file.Close()
+	for _, free := range f.inputCredits {
+		free()
+	}
+	f.inputCredits = nil
+	if f.frameState != nil {
+		f.frameState.Close()
+		f.frameState = nil
+	}
+	if f.state != nil {
+		f.state.Close()
+		f.state = nil
+	}
 	current, err := os.Lstat(file.Name())
 	if err == nil && current.Mode().IsRegular() && os.SameFile(f.info, current) {
 		err = os.Remove(file.Name())

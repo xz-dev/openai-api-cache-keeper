@@ -21,31 +21,35 @@ func waitWorking(t *testing.T, k *keeper, want int) {
 	t.Helper()
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
-		if len(k.work.turns) == want {
+		if k.work.activeTurns.Load() == int64(want) {
 			return
 		}
 		time.Sleep(time.Millisecond)
 	}
-	t.Fatalf("turn slots=%d want=%d", len(k.work.turns), want)
+	t.Fatalf("turn slots=%d want=%d", k.work.activeTurns.Load(), want)
 }
 func TestQueuedWSPingAndCancellation(t *testing.T) {
 	_, srv, k := newLocalTestKeeper(t)
-	leave, err := k.work.enter(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer leave()
+	k.store.mu.Lock()
+	defer k.store.mu.Unlock()
 	conn := dialWS(t, srv, "Bearer queued")
 	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
 	defer cancel()
-	// A real queued message is on disk while phase remains unavailable. The
-	// independent reader must keep processing pings, then notice socket close.
+	// A real turn waits for the serialized store writer, not a processing gate.
+	// The independent reader must keep processing pings, then notice socket close.
 	if err := conn.Write(ctx, websocket.MessageText, []byte(`{"type":"response.create","input":"queued"}`)); err != nil {
 		t.Fatal(err)
 	}
 	waitWorking(t, k, 1)
 	readDone := make(chan struct{})
-	go func() { defer close(readDone); _, _, _ = conn.Read(ctx) }()
+	go func() {
+		defer close(readDone)
+		for {
+			if _, _, err := conn.Read(ctx); err != nil {
+				return
+			}
+		}
+	}()
 	for i := 0; i < 3; i++ {
 		pingCtx, stop := context.WithTimeout(ctx, time.Second)
 		err := conn.Ping(pingCtx)
@@ -64,11 +68,8 @@ func TestQueuedWSPingAndCancellation(t *testing.T) {
 }
 func TestQueuedHTTPCancellationAndOverflow(t *testing.T) {
 	_, srv, k := newLocalTestKeeper(t)
-	leave, err := k.work.enter(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer leave()
+	k.store.mu.Lock()
+	defer k.store.mu.Unlock()
 	ctx, cancel := context.WithCancel(context.Background())
 	req, _ := http.NewRequestWithContext(ctx, "POST", srv.URL+"/v1/responses", strings.NewReader(`{"input":"queued"}`))
 	done := make(chan struct{})
@@ -83,14 +84,13 @@ func TestQueuedHTTPCancellationAndOverflow(t *testing.T) {
 	cancel()
 	<-done
 	waitWorking(t, k, 0)
-	for i := 0; i < maxTurns; i++ {
-		k.work.turns <- struct{}{}
+	freePressure, err := k.work.reserveInput(maxInputWorkingBytes)
+	if err != nil {
+		t.Fatal(err)
 	}
 	status, body, _ := post(t, srv, "Bearer overflow", `{"input":"rejected"}`)
-	for i := 0; i < maxTurns; i++ {
-		<-k.work.turns
-	}
-	if status != 503 || !strings.Contains(body, "working_set_unavailable") {
+	freePressure()
+	if status != 413 || !strings.Contains(body, "working_set_too_large") {
 		t.Fatalf("overflow: %d %s", status, body)
 	}
 	files, _ := filepath.Glob(spoolFilePattern(k.cfg.storeDir))
@@ -121,11 +121,6 @@ func TestEncodedInputDoesNotGrowWithHTMLCharacters(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer raw.Close()
-	leave, err := k.work.enter(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer leave()
 	turn, apiErr := k.prepareDisk(context.Background(), raw, [32]byte{1}, func(string) ([32]byte, bool) { return [32]byte{}, false }, false)
 	if apiErr != nil {
 		t.Fatal(apiErr)

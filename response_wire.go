@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"io"
+	"unicode/utf8"
 )
 
 func encodeResponse(v any) ([]byte, error) {
@@ -15,13 +16,6 @@ func encodeResponse(v any) ([]byte, error) {
 		return nil, err
 	}
 	return bytes.TrimSuffix(b.Bytes(), []byte("\n")), nil
-}
-func rewritePayload(raw []byte, stored bool) ([]byte, error) {
-	obj, err := responseObject(raw)
-	if err != nil {
-		return nil, err
-	}
-	return rewriteParsedPayload(obj, raw, stored)
 }
 
 // responseEventTypes are the known Responses lifecycle events whose payload
@@ -43,69 +37,159 @@ func isResponseEventType(t string) bool {
 	return responseEventTypes[t]
 }
 
+// isResponseEventToken is isResponseEventType on the raw type token, compared
+// without decoding it (tokenIs).
+func isResponseEventToken(tok []byte) bool {
+	for name := range responseEventTypes {
+		if tokenIs(tok, name) {
+			return true
+		}
+	}
+	return false
+}
+
 // responseTypeOf extracts the event's type field from a decoded object.
 func responseTypeOf(obj map[string]json.RawMessage) string {
 	kind, _ := responseString(obj["type"])
 	return kind
 }
 
-func rewriteParsedPayload(obj map[string]json.RawMessage, raw []byte, stored bool) ([]byte, error) {
-	kind, _ := responseString(obj["type"])
-	if nested, ok := obj["response"]; ok && isResponseEventType(kind) {
-		fixed, err := rewriteResponseObject(nested, stored)
-		if err != nil {
-			return nil, err
-		}
-		if bytes.Equal(fixed, nested) {
+// rewritePayload publishes the client-visible id/store for one Response or
+// response-bearing event by splicing value spans: unchanged bytes (key order,
+// whitespace, escapes, unknown fields) are copied verbatim into one exactly
+// sized buffer. It returns raw itself when nothing changes.
+func rewritePayload(raw []byte, stored bool) ([]byte, error) {
+	ms, err := objectMembers(raw)
+	if err != nil {
+		return nil, err
+	}
+	if r := lastMember(ms, "response"); r >= 0 && isResponseEventToken(memberValue(raw, ms, "type")) {
+		nested := raw[ms[r].vs:ms[r].ve]
+		edits, err := responseEdits(nested, stored)
+		if err != nil || len(edits) == 0 {
+			if err != nil {
+				return nil, err
+			}
 			return raw, nil
 		}
-		obj["response"] = fixed
-		return encodeResponse(obj)
+		for i := range edits {
+			edits[i].start += ms[r].vs
+			edits[i].end += ms[r].vs
+		}
+		return splice(raw, append(dropDuplicates(ms, r, "response"), edits...)), nil
 	}
 	// A bare object is a Response only when it declares object:"response";
 	// unrelated events carrying an id must pass through untouched.
-	if string(obj["object"]) != `"response"` {
+	if string(memberValue(raw, ms, "object")) != `"response"` {
 		return raw, nil
 	}
-	return rewriteParsed(obj, raw, stored)
-}
-func rewriteResponseObject(raw []byte, stored bool) ([]byte, error) {
-	obj, err := responseObject(raw)
-	if err != nil {
-		return nil, err
-	}
-	return rewriteParsed(obj, raw, stored)
-}
-
-// rewriteParsed reuses an already decoded object so no event is parsed
-// twice. The id is rewritten whenever the turn is recorded or still
-// undecided (pre-terminal frames cannot know yet); when the caller learned
-// retention failed it passes stored=false AND tells rewriteParsedPayload to
-// bypass rewriting entirely (see rewriteStored=false in responseFrame).
-func rewriteParsed(obj map[string]json.RawMessage, raw []byte, stored bool) ([]byte, error) {
-	id, err := responseString(obj["id"])
-	if err != nil {
-		return nil, err
-	}
-	if id == "" {
-		return raw, nil
-	}
-	changed := false
-	if publicID(id) != id {
-		obj["id"], err = encodeResponse(publicID(id))
+	edits, err := responseEdits(raw, stored)
+	if err != nil || len(edits) == 0 {
 		if err != nil {
 			return nil, err
 		}
-		changed = true
-	}
-	if stored && string(obj["store"]) != "true" {
-		obj["store"] = json.RawMessage("true")
-		changed = true
-	}
-	if !changed {
 		return raw, nil
 	}
-	return encodeResponse(obj)
+	return splice(raw, edits), nil
+}
+
+// responseEventFrame reports whether raw is a known lifecycle event carrying
+// a nested Response (the c.rewrite latch condition).
+func responseEventFrame(raw []byte) bool {
+	ms, err := objectMembers(raw)
+	if err != nil {
+		return false
+	}
+	return lastMember(ms, "response") >= 0 && isResponseEventToken(memberValue(raw, ms, "type"))
+}
+
+type spliceEdit struct {
+	start, end int
+	text       string
+}
+
+// splice copies raw with sorted, non-overlapping edits applied.
+func splice(raw []byte, edits []spliceEdit) []byte {
+	size := len(raw)
+	for _, e := range edits {
+		size += len(e.text) - (e.end - e.start)
+	}
+	out := make([]byte, 0, size)
+	at := 0
+	for _, e := range edits {
+		out = append(out, raw[at:e.start]...)
+		out = append(out, e.text...)
+		at = e.end
+	}
+	return append(out, raw[at:]...)
+}
+
+// dropDuplicates deletes every earlier member named name (keep is the
+// last-wins index), so the output carries one value as the old re-encode did.
+// A deleted member is always followed by its later duplicate.
+func dropDuplicates(ms []jsonMember, keep int, name string) []spliceEdit {
+	var edits []spliceEdit
+	for i := 0; i < keep; i++ {
+		if ms[i].is(name) {
+			edits = append(edits, spliceEdit{start: ms[i].ks, end: ms[i+1].ks})
+		}
+	}
+	return edits
+}
+
+// responseEdits decides the rewrite of one Response object exactly as the old
+// decoded path did: the id is aliased whenever it lacks the resp_ prefix, and
+// a stored turn publishes store:true. The id stays undecoded (only its first
+// five characters are decoded for the prefix check): the alias is the
+// original string token with resp_ inserted after its opening quote. Raw
+// invalid UTF-8 in the id is malformed upstream data.
+func responseEdits(obj []byte, stored bool) ([]spliceEdit, error) {
+	ms, err := objectMembers(obj)
+	if err != nil {
+		return nil, err
+	}
+	idAt := lastMember(ms, "id")
+	if idAt < 0 {
+		return nil, nil
+	}
+	idRaw := obj[ms[idAt].vs:ms[idAt].ve]
+	switch {
+	case idRaw[0] != '"':
+		if string(idRaw) != "null" { // null is an empty id
+			return nil, errUpstreamData
+		}
+		return nil, nil
+	case !utf8.Valid(idRaw):
+		return nil, errUpstreamData
+	case len(idRaw) == 2:
+		return nil, nil
+	}
+	hasPrefix := hasJSONPrefix(idRaw, "resp_")
+	storeAt := lastMember(ms, "store")
+	setStore := stored && (storeAt < 0 || string(obj[ms[storeAt].vs:ms[storeAt].ve]) != "true")
+	if hasPrefix && !setStore {
+		return nil, nil
+	}
+	var edits []spliceEdit
+	for i, m := range ms {
+		switch {
+		case i == idAt:
+			if !hasPrefix {
+				edits = append(edits, spliceEdit{start: m.vs + 1, end: m.vs + 1, text: "resp_"})
+			}
+		case i == storeAt:
+			if setStore {
+				edits = append(edits, spliceEdit{start: m.vs, end: m.ve, text: "true"})
+			}
+		case m.is("id") || m.is("store"):
+			edits = append(edits, spliceEdit{start: m.ks, end: ms[i+1].ks})
+		}
+	}
+	if setStore && storeAt < 0 {
+		end := ms[len(ms)-1].ve
+		edits = append(edits, spliceEdit{start: end, end: end, text: `,"store":true`})
+	}
+	return edits, nil
 }
 
 // Compatibility helper for focused rewrite tests; production propagates errors.
@@ -132,6 +216,10 @@ func rewriteResponse(raw []byte, stored bool) []byte {
 // accumulated first. data-field identification needs only the first five
 // bytes of a line, so lines stay unbounded on disk-side budgets only.
 func readSSE(body io.Reader, onFrame func([]byte) error, onData func([]byte) error, budget ...*workingSet) error {
+	return readSSEOwned(body, onFrame, func(data *responseBuffer, _ suspendResponseFrame) error { return onData(data.data) }, nil, budget...)
+}
+
+func readSSEOwned(body io.Reader, onFrame func([]byte) error, onData func(*responseBuffer, suspendResponseFrame) error, k *keeper, budget ...*workingSet) error {
 	m := newWorkingSet()
 	if len(budget) > 0 {
 		m = budget[0]
@@ -139,7 +227,18 @@ func readSSE(body io.Reader, onFrame func([]byte) error, onData func([]byte) err
 	if !m.reserveOutput(32 << 10) {
 		return errWorkSize
 	}
-	defer m.freeOutput(32 << 10)
+	scannerHeld := true
+	defer func() {
+		if scannerHeld {
+			m.freeOutput(32 << 10)
+		}
+	}()
+	var pending []*spool
+	defer func() {
+		for _, f := range pending {
+			f.Close()
+		}
+	}()
 	r := bufio.NewReaderSize(body, 32<<10)
 	// WHATWG §9.2.6: strip a leading UTF-8 BOM once at the stream head.
 	if b, err := r.Peek(3); err == nil && bytes.Equal(b, []byte("\xef\xbb\xbf")) {
@@ -149,6 +248,37 @@ func readSSE(body io.Reader, onFrame func([]byte) error, onData func([]byte) err
 	defer frame.close()
 	data := responseBuffer{work: m}
 	defer data.close()
+
+	suspend := func() (func() error, error) {
+		unread, err := r.Peek(r.Buffered())
+		if err != nil {
+			return nil, err
+		}
+		frameLen := int64(len(frame.data))
+		saved, err := k.savePendingResponse(frame.data, unread)
+		if err != nil {
+			return nil, err
+		}
+		pending = append(pending, saved)
+		unread = nil
+		frame.close()
+		r = nil
+		m.freeOutput(32 << 10)
+		scannerHeld = false
+		return func() error {
+			if !m.reserveOutput(32 << 10) {
+				return errWorkSize
+			}
+			scannerHeld = true
+			r = bufio.NewReaderSize(io.MultiReader(saved.spanReader(frameLen, saved.size), body), 32<<10)
+			restored, err := readResponseBody(saved.spanReader(0, frameLen), m)
+			if err != nil {
+				return err
+			}
+			frame = *restored
+			return nil
+		}, nil
+	}
 
 	var lineLen int // content bytes on the current line
 	var content int // non-terminator bytes appended since the last dispatch
@@ -166,12 +296,15 @@ func readSSE(body io.Reader, onFrame func([]byte) error, onData func([]byte) err
 			// the stray blank line is still forwarded in the next frame's
 			// raw bytes, keeping the stream byte-faithful.
 			if len(frame.data) > 0 {
-				payload := data.data
-				if len(payload) > 0 && payload[len(payload)-1] == '\n' {
-					payload = payload[:len(payload)-1] // strip the trailing LF added per field
+				if len(data.data) > 0 && data.data[len(data.data)-1] == '\n' {
+					data.data = data.data[:len(data.data)-1]
 				}
-				if data.started && !bytes.Equal(payload, []byte("[DONE]")) {
-					if err := onData(payload); err != nil {
+				if data.started && !bytes.Equal(data.data, []byte("[DONE]")) {
+					var park suspendResponseFrame
+					if k != nil {
+						park = suspend
+					}
+					if err := onData(&data, park); err != nil {
 						return err
 					}
 				}

@@ -284,13 +284,13 @@ func TestRoutingLookupDoesNotHoldMaterializationPhase(t *testing.T) {
 		t.Fatal("routing request did not start")
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
-	leave, err := k.work.enter(ctx)
+	turn, failure := k.prepareDisk(ctx, raw, [32]byte{}, func(string) ([32]byte, bool) { return [32]byte{}, false }, false)
 	cancel()
 	close(release)
-	if err != nil {
-		t.Fatal("network lookup held materialization phase")
+	if failure != nil {
+		t.Fatal("network lookup excluded unrelated input materialization:", failure)
 	}
-	leave()
+	turn.file.Close()
 	if err := <-done; err != nil {
 		t.Fatal(err)
 	}

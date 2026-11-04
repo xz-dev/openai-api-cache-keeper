@@ -185,7 +185,7 @@ func reopenReadOnly(t *testing.T, s *store) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	s.db = ro
+	s.publishGeneration(ro)
 }
 func TestReviewFailedReplacementPreservesOldEntry(t *testing.T) {
 	s := newTestStore(t, time.Hour, 1<<20, 1<<20, 1<<19, 4<<20)

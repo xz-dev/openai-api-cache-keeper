@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -124,11 +123,12 @@ func (f closerFunc) Close() error { return f() }
 // Turns serialize exactly once: while a turn is in flight, later create frames
 // wait. Every other frame — upstream or client — relays immediately.
 func (k *keeper) serveWSNative(w http.ResponseWriter, r *http.Request) {
-	if !trySlot(k.work.sockets) {
-		writeAPIError(w, workingError(errors.New("socket limit")))
+	lease, err := k.work.state(socketStateBytes(r.Header), &k.work.activeSockets)
+	if err != nil {
+		writeAPIError(w, workingError(err))
 		return
 	}
-	defer func() { <-k.work.sockets }()
+	defer lease.Close()
 
 	target := *k.cfg.upstream
 	target.Path = strings.TrimRight(target.Path, "/") + r.URL.Path
@@ -282,17 +282,18 @@ func (k *keeper) serveWSNative(w http.ResponseWriter, r *http.Request) {
 				}
 				return
 			}
-			if !trySlot(k.work.turns) {
+			frameState, stateErr := k.work.state(turnStateBytes(nil), &k.work.activeTurns)
+			if stateErr != nil {
 				if readDiscard(ctx, reader) != nil {
 					clCh <- pumpResult{err: errors.New("client read failed")}
 					return
 				}
-				wsError(ctx, conn, workingError(errors.New("turn limit")))
+				wsError(ctx, conn, workingError(stateErr))
 				continue
 			}
 			f, err := k.spoolRequestUTF8(ctx, reader, typ)
 			if err != nil {
-				<-k.work.turns
+				frameState.Close()
 				if errors.Is(err, errInvalidUTF8) {
 					// RFC 6455 §8.1: invalid UTF-8 in a text message fails
 					// the connection with 1007.
@@ -307,15 +308,14 @@ func (k *keeper) serveWSNative(w http.ResponseWriter, r *http.Request) {
 				}
 				continue
 			}
+			f.frameState = frameState
 			select {
 			case clCh <- pumpResult{frame: wsFrame{typ, f}}:
 			case <-ctx.Done():
 				f.Close()
-				<-k.work.turns
 				return
 			default:
 				f.Close()
-				<-k.work.turns
 				wsError(ctx, conn, workingError(errors.New("socket queue full")))
 			}
 		}
@@ -361,7 +361,6 @@ func (k *keeper) serveWSNative(w http.ResponseWriter, r *http.Request) {
 		releaseInflight()
 		if queued != nil {
 			queued.spool.Close()
-			<-k.work.turns
 			queued = nil
 		}
 		for res := range pumpUp {
@@ -372,7 +371,6 @@ func (k *keeper) serveWSNative(w http.ResponseWriter, r *http.Request) {
 		for res := range pumpCl {
 			if res.frame.spool != nil {
 				res.frame.spool.Close()
-				<-k.work.turns
 			}
 		}
 	}
@@ -382,7 +380,6 @@ func (k *keeper) serveWSNative(w http.ResponseWriter, r *http.Request) {
 		create := f.typ == websocket.MessageText && isWSCreate(f.spool)
 		id, status, hasPrev := k.wsNativeClientFrame(ctx, conn, upstream, r, owner, f, sess, &inflight, &nativeOpen)
 		f.spool.Close()
-		<-k.work.turns
 		if create {
 			turnStart, turnPrevious = start, hasPrev
 			if inflight == nil && !nativeOpen {
@@ -499,7 +496,6 @@ func (k *keeper) serveWSNative(w http.ResponseWriter, r *http.Request) {
 			if !isWSCreate(f.spool) {
 				if err := k.wsRelayFrame(ctx, upstream, f.spool, f.typ); err != nil {
 					f.spool.Close()
-					<-k.work.turns
 					clCh = nil
 					conn.CloseNow()
 					upstream.CloseNow()
@@ -508,14 +504,12 @@ func (k *keeper) serveWSNative(w http.ResponseWriter, r *http.Request) {
 					return
 				}
 				f.spool.Close()
-				<-k.work.turns
 				continue
 			}
 			// Hold at most one create while a turn is in flight; a second
 			// queued create is shed with an explicit overload error.
 			if queued != nil {
 				f.spool.Close()
-				<-k.work.turns
 				wsError(ctx, conn, workingError(errors.New("socket queue full")))
 				continue
 			}
@@ -543,7 +537,6 @@ func (k *keeper) serveWSNative(w http.ResponseWriter, r *http.Request) {
 				}
 				if res.frame.spool != nil {
 					res.frame.spool.Close()
-					<-k.work.turns
 				}
 			default:
 			}
@@ -579,6 +572,15 @@ type wsProbe struct {
 	prevSet           bool
 	generate          bool
 	generateSet       bool
+	err               error
+	frees             []func()
+}
+
+func (p *wsProbe) close() {
+	for _, free := range p.frees {
+		free()
+	}
+	p.frees = nil
 }
 
 // probeWSFrame scans the spooled frame for wsProbe fields with the span
@@ -597,10 +599,22 @@ func probeWSFrame(data *spool) wsProbe {
 				}
 			}
 		case "previous_response_id":
-			if raw := data.keySlice(start, end); raw != nil {
-				if v, ok := readJSONString(raw); ok && v != "" {
-					p.prev, p.prevSet = v, true
-				}
+			// Any-size ID decoded straight from the spool (no raw copy,
+			// invalid UTF-8 refused): charge the decoded string with its
+			// rounding plus the decoder's 4 KiB read buffer.
+			free, err := data.mem.reserveInput(heapBytes(int(end-start)) + 8<<10)
+			if err != nil {
+				p.err = err
+				return nil
+			}
+			p.frees = append(p.frees, free)
+			v, ok, err := data.decodeJSONSpan(start, end)
+			if err != nil {
+				p.err = err
+				return nil
+			}
+			if ok && v != "" {
+				p.prev, p.prevSet = v, true
 			}
 		case "generate":
 			if raw := data.keySlice(start, end); raw != nil {
@@ -613,6 +627,7 @@ func probeWSFrame(data *spool) wsProbe {
 		return nil
 	})
 	if err != nil {
+		p.close()
 		return wsProbe{}
 	}
 	return p
@@ -620,7 +635,9 @@ func probeWSFrame(data *spool) wsProbe {
 
 // isWSCreate reports whether the spooled frame is a response.create object.
 func isWSCreate(data *spool) bool {
-	return probeWSFrame(data).isCreate
+	p := probeWSFrame(data)
+	p.close()
+	return p.isCreate
 }
 
 // wsNativeTerminal reports whether the spooled upstream text frame ends a
@@ -715,11 +732,15 @@ func (k *keeper) wsNativeClientFrame(ctx context.Context, conn, upstream *websoc
 		return "", http.StatusOK, false
 	}
 	probe := probeWSFrame(data)
+	defer probe.close()
 	if !probe.isCreate {
 		if err := k.wsRelayFrame(ctx, upstream, data, f.typ); err != nil {
 			return "", http.StatusBadGateway, false
 		}
 		return "", http.StatusOK, false
+	}
+	if probe.err != nil {
+		return "", wsError(ctx, conn, workingError(probe.err)), true
 	}
 	if probe.prevSet {
 		known, valid := k.store.ownedID(probe.prev, owner)
@@ -734,8 +755,7 @@ func (k *keeper) wsNativeClientFrame(ctx context.Context, conn, upstream *websoc
 			}
 			if !valid {
 				if known || pinned || strings.HasPrefix(probe.prev, keeperResponsePrefix) || probe.prev == sess.lastID {
-					return "", wsError(ctx, conn, &apiError{status: http.StatusBadRequest, typ: "invalid_request_error", code: "previous_response_not_found", param: "previous_response_id",
-						message: fmt.Sprintf("Previous response with id '%s' not found.", probe.prev)}), true
+					return "", wsError(ctx, conn, previousNotFound(probe.prev)), true
 				}
 				// Native parent: the delta is meaningful only downstream.
 				// Forward verbatim and mark the turn so its events stay
@@ -750,21 +770,16 @@ func (k *keeper) wsNativeClientFrame(ctx context.Context, conn, upstream *websoc
 	}
 	// No parent, or a keeper-owned/pinned parent: build the upstream frame on
 	// disk (expanding stored history for an owned parent) and record the turn.
-	lookup := func(id string) ([32]byte, bool) {
+	lookup := func(id string) (*historySnapshot, error) {
 		if id == sess.lastID && sess.lastPin != "" {
-			if tip, _, ok := k.store.resolveID(sess.lastPin, owner, true); ok {
-				return tip, true
+			history, err := k.store.snapshotID(ctx, sess.lastPin, owner, true)
+			if err != errMissingItem {
+				return history, err
 			}
 		}
-		tip, _, ok := k.store.resolveID(id, owner, false)
-		return tip, ok
+		return k.store.snapshotID(ctx, id, owner, false)
 	}
-	leave, err := k.work.enter(ctx)
-	if err != nil {
-		return "", wsError(ctx, conn, workingError(err)), probe.prevSet
-	}
-	t, apiErr := k.prepareDiskEnv(ctx, data, owner, lookup, true, true)
-	leave()
+	t, apiErr := k.prepareDiskSnapshot(ctx, data, owner, lookup, true, true)
 	if apiErr != nil {
 		return "", wsError(ctx, conn, apiErr), probe.prevSet
 	}
@@ -811,32 +826,14 @@ func (k *keeper) wsNativeUpstreamFrame(ctx context.Context, conn *websocket.Conn
 		log.Printf("ws native upstream frame uncharged: %v", err)
 		return endTurn(-1)
 	}
-	defer k.work.freeOutput(int64(cap(raw)))
+	body := &responseBuffer{data: raw, work: k.work}
+	raw = nil
+	defer body.close()
 	terminal := wsNativeTerminal(data)
-	accept := func() (bool, error) {
-		if rid, output, ok := inflight.c.final(); ok && inflight.id == "" {
-			if err := ctx.Err(); err != nil {
-				return false, err
-			}
-			pin, err := k.acceptDisk(ctx, inflight.turn, publicID(rid), inflight.owner, output, sess.lastPin, true)
-			if err != nil {
-				logNotRetained(err)
-				return false, nil
-			}
-			inflight.id = rid
-			if inflight.c.rewrite {
-				inflight.id = publicID(rid)
-			}
-			sess.lastID, sess.lastPin = inflight.id, pin
-			sess.release = func() {
-				if err := k.store.release(pin); err != nil {
-					log.Printf("socket pin cleanup failed (records remain charged): %v", err)
-				}
-			}
-		}
-		return true, nil
+	prepare := func() (*responseAcceptance, error) {
+		return k.prepareSocketAcceptance(ctx, &inflight.c, inflight.turn, inflight.owner, sess, &inflight.id)
 	}
-	wire, release, err := k.responseFrame(ctx, &inflight.c, raw, true, inflight.turn.store, accept)
+	wire, release, _, err := k.responseFrameOwned(ctx, &inflight.c, body, true, inflight.turn.store, prepare, nil)
 	if err != nil {
 		log.Printf("ws native upstream frame failed: %v", err)
 		return endTurn(-1)

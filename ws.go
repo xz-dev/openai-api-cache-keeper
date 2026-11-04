@@ -20,6 +20,25 @@ type wsSession struct {
 	lastID  string // public id of the last completed turn
 	lastPin string // opaque pin handle for the last accepted turn
 	release func() // releases the store pin, if any
+	idFree  func() // owns the retained id independently of the turn collector
+}
+
+func (s *wsSession) reserveID(m *workingSet, id string) (func(), error) {
+	if id == s.lastID {
+		return nil, nil
+	}
+	return m.reserveInput(int64(len(id)))
+}
+
+func (s *wsSession) setID(id string, free func()) {
+	if id == s.lastID {
+		return
+	}
+	old := s.idFree
+	s.lastID, s.idFree = id, free
+	if old != nil {
+		old()
+	}
 }
 
 func (s *wsSession) clear() {
@@ -28,17 +47,22 @@ func (s *wsSession) clear() {
 		s.release = nil
 	}
 	s.lastID, s.lastPin = "", ""
+	if s.idFree != nil {
+		s.idFree()
+		s.idFree = nil
+	}
 }
 
 // serveWS runs the Responses WebSocket mode: each response.create frame is
 // expanded like an HTTP request, sent upstream as streaming HTTP, and every
 // upstream SSE event is relayed back as one text frame. Turns run in order.
 func (k *keeper) serveWS(w http.ResponseWriter, r *http.Request) {
-	if !trySlot(k.work.sockets) {
-		writeAPIError(w, workingError(errors.New("socket limit")))
+	lease, err := k.work.state(socketStateBytes(r.Header), &k.work.activeSockets)
+	if err != nil {
+		writeAPIError(w, workingError(err))
 		return
 	}
-	defer func() { <-k.work.sockets }()
+	defer lease.Close()
 	conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{InsecureSkipVerify: true})
 	if err != nil {
 		return
@@ -65,31 +89,31 @@ func (k *keeper) serveWS(w http.ResponseWriter, r *http.Request) {
 				}
 				continue
 			}
-			if !trySlot(k.work.turns) {
+			frameState, stateErr := k.work.state(turnStateBytes(nil), &k.work.activeTurns)
+			if stateErr != nil {
 				if readDiscard(ctx, reader) != nil {
 					return
 				}
-				wsError(ctx, conn, workingError(errors.New("turn limit")))
+				wsError(ctx, conn, workingError(stateErr))
 				continue
 			}
 			frame, err := k.spoolRequest(ctx, reader)
 			if err != nil {
-				<-k.work.turns
+				frameState.Close()
 				wsError(ctx, conn, workingError(err))
 				if readDiscard(ctx, reader) != nil {
 					return
 				}
 				continue
 			}
+			frame.frameState = frameState
 			select {
 			case frames <- frame:
 			case <-ctx.Done():
 				frame.Close()
-				<-k.work.turns
 				return
 			default:
 				frame.Close()
-				<-k.work.turns
 				wsError(ctx, conn, workingError(errors.New("socket queue full")))
 			}
 		}
@@ -98,10 +122,11 @@ func (k *keeper) serveWS(w http.ResponseWriter, r *http.Request) {
 	sess := &wsSession{}
 	defer sess.clear()
 	for data := range frames {
+		workerState := data.frameState.retain()
 		start := time.Now()
 		id, status, hasPrev := k.wsTurn(ctx, conn, header, owner, data, sess)
 		data.Close()
-		<-k.work.turns
+		workerState()
 		logTurn("ws", status, hasPrev, id, start, k.store)
 		if ctx.Err() != nil {
 			break
@@ -111,7 +136,6 @@ func (k *keeper) serveWS(w http.ResponseWriter, r *http.Request) {
 	_ = conn.CloseNow()
 	for data := range frames {
 		data.Close()
-		<-k.work.turns
 	}
 }
 
@@ -120,20 +144,15 @@ func (k *keeper) wsTurn(ctx context.Context, conn *websocket.Conn, header http.H
 	if routeErr != nil {
 		return "", wsError(ctx, conn, routeErr), false
 	}
-	leave, err := k.work.enter(ctx)
-	if err != nil {
-		return "", wsError(ctx, conn, workingError(err)), false
-	}
-	t, apiErr := k.prepareDisk(ctx, data, owner, func(id string) ([32]byte, bool) {
+	t, apiErr := k.prepareDiskSnapshot(ctx, data, owner, func(id string) (*historySnapshot, error) {
 		if id == sess.lastID && sess.lastPin != "" {
-			if tip, _, ok := k.store.resolveID(sess.lastPin, owner, true); ok {
-				return tip, true
+			history, err := k.store.snapshotID(ctx, sess.lastPin, owner, true)
+			if err != errMissingItem {
+				return history, err
 			}
 		}
-		tip, _, ok := k.store.resolveID(id, owner, false)
-		return tip, ok
-	}, true)
-	leave()
+		return k.store.snapshotID(ctx, id, owner, false)
+	}, true, false)
 	data.Close()
 	if apiErr != nil {
 		return "", wsError(ctx, conn, apiErr), false
@@ -157,43 +176,15 @@ func (k *keeper) wsTurn(ctx context.Context, conn *websocket.Conn, header http.H
 	defer c.release(k.work)
 	id := ""
 	status := resp.StatusCode
-	accept := func() (bool, error) {
-		if rid, output, ok := c.final(); ok && id == "" {
-			if err := ctx.Err(); err != nil {
-				return false, err
-			}
-			pin, err := k.acceptDisk(ctx, t, publicID(rid), owner, output, sess.lastPin, true)
-			if err != nil {
-				// The previous pin stays intact; only this turn is not continuable.
-				logNotRetained(err)
-				return false, nil
-			}
-			// accept replaced the old pin atomically. Failure leaves it intact.
-			// The session pins the id the client actually saw: the resp_ alias
-			// when the turn latched the rewrite, the upstream id otherwise
-			// (store:false turns publish no alias but still pin same-socket
-			// continuation under the upstream id).
-			id = rid
-			if c.rewrite {
-				id = publicID(rid)
-			}
-			sess.lastID, sess.lastPin = id, pin
-			sess.release = func() {
-				if err := k.store.release(pin); err != nil {
-					log.Printf("socket pin cleanup failed (records remain charged): %v", err)
-				}
-			}
-		}
-		return true, nil
-	}
-	err = readSSE(resp.Body, nil, func(event []byte) error {
-		wire, release, err := k.responseFrame(ctx, &c, event, true, t.store, accept)
+	prepare := func() (*responseAcceptance, error) { return k.prepareSocketAcceptance(ctx, &c, t, owner, sess, &id) }
+	err = readSSEOwned(resp.Body, nil, func(event *responseBuffer, suspend suspendResponseFrame) error {
+		wire, release, _, err := k.responseFrameOwned(ctx, &c, event, true, t.store, prepare, suspend)
 		if err != nil {
 			return err
 		}
 		defer release()
 		return conn.Write(ctx, websocket.MessageText, wire)
-	}, k.work)
+	}, k, k.work)
 	if err == nil && !c.done && ctx.Err() == nil {
 		status = wsFailure(ctx, conn, c.responseID(), c.nextSeq(), &apiError{status: 502, typ: "upstream_error", message: "upstream stream ended before terminal response"})
 	}

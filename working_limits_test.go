@@ -1,27 +1,26 @@
 package main
 
 import (
-	"context"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
 )
 
-func TestWorkingWaitExpires(t *testing.T) {
+func TestInputWorkingCreditRefusesWithoutWaiting(t *testing.T) {
 	m := newWorkingSet()
-	leave, err := m.enter(context.Background())
+	release, err := m.reserveInput(maxInputWorkingBytes)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer leave()
+	defer release()
 	start := time.Now()
-	if release, err := m.enter(context.Background()); err == nil {
-		release()
-		t.Fatal("unbounded phase wait")
+	if free, err := m.reserveInput(1); err == nil {
+		free()
+		t.Fatal("working-byte capacity exceeded")
 	}
-	if elapsed := time.Since(start); elapsed < workWait || elapsed > workWait+time.Second {
-		t.Fatalf("wait=%v", elapsed)
+	if time.Since(start) > time.Second {
+		t.Fatal("byte admission waited instead of refusing genuine pressure")
 	}
 }
 func TestStartupTransientCleanup(t *testing.T) {

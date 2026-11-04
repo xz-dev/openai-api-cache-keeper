@@ -207,24 +207,19 @@ func TestReviewCoreOverlappingStageFailure(t *testing.T) {
 	if _, err := s.put("base", owner, "", items(`"preserve"`)); err != nil {
 		t.Fatal(err)
 	}
-	var passes atomic.Int32
+	var stageCalls atomic.Int32
 	staged := make(chan struct{})
 	unblock := make(chan struct{})
 	boom := errors.New("review stage failure AFTER committed batch")
-	failedFactory := func() itemSource {
-		pass := passes.Add(1)
-		i := 0
-		normal := reviewUniqueFactory(80, 64<<10)()
-		return func(buf []byte) ([]byte, error) {
-			if pass == 2 && i == 65 {
-				close(staged)
-				<-unblock
-				return nil, boom
-			}
-			i++
-			return normal(buf)
+	s.stageCommitted = func() error {
+		if stageCalls.Add(1) == 1 {
+			close(staged)
+			<-unblock
+			return boom
 		}
+		return nil
 	}
+	failedFactory := reviewUniqueFactory(80, 64<<10)
 	failed := make(chan error, 1)
 	go func() { _, _, err := s.accept("failed", owner, failedFactory, "", true, false); failed <- err }()
 	select {
@@ -232,7 +227,7 @@ func TestReviewCoreOverlappingStageFailure(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("no committed-stage checkpoint")
 	}
-	// A t.Fatal below must not leave the blocked accept holding store.mu.
+	// A t.Fatal below must not leave the staged producer waiting forever.
 	defer func() {
 		select {
 		case <-unblock:
@@ -264,15 +259,20 @@ func TestReviewCoreOverlappingStageFailure(t *testing.T) {
 	}()
 	select {
 	case err := <-done:
-		t.Fatalf("overlapping accept entered locked staging window: %v", err)
-	case <-time.After(40 * time.Millisecond):
+		if err != nil {
+			t.Fatalf("successful overlap: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("overlapping accept blocked outside an atomic staging transaction")
+	}
+	select {
+	case err := <-failed:
+		t.Fatalf("paused staged producer ended before release: %v", err)
+	default:
 	}
 	close(unblock)
 	if err := <-failed; err != boom {
 		t.Fatalf("failed err=%v", err)
-	}
-	if err := <-done; err != nil {
-		t.Fatalf("successful overlap: %v", err)
 	}
 	roundtrip(t, s, "base", owner, []string{`"preserve"`})
 	if _, ok := s.get("failed", owner); ok {

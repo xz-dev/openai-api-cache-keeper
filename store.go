@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/json"
@@ -10,18 +11,25 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	bolt "go.etcd.io/bbolt"
 	"golang.org/x/sys/unix"
 )
 
-// All mutable cache state belongs to bbolt transactions. The mutex protects
-// database lifetime (including file swaps), not a second set of RAM indexes.
+// Mutations serialize independently of short generation selection and reads.
 // Each node adds ONE item to a content-addressed prefix; full-history fallback
 // therefore shares prefixes too. No response stores a growing hash manifest.
 type store struct {
-	mu                                  sync.Mutex
+	mu                                  storeMutation
+	generationMu                        sync.Mutex
+	current                             *storeGeneration
+	generations                         []*storeGeneration
+	closed                              bool
+	closing                             chan struct{}
+	retiredErr                          error
+	committed                           atomic.Value
 	db                                  *bolt.DB
 	lock                                *os.File
 	dir, path                           string
@@ -29,6 +37,10 @@ type store struct {
 	maxLive, maxMeta, pinMax, compactAt int64
 	maxEntries                          int64
 	now                                 func() time.Time
+	compactCopy                         func(*bolt.DB, *bolt.DB, int64) error
+	stageCommitted                      func() error
+	inputWork                           *workingSet
+	staging                             *preparedStoreSource // protected by mu; owners pay for their plans
 }
 
 const (
@@ -136,7 +148,10 @@ func newStore(dir string, ttl time.Duration, maxLive, maxMeta, pinMax, compactAt
 			compactAt = maxLive * 2
 		}
 	}
-	return &store{db: db, lock: lock, dir: dir, path: path, ttl: ttl, maxLive: maxLive, maxMeta: maxMeta, pinMax: pinMax, compactAt: compactAt, now: time.Now}, nil
+	g := &storeGeneration{db: db, done: make(chan struct{})}
+	s := &store{db: db, current: g, generations: []*storeGeneration{g}, lock: lock, dir: dir, path: path, ttl: ttl, maxLive: maxLive, maxMeta: maxMeta, pinMax: pinMax, compactAt: compactAt, now: time.Now, compactCopy: bolt.Compact, inputWork: newWorkingSet(), closing: make(chan struct{})}
+	s.committed.Store(storeStats{})
+	return s, nil
 }
 
 func fileSizeOf(path string) int64 {
@@ -160,14 +175,22 @@ func encoded(n int64) []byte {
 // These counters exist only inside a write transaction. Rollback also rolls
 // back every reference, deletion, alias, pin and counter.
 type storeTx struct {
+	store              *store
 	tx                 *bolt.Tx
 	live, meta, pinned int64
 }
 
 func (s *store) update(fn func(*storeTx) error) error {
-	return s.db.Update(func(tx *bolt.Tx) error {
+	s.generationMu.Lock()
+	closed := s.closed
+	s.generationMu.Unlock()
+	if closed {
+		return errStoreClosed
+	}
+	var snapshot storeStats
+	err := s.db.Update(func(tx *bolt.Tx) error {
 		b := tx.Bucket(bucketCounts)
-		st := &storeTx{tx: tx, live: number(b.Get([]byte("live"))), meta: number(b.Get([]byte("meta"))), pinned: number(b.Get([]byte("pinned")))}
+		st := &storeTx{store: s, tx: tx, live: number(b.Get([]byte("live"))), meta: number(b.Get([]byte("meta"))), pinned: number(b.Get([]byte("pinned")))}
 		if err := fn(st); err != nil {
 			return err
 		}
@@ -176,8 +199,20 @@ func (s *store) update(fn func(*storeTx) error) error {
 				return err
 			}
 		}
+		// Bucket.Stats reports pre-spill KeyN in a writable transaction.
+		if err := tx.Bucket(bucketResponses).ForEach(func(_, _ []byte) error {
+			snapshot.entries++
+			return nil
+		}); err != nil {
+			return err
+		}
+		snapshot.live = st.live
 		return nil
 	})
+	if err == nil {
+		s.committed.Store(snapshot)
+	}
+	return err
 }
 
 // Node: parent[32], item hash[32], owner[32], references[8]. A zero item
@@ -212,11 +247,19 @@ func (st *storeTx) ref(id []byte, delta int64) error {
 			if number(r[8:]) == 1 {
 				st.live -= number(r[:8])
 				st.meta -= hashMetaOverhead
-				if err := refs.Delete(h); err != nil {
-					return err
-				}
-				if err := st.tx.Bucket(bucketItems).Delete(h); err != nil {
-					return err
+				if st.store.stagedItem(h) {
+					next := append([]byte(nil), r...)
+					copy(next[8:], encoded(0))
+					if err := refs.Put(h, next); err != nil {
+						return err
+					}
+				} else {
+					if err := refs.Delete(h); err != nil {
+						return err
+					}
+					if err := st.tx.Bucket(bucketItems).Delete(h); err != nil {
+						return err
+					}
 				}
 			} else {
 				next := append([]byte(nil), r...)
@@ -428,7 +471,7 @@ func (st *storeTx) sweepOrphans() error {
 	}
 	c := refs.Cursor()
 	for k, v := c.First(); k != nil; k, v = c.Next() {
-		if len(v) == 16 && number(v[8:]) == 0 {
+		if len(v) == 16 && number(v[8:]) == 0 && !st.store.stagedItem(k) {
 			orphans = append(orphans, append([]byte(nil), k...))
 			bytes += number(v[:8])
 			if bytes >= batch {
@@ -503,23 +546,48 @@ func (s *store) put(id string, owner [32]byte, _ string, full []json.RawMessage)
 // and the final link transaction touches only small node/alias/pin rows.
 // Any failure rejects the turn: unlinked staged items are swept as orphans.
 func (s *store) accept(id string, owner [32]byte, next itemFactory, oldPin string, registered, pinned bool) (string, string, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if err := s.maintainLocked(); err != nil {
-		return "", "", err
-	}
-	plan, err := s.planChain(owner, next())
+	return s.acceptContext(context.Background(), id, owner, next, oldPin, registered, pinned)
+}
+
+func (s *store) acceptContext(ctx context.Context, id string, owner [32]byte, source itemFactory, oldPin string, registered, pinned bool) (string, string, error) {
+	return s.acceptWithBudget(ctx, id, owner, source, oldPin, registered, pinned, nil)
+}
+
+func (s *store) acceptWithBudget(ctx context.Context, id string, owner [32]byte, source itemFactory, oldPin string, registered, pinned bool, reserve func() (int64, func())) (string, string, error) {
+	prepared, err := s.prepareStoreSource(ctx, owner, source)
 	if err != nil {
 		return "", "", err
 	}
-	if len(plan.newItems) > 0 {
-		if err := s.writeNewItems(next(), plan.newItems); err != nil {
-			_ = s.update(func(st *storeTx) error { return st.sweepOrphans() })
-			return "", "", err
-		}
+	defer prepared.Close()
+	if err := s.acquireMutation(ctx); err != nil {
+		return "", "", err
 	}
+	if err := s.maintainLocked(); err != nil {
+		s.mu.Unlock()
+		return "", "", err
+	}
+	prepared.stageNext, s.staging = s.staging, prepared
+	prepared.staging = true
+	s.mu.Unlock()
+	if err := s.writePreparedItems(ctx, prepared); err != nil {
+		return "", "", err
+	}
+	if err := s.acquireMutation(ctx); err != nil {
+		return "", "", err
+	}
+	defer s.mu.Unlock()
+	var sharedLimit int64 = -1
+	if reserve != nil {
+		var release func()
+		sharedLimit, release = reserve()
+		defer release()
+	}
+	plan := prepared.plan
 	var node, pin string
 	err = s.update(func(st *storeTx) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		responses := st.tx.Bucket(bucketResponses)
 		entries := int64(responses.Stats().KeyN)
 		if registered {
@@ -574,7 +642,7 @@ func (s *store) accept(id string, owner [32]byte, next itemFactory, oldPin strin
 		if st.pinned > s.pinMax {
 			return errStoreBudget
 		}
-		for (s.maxLive > 0 && st.live > s.maxLive) || st.meta > s.maxMeta || (s.maxEntries > 0 && entries > s.maxEntries) {
+		for (s.maxLive > 0 && st.live > s.maxLive) || (sharedLimit >= 0 && st.live > sharedLimit) || st.meta > s.maxMeta || (s.maxEntries > 0 && entries > s.maxEntries) {
 			var victim []byte
 			var oldest int64
 			if err := responses.ForEach(func(k, v []byte) error {
@@ -600,8 +668,6 @@ func (s *store) accept(id string, owner [32]byte, next itemFactory, oldPin strin
 		return nil
 	})
 	if err != nil {
-		// Staged items the rolled-back link never adopted are orphans.
-		_ = s.update(func(st *storeTx) error { return st.sweepOrphans() })
 		return "", "", err
 	}
 	return node, pin, nil
@@ -629,7 +695,7 @@ func (s *store) compactLocked() error {
 	if err != nil {
 		return err
 	}
-	if err = bolt.Compact(dst, s.db, 1<<20); err != nil {
+	if err = s.compactCopy(dst, s.db, 1<<20); err != nil {
 		dst.Close()
 		os.Remove(tmp)
 		return err
@@ -639,19 +705,12 @@ func (s *store) compactLocked() error {
 		os.Remove(tmp)
 		return err
 	}
-	old := s.db
-	s.db = dst
-	return old.Close()
+	s.publishGeneration(dst)
+	return nil
 }
 func (s *store) stats() (entries int, bytes int64) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	_ = s.db.View(func(tx *bolt.Tx) error {
-		entries = tx.Bucket(bucketResponses).Stats().KeyN
-		bytes = number(tx.Bucket(bucketCounts).Get([]byte("live")))
-		return nil
-	})
-	return
+	snapshot := s.committed.Load().(storeStats)
+	return snapshot.entries, snapshot.live
 }
 func (s *store) diskUsage() int64 { s.mu.Lock(); defer s.mu.Unlock(); return fileSizeOf(s.path) }
 
@@ -660,9 +719,7 @@ func (s *store) diskUsage() int64 { s.mu.Lock(); defer s.mu.Unlock(); return fil
 // without a private path or protocol flag. A miss on a known local id (wrong
 // owner or expired) must fail closed, so callers can refuse to forward it.
 func (s *store) ownedID(id string, owner [32]byte) (known bool, valid bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.db.View(func(tx *bolt.Tx) error {
+	_ = s.view(func(tx *bolt.Tx) error {
 		entry := tx.Bucket(bucketResponses).Get([]byte(id))
 		if entry == nil {
 			return nil
@@ -689,7 +746,29 @@ func (s *store) forget(id string) error {
 func (s *store) close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	err := s.db.Close()
+	s.generationMu.Lock()
+	if s.closed {
+		s.generationMu.Unlock()
+		return nil
+	}
+	s.closed = true
+	close(s.closing)
+	current := s.current
+	current.retired = true
+	closeNow := current.refs == 0
+	generations := append([]*storeGeneration(nil), s.generations...)
+	s.generationMu.Unlock()
+	if closeNow {
+		current.err = current.db.Close()
+		close(current.done)
+	}
+	var err = s.retiredErr
+	for _, generation := range generations {
+		<-generation.done
+		if err == nil {
+			err = generation.err
+		}
+	}
 	if s.lock != nil {
 		e := s.lock.Close()
 		s.lock = nil

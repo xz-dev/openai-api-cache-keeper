@@ -115,7 +115,7 @@ func newKeeperFixture(t *testing.T, local bool, opts ...func(*config)) (*fakeUps
 		for _, task := range tasks {
 			select {
 			case <-task.finished:
-			case <-time.After(workWait):
+			case <-time.After(8 * time.Second):
 				t.Error("background task did not stop")
 			}
 		}

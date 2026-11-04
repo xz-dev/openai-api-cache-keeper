@@ -2,7 +2,6 @@ package main
 
 import (
 	"errors"
-	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -41,12 +40,12 @@ func (k *keeper) newNativeProxy() *httputil.ReverseProxy {
 // incremental and unrelated traffic keeps its exact semantics.
 func (k *keeper) serveNative(w http.ResponseWriter, r *http.Request) {
 	if isUpgradeRequest(r) {
-		// Native tunnels share the documented live-WebSocket bound.
-		if !trySlot(k.work.sockets) {
-			writeAPIError(w, errNativeSocketLimit)
+		lease, err := k.work.state(socketStateBytes(r.Header), &k.work.activeSockets)
+		if err != nil {
+			writeAPIError(w, workingError(err))
 			return
 		}
-		defer func() { <-k.work.sockets }()
+		defer lease.Close()
 	}
 	k.native.ServeHTTP(w, r)
 }
@@ -140,6 +139,11 @@ func (s *spanSource) Read(p []byte) (int, error) {
 // an apiError so the local parent context is never sent to the native upstream
 // nor silently lost; unknown ids are native and pass through.
 func (k *keeper) ownedLocalPreviousID(spool *spool, owner [32]byte) (id string, owned bool, apiErr *apiError) {
+	release, err := k.work.reserveInput(4*min(spool.size, 128<<10) + 192<<10)
+	if err != nil {
+		return "", false, workingError(err)
+	}
+	defer release()
 	id, present := nativePreviousID(io.NewSectionReader(spool.File, spool.offset, spool.size))
 	if !present {
 		return "", false, nil
@@ -158,8 +162,7 @@ func (k *keeper) ownedLocalPreviousID(spool *spool, owner [32]byte) (id string, 
 		}
 	}
 	if !valid && (known || strings.HasPrefix(id, keeperResponsePrefix)) {
-		return id, true, &apiError{status: http.StatusBadRequest, typ: "invalid_request_error", code: "previous_response_not_found", param: "previous_response_id",
-			message: fmt.Sprintf("Previous response with id '%s' not found.", id)}
+		return id, true, previousNotFound(id)
 	}
 	return id, known && valid, nil
 }

@@ -158,7 +158,7 @@ func TestBackgroundSlowValidatorStorm(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	var wg sync.WaitGroup
-	for range maxSockets {
+	for range 65 {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -172,15 +172,15 @@ func TestBackgroundSlowValidatorStorm(t *testing.T) {
 	}
 	defer wg.Wait()
 	deadline := time.Now().Add(3 * time.Second)
-	for stalled.Load() < maxTaskReaders {
+	for stalled.Load() < 65 {
 		if time.Now().After(deadline) {
 			t.Fatalf("storm never reached validator: %d", stalled.Load())
 		}
 		time.Sleep(time.Millisecond)
 	}
 	time.Sleep(100 * time.Millisecond)
-	if n := stalled.Load(); n > maxTaskReaders {
-		t.Errorf("storm on one task reached validator %d times (cap %d)", n, maxTaskReaders)
+	if n := stalled.Load(); n != 65 {
+		t.Errorf("fitting reader fanout was refused before validator: %d want65", n)
 	}
 	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, srv.URL+"/v1/responses/"+idB+"?stream=true&starting_after=0", nil)
 	req.Header.Set("Authorization", "Bearer owner")
@@ -236,7 +236,7 @@ func reviewCall(k *keeper, rawQuery, credential string) (status int) {
 // Cancel is applied even when the task's local reader budget is full.
 func TestBackgroundCancelAtReaderCap(t *testing.T) {
 	k, task := reviewTask(func(*http.Request) (*http.Response, error) { return billingReply(http.StatusOK), nil })
-	task.done, task.readers = false, maxTaskReaders
+	task.done, task.readers = false, 65
 	r := httptest.NewRequest(http.MethodPost, "/v1/responses/resp_ck_review/cancel", nil)
 	r.Header.Set("Authorization", "Bearer owner")
 	w := httptest.NewRecorder()
@@ -262,7 +262,7 @@ func TestBackgroundMalformedCursorQueryRejected(t *testing.T) {
 // billing share the task's reader budget, and a stalled pool of them can
 // starve later readers until they release or the upstream decides.
 func TestBackgroundCallersShareTaskBudget(t *testing.T) {
-	entered, release := make(chan struct{}, maxTaskReaders), make(chan struct{})
+	entered, release := make(chan struct{}, 4), make(chan struct{})
 	k, _ := reviewTask(func(r *http.Request) (*http.Response, error) {
 		if r.Header.Get("Authorization") != "Bearer owner" {
 			entered <- struct{}{}
@@ -281,55 +281,21 @@ func TestBackgroundCallersShareTaskBudget(t *testing.T) {
 		wg.Add(1)
 		go func() { defer wg.Done(); reviewCall(k, "", credential) }()
 	}
-	for range maxTaskReaders {
+	for range 4 {
 		select {
 		case <-entered:
 		case <-time.After(3 * time.Second):
 			t.Fatal("foreign callers never reached billing")
 		}
 	}
-	// The budget is shared: stalled callers fill it and the next reader is
-	// denied until they release.
-	if got := reviewCall(k, "", "owner"); got != http.StatusServiceUnavailable {
-		t.Fatalf("shared budget should deny a further reader: status=%d", got)
+	// Fitting authenticated readers remain independent of stalled foreign callers.
+	if got := reviewCall(k, "", "owner"); got != http.StatusOK {
+		t.Fatalf("fitting owner reader was refused: status=%d", got)
 	}
 }
 
-// The decoded event map stays charged while acceptance (which may materialize
-// history) runs, and every path returns the budget to zero.
-func TestParsedEventChargedDuringAccept(t *testing.T) {
-	k := &keeper{work: newWorkingSet()}
-	raw := []byte(`{"type":"response.completed","response":{"id":"resp_up","status":"completed","output":[]},"opaque":"` + strings.Repeat("x", 512<<10) + `"}`)
-	for _, acceptErr := range []error{io.ErrClosedPipe, nil} {
-		var c collector
-		var observed int64
-		wire, release, parsed, err := k.responseFrameParsed(context.Background(), &c, raw, true, false, func() (bool, error) {
-			k.work.mu.Lock()
-			observed = k.work.output
-			k.work.mu.Unlock()
-			return false, acceptErr
-		})
-		if err != acceptErr {
-			t.Fatalf("accept error lost: %v", err)
-		}
-		if observed < int64(len(raw)) {
-			t.Errorf("decoded map uncharged during accept: output=%d raw=%d", observed, len(raw))
-		}
-		if acceptErr == nil && (parsed == nil || !bytes.Equal(wire, raw)) {
-			t.Errorf("unchanged event lost its parsed map")
-		}
-		if release != nil {
-			release()
-		}
-		c.release(k.work)
-		if k.work.output != 0 {
-			t.Fatalf("output not balanced (acceptErr=%v): %d", acceptErr, k.work.output)
-		}
-	}
-}
-
-// Many medium values accumulate allocator slack beyond their encoded length;
-// the held charge must cover the decoded map's real capacities.
+// Many medium values: the escaping map's values alias the charged wire copy,
+// and its keys/table stay charged until release.
 func TestParsedChargeCoversManyMediumFields(t *testing.T) {
 	var b strings.Builder
 	b.WriteString(`{"type":"ping"`)
@@ -338,22 +304,25 @@ func TestParsedChargeCoversManyMediumFields(t *testing.T) {
 	}
 	b.WriteByte('}')
 	raw := []byte(b.String())
-	m := newWorkingSet()
+	k := &keeper{work: newWorkingSet()}
 	var c collector
-	obj, held, err := c.collectParsed(raw, m, true)
-	if err != nil {
-		t.Fatal(err)
+	wire, release, obj, err := k.responseFrameParsed(context.Background(), &c, raw, true, false, nil)
+	if err != nil || obj == nil || string(wire) != string(raw) {
+		t.Fatal(err, obj == nil)
 	}
-	var live int64
+	var keys int64
 	for key, value := range obj {
-		live += int64(len(key) + cap(value))
+		keys += int64(len(key))
+		if len(value) > 0 && (&value[0] == &raw[0] || cap(value) != len(value)) {
+			t.Fatal("map value does not alias the owned wire copy")
+		}
 	}
-	if held < live || m.output < held+c.charged {
-		t.Errorf("held=%d live=%d output=%d collector=%d", held, live, m.output, c.charged)
+	if k.work.output < c.charged+int64(cap(wire))+keys {
+		t.Errorf("output=%d collector=%d wire=%d keys=%d", k.work.output, c.charged, cap(wire), keys)
 	}
-	m.freeOutput(held)
-	c.release(m)
-	if m.output != 0 {
-		t.Fatalf("output not balanced: %d", m.output)
+	release()
+	c.release(k.work)
+	if k.work.output != 0 {
+		t.Fatalf("output not balanced: %d", k.work.output)
 	}
 }
