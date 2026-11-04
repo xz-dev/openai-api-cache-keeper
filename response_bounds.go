@@ -278,9 +278,10 @@ func responseError(err error) *apiError {
 }
 
 func (m *workingSet) reserveOutput(n int64) bool {
+	limit, current, ok := m.cgroupRead()
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if m.output+n > maxCollectedBytes {
+	if m.output+n > maxCollectedBytes || m.headroomLocked(n, limit, current, ok) != nil {
 		return false
 	}
 	m.output += n

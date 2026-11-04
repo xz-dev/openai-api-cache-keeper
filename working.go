@@ -72,9 +72,11 @@ type workingSet struct {
 	output        int64
 	input         int64
 	statfs        func(fd int, st *unix.Statfs_t) error // free-space source; nil = unix.Fstatfs
+	cg            *cgroupMem
+	cgroup        func() (limit, current int64, ok bool) // test hook; nil = cg
 }
 
-func newWorkingSet() *workingSet { return &workingSet{} }
+func newWorkingSet() *workingSet { return &workingSet{cg: openCgroupMem()} }
 
 // previousNotFound never echoes an unbounded client id: the message carries
 // at most a 64-byte UTF-8-safe prefix (the lookup itself used the full id).
@@ -102,6 +104,10 @@ func workingError(err error) *apiError {
 	var refused *authRefusal
 	if errors.As(err, &refused) {
 		return refused.e
+	}
+	var mem *insufficientMemoryError
+	if errors.As(err, &mem) {
+		return insufficientMemory(mem)
 	}
 	var floor *storageFloorError
 	if errors.As(err, &floor) {

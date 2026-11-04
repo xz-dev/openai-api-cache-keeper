@@ -16,21 +16,25 @@ const requestCopyCredit int64 = 96 << 10    // 32-KiB copy plus UTF-8 tail/growt
 const parseMetadataCredit int64 = 512 << 10 // scanner/keys/maps and bounded item-span overlap
 
 func (m *workingSet) reserveInput(n int64) (func(), error) {
-	if !m.tryInput(n) {
-		return nil, errWorkSize
+	if err := m.tryInput(n); err != nil {
+		return nil, err
 	}
 	var once sync.Once
 	return func() { once.Do(func() { m.freeInput(n) }) }, nil
 }
 
-func (m *workingSet) tryInput(n int64) bool {
+func (m *workingSet) tryInput(n int64) error {
+	limit, current, ok := m.cgroupRead()
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if n < 0 || n > maxInputWorkingBytes-m.input {
-		return false
+		return errWorkSize
+	}
+	if err := m.headroomLocked(n, limit, current, ok); err != nil {
+		return err
 	}
 	m.input += n
-	return true
+	return nil
 }
 
 func (m *workingSet) freeInput(n int64) {
