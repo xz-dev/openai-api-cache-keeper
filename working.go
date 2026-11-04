@@ -14,12 +14,15 @@ import (
 	"sync"
 	"sync/atomic"
 	"unicode/utf8"
+	"unsafe"
 )
 
 // Bounds for the unchanged 384-MiB envelope. Slow upstreams retain disk files,
 // while simultaneously materialized scratch is admitted by actual byte credits.
 const (
-	maxHistoryBytes int64 = 64 << 20
+	// The expanded history spool follows the 256 MiB end-to-end cap (design
+	// D1); it lives on disk, never in the heap.
+	maxHistoryBytes int64 = 256 << 20
 	maxEventBytes         = 1 << 20
 	// maxResponseItems bounds the output array of ONE upstream response
 	// object (itself bounded by maxResponseBytes) so its slice header is a
@@ -33,6 +36,25 @@ const (
 )
 
 var errWorkSize = errors.New("encoded history or response exceeds working limit")
+
+// sizeLimitError is a size refusal that names the hop, the limit and its
+// setting (design D7); it still matches errWorkSize.
+type sizeLimitError struct {
+	code, what, setting string
+	limit               int64
+}
+
+func (e *sizeLimitError) Error() string {
+	return fmt.Sprintf("keeper: %s exceeds the %d-byte limit (%s)", e.what, e.limit, e.setting)
+}
+
+func (e *sizeLimitError) Is(target error) bool { return target == errWorkSize }
+
+var errHistorySize error = &sizeLimitError{code: "history_too_large", what: "the expanded history", setting: "keeper history limit", limit: maxHistoryBytes}
+
+func requestSizeError(limit int64) error {
+	return &sizeLimitError{code: "request_too_large", what: "the request body or frame", setting: "MAX_REQUEST_BYTES", limit: limit}
+}
 
 // Output and input scratch have independent, non-waiting byte accounting.
 // Fixed connection admission remains until its lifecycle-credit slice lands.
@@ -64,7 +86,14 @@ func previousNotFound(id string) *apiError {
 
 func workingError(err error) *apiError {
 	var tooLarge *http.MaxBytesError
-	if errors.Is(err, errWorkSize) || errors.As(err, &tooLarge) {
+	var named *sizeLimitError
+	if errors.As(err, &tooLarge) {
+		err = requestSizeError(tooLarge.Limit)
+	}
+	if errors.As(err, &named) {
+		return &apiError{status: 413, typ: "invalid_request_error", code: named.code, message: named.Error()}
+	}
+	if errors.Is(err, errWorkSize) {
 		return &apiError{status: 413, typ: "invalid_request_error", code: "working_set_too_large", message: err.Error()}
 	}
 	return &apiError{status: 503, typ: "server_error", code: "working_set_unavailable", message: "Working capacity unavailable; retry later."}
@@ -83,7 +112,7 @@ func (k *keeper) spoolRequest(ctx context.Context, r io.Reader) (*spool, error) 
 	// Hide os.File.ReadFrom so CopyBuffer cannot bypass byte accounting.
 	n, err := io.CopyBuffer(struct{ io.Writer }{f}, io.LimitReader(contextReader{ctx, r}, k.cfg.maxRequestBytes+1), make([]byte, 32<<10))
 	if err == nil && n > k.cfg.maxRequestBytes {
-		err = errWorkSize
+		err = requestSizeError(k.cfg.maxRequestBytes)
 	}
 	if err == nil {
 		err = ctx.Err()
@@ -230,13 +259,35 @@ func (k *keeper) prepareDiskSnapshot(ctx context.Context, raw *spool, owner [32]
 	// then the remaining fields sorted by key.
 	var other []fieldSpan
 	seen := map[string]int{}
-	putOther := func(name string, start, end int64) {
+	var frees []func()
+	defer func() {
+		for _, free := range frees {
+			free()
+		}
+	}()
+	charge := func(n int64) error {
+		free, err := k.work.reserveInput(n)
+		if err == nil {
+			frees = append(frees, free)
+		}
+		return err
+	}
+	putOther := func(name string, start, end int64) error {
 		if i, ok := seen[name]; ok {
 			other[i] = fieldSpan{name, start, end}
-			return
+			return nil
+		}
+		// Top-level field count is bounded only by bytes: charge each new
+		// field's slice slot (with doubling overlap), the seen/spans map
+		// entries, the keys slot, the name, and its JSON re-encode buffer
+		// (6x escape, doubled by bytes.Buffer growth).
+		if err := charge(5*int64(unsafe.Sizeof(fieldSpan{})) + 128 + 14*heapBytes(len(name))); err != nil {
+			readErr = err
+			return err
 		}
 		seen[name] = len(other)
 		other = append(other, fieldSpan{name, start, end})
+		return nil
 	}
 	// Input item spans recorded as offsets in the RAW request file; nothing
 	// is copied until expansion writes the upstream spool in history order.
@@ -250,7 +301,7 @@ func (k *keeper) prepareDiskSnapshot(ctx context.Context, raw *spool, owner [32]
 			// Routed mode drops this field on ordinary turns; the pure
 			// single-upstream cache is not a policy filter and forwards it.
 			if task != nil || k.cfg.upstream != nil {
-				putOther(name, start, end)
+				return putOther(name, start, end)
 			}
 		case "input":
 			b := raw.keySlice(start, min(end, start+1))
@@ -288,10 +339,14 @@ func (k *keeper) prepareDiskSnapshot(ctx context.Context, raw *spool, owner [32]
 			}
 		case "previous_response_id":
 			// Any-size ID decoded straight from the spool (no raw copy, invalid
-			// UTF-8 refused): the id plus the store lookup's key copy fit
-			// inputParseCredit (2*raw).
+			// UTF-8 refused): charge the id, the store lookup's key copy and
+			// the decoder's read buffer.
 			if end-start == 4 && string(raw.keySlice(start, end)) == "null" {
 				return nil
+			}
+			if err := charge(2*heapBytes(int(end-start)) + 8<<10); err != nil {
+				readErr = err
+				return err
 			}
 			id, ok, err := raw.decodeJSONSpan(start, end)
 			if err != nil {
@@ -314,18 +369,18 @@ func (k *keeper) prepareDiskSnapshot(ctx context.Context, raw *spool, owner [32]
 					return nil
 				}
 				if wsEnvelope {
-					putOther(name, start, end)
+					return putOther(name, start, end)
 				}
 				return nil
 			}
-			putOther(name, start, end)
+			return putOther(name, start, end)
 		case "store":
 			if v := raw.keySlice(start, end); v != nil {
 				t.store = string(v) != "false"
 			}
-			putOther(name, start, end)
+			return putOther(name, start, end)
 		default:
-			putOther(name, start, end)
+			return putOther(name, start, end)
 		}
 		return nil
 	})
@@ -414,7 +469,7 @@ func (k *keeper) prepareDiskSnapshot(ctx context.Context, raw *spool, owner [32]
 			return fail(err)
 		}
 		if f.size > maxHistoryBytes {
-			return fail(errWorkSize)
+			return fail(errHistorySize)
 		}
 		if err := out.write([]byte(`,`)); err != nil {
 			return fail(err)
@@ -444,7 +499,7 @@ func (k *keeper) prepareDiskSnapshot(ctx context.Context, raw *spool, owner [32]
 				separator = 1
 			}
 			if f.size+size+separator > maxHistoryBytes {
-				return errWorkSize
+				return errHistorySize
 			}
 			if nItems > 0 {
 				if err := out.write([]byte(",")); err != nil {
@@ -483,7 +538,7 @@ func (k *keeper) prepareDiskSnapshot(ctx context.Context, raw *spool, owner [32]
 			return err
 		}
 		if f.size-off > maxHistoryBytes {
-			return errWorkSize
+			return errHistorySize
 		}
 		if err := t.addSpan(itemSpan{off, int(f.size - off)}); err != nil {
 			return err
@@ -513,7 +568,7 @@ func (k *keeper) prepareDiskSnapshot(ctx context.Context, raw *spool, owner [32]
 			return fail(err)
 		}
 		if f.size-off > maxHistoryBytes {
-			return fail(errWorkSize)
+			return fail(errHistorySize)
 		}
 		if err := t.addSpan(itemSpan{off, int(f.size - off)}); err != nil {
 			return fail(err)
@@ -568,14 +623,14 @@ func (k *keeper) prepareDiskSnapshot(ctx context.Context, raw *spool, owner [32]
 			return fail(err)
 		}
 		if f.size > maxHistoryBytes {
-			return fail(errWorkSize)
+			return fail(errHistorySize)
 		}
 	}
 	if err := out.write([]byte("}")); err != nil {
 		return fail(err)
 	}
 	if f.size > maxHistoryBytes {
-		return fail(errWorkSize)
+		return fail(errHistorySize)
 	}
 	if k.cfg.ignoreClientStoreFalse {
 		t.store = true
@@ -595,7 +650,7 @@ type spoolWriter struct {
 
 func (w *spoolWriter) write(p []byte) error {
 	if w.f.size+int64(len(p)) > w.limit {
-		return errWorkSize
+		return errHistorySize
 	}
 	_, err := w.f.Write(p)
 	return err
@@ -643,7 +698,7 @@ func (k *keeper) prepareAcceptDisk(ctx context.Context, t *diskTurn, id string, 
 		encoded += int64(len(item)) + 1
 	}
 	if encoded > maxHistoryBytes {
-		return nil, errWorkSize
+		return nil, errHistorySize
 	}
 	// Output items are appended to the turn spool so accept replays everything
 	// from disk. Spans already cover input+history; output extends them.

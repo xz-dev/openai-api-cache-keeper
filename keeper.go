@@ -148,7 +148,7 @@ func (k *keeper) localCheckpointTurn(w http.ResponseWriter, r *http.Request) (re
 	}
 	defer lease.Close()
 	if r.ContentLength > k.cfg.maxRequestBytes {
-		writeAPIError(w, workingError(errWorkSize))
+		writeAPIError(w, workingError(requestSizeError(k.cfg.maxRequestBytes)))
 		return nil, false, false, true
 	}
 	raw, err := k.spoolRequest(r.Context(), http.MaxBytesReader(w, r.Body, k.cfg.maxRequestBytes))

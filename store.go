@@ -140,7 +140,7 @@ func newStore(dir string, ttl time.Duration, maxLive, maxMeta, pinMax, compactAt
 	if maxLive > 0 && (pinMax <= 0 || pinMax > maxLive) {
 		pinMax = maxLive / 2
 	} else if pinMax <= 0 {
-		pinMax = 100 << 20
+		pinMax = 256 << 20
 	}
 	if compactAt <= 0 {
 		compactAt = 400 << 20

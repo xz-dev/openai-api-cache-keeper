@@ -2,14 +2,11 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
 	"sync"
 	"time"
-
-	"golang.org/x/sys/unix"
 )
 
 // Input mappings, scanner/copy windows and retained span metadata share this
@@ -42,29 +39,16 @@ func (m *workingSet) freeInput(n int64) {
 	m.mu.Unlock()
 }
 
-// Validate the complete JSON without Decoder retaining a whole ignored value.
-// The mapping stays accounted by the caller until it is unmapped.
+// validSpoolJSON validates the complete body in constant memory: the spool
+// is streamed through validJSONStream, never mapped or decoded whole.
 func validSpoolJSON(ctx context.Context, raw *spool) error {
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	mapped, err := unix.Mmap(int(raw.File.Fd()), 0, int(raw.offset+raw.size), unix.PROT_READ, unix.MAP_PRIVATE)
-	if err != nil {
-		return err
-	}
-	valid := json.Valid(mapped[raw.offset:])
-	unmapErr := unix.Munmap(mapped)
-	if !valid {
-		return errJSONSyntax
-	}
-	if unmapErr != nil {
-		return unmapErr
-	}
-	return ctx.Err()
+	return validJSONStream(ctx, io.NewSectionReader(raw.File, raw.offset, raw.size))
 }
 
-func inputParseCredit(raw *spool) int64 {
-	return 2*raw.size + parseMetadataCredit
+// inputParseCredit is the fixed scan skeleton (design D2). It does not grow
+// with the body; per-field and decoded-id heap is charged where allocated.
+func inputParseCredit(*spool) int64 {
+	return jsonValidateCredit + parseMetadataCredit
 }
 
 func spoolFlags(ctx context.Context, raw *spool) (stream, background bool, err error) {

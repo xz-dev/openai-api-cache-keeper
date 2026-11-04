@@ -363,7 +363,7 @@ func TestWSNativeStorageFailureServesTurn(t *testing.T) {
 }
 
 // A frame beyond the request budget is rejected like in local mode: the turn
-// gets an explicit working_set_too_large error frame, then the socket closes
+// gets an explicit request_too_large error frame, then the socket closes
 // with StatusMessageTooBig rather than serving a partial read.
 func TestWSNativeOversizeFrame(t *testing.T) {
 	_, srv, _ := newWSNativeKeeper(t, func(c *config) { c.maxRequestBytes = 128 })
@@ -380,7 +380,7 @@ func TestWSNativeOversizeFrame(t *testing.T) {
 		t.Fatalf("oversize turn: err=%v frame=%s", err, data)
 	}
 	errObj, _ := ev["error"].(map[string]any)
-	if errObj["code"] != "working_set_too_large" {
+	if errObj["code"] != "request_too_large" {
 		t.Fatalf("oversize code: %v", ev)
 	}
 	_, _, err = c.Read(ctx)

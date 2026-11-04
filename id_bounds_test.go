@@ -99,7 +99,7 @@ func TestPrepareDiskSnapshotPrevIDWithinCredit(t *testing.T) {
 		if tc.native {
 			ctx = context.WithValue(ctx, backgroundTaskKey{}, task)
 		}
-		credit := inputParseCredit(input)
+		credit := inputParseCredit(input) + 2*heapBytes(len(tc.id)+2) + 8<<10 // skeleton + decoded id
 		if tc.native {
 			credit += heapBytes(len(tc.id) + 2) // the forwarded token's own credit
 		}

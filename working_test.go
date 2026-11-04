@@ -108,7 +108,8 @@ func TestRequestExactCeilingAndOversize(t *testing.T) {
 		t.Fatalf("exact ceiling: %d %s", status, body)
 	}
 	status, body, _ = post(t, srv, "Bearer size", request+" ")
-	if status != 413 || !strings.Contains(body, "working_set_too_large") {
+	// The refusal names the setting and its limit (design D7).
+	if status != 413 || !strings.Contains(body, "request_too_large") || !strings.Contains(body, "4096-byte limit (MAX_REQUEST_BYTES)") {
 		t.Fatalf("oversize: %d %s", status, body)
 	}
 	waitWorking(t, k, 0)
@@ -142,7 +143,8 @@ func TestExpandedHistoryBoundBeforeCopy(t *testing.T) {
 	s := newTestStore(t, time.Hour, 2<<20, 1<<20, 1<<20, 4<<20)
 	owner := [32]byte{1}
 	raw, _ := json.Marshal(strings.Repeat("X", 1<<20))
-	full := make([]json.RawMessage, 65)
+	n := int(maxHistoryBytes>>20) + 1
+	full := make([]json.RawMessage, n)
 	for i := range full {
 		full[i] = raw
 	}
@@ -152,7 +154,7 @@ func TestExpandedHistoryBoundBeforeCopy(t *testing.T) {
 	}
 	// Refusal never deletes accepted reference or truncates its history.
 	got, ok := s.get("large-expanded", owner)
-	if !ok || len(got) != 65 {
+	if !ok || len(got) != n {
 		t.Fatal("refusal changed accepted history")
 	}
 }

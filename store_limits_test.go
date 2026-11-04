@@ -162,7 +162,7 @@ func TestStoreUnlimitedEntriesAndWriteBasedTTL(t *testing.T) {
 func TestStoreUnlimitedBytesKeepsPinSafetyBudget(t *testing.T) {
 	s := newTestStore(t, time.Hour, 0, 0, 0, 0)
 	s.maxEntries = 1
-	if s.pinMax != 100<<20 || s.maxMeta != 32<<20 || s.compactAt != 400<<20 {
+	if s.pinMax != 256<<20 || s.maxMeta != 32<<20 || s.compactAt != 400<<20 {
 		t.Fatalf("safety budgets pin=%d meta=%d compact=%d", s.pinMax, s.maxMeta, s.compactAt)
 	}
 	o := [32]byte{1}

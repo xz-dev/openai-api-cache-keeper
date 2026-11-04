@@ -113,7 +113,7 @@ func loadConfig() (config, error) {
 	if cfg.maxStoreEntries, err = envNonNegativeInt("STORE_MAX_ENTRIES", 100); err != nil {
 		return config{}, err
 	}
-	if cfg.maxRequestBytes, err = envPositiveInt("MAX_REQUEST_BYTES", 32<<20); err != nil {
+	if cfg.maxRequestBytes, err = envPositiveInt("MAX_REQUEST_BYTES", 256<<20); err != nil {
 		return config{}, err
 	}
 	cfg.storeDir = os.Getenv("STORE_DIR")
@@ -123,7 +123,7 @@ func loadConfig() (config, error) {
 	if cfg.storeMetaBytes, err = envPositiveInt("STORE_META_MAX_BYTES", 32<<20); err != nil {
 		return config{}, err
 	}
-	if cfg.storePinBytes, err = envPositiveInt("STORE_PIN_MAX_BYTES", 100<<20); err != nil {
+	if cfg.storePinBytes, err = envPositiveInt("STORE_PIN_MAX_BYTES", 256<<20); err != nil {
 		return config{}, err
 	}
 	if cfg.storeCompactBytes, err = envPositiveInt("STORE_COMPACT_BYTES", 400<<20); err != nil {
