@@ -8,7 +8,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
-	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -61,7 +60,7 @@ func TestQueuedWSPingAndCancellation(t *testing.T) {
 	conn.CloseNow()
 	<-readDone
 	waitWorking(t, k, 0)
-	files, _ := filepath.Glob(spoolFilePattern(k.cfg.storeDir))
+	files, _ := openSpoolFiles(k.cfg.storeDir)
 	if len(files) != 0 {
 		t.Fatalf("queued cancel leaked files: %v", files)
 	}
@@ -93,7 +92,7 @@ func TestQueuedHTTPCancellationAndOverflow(t *testing.T) {
 	if status != 413 || !strings.Contains(body, "working_set_too_large") {
 		t.Fatalf("overflow: %d %s", status, body)
 	}
-	files, _ := filepath.Glob(spoolFilePattern(k.cfg.storeDir))
+	files, _ := openSpoolFiles(k.cfg.storeDir)
 	if len(files) != 0 {
 		t.Fatal("cancel/overflow leaked spool")
 	}
@@ -170,7 +169,7 @@ func TestSpoolBudgetAndDiskErrorCleanup(t *testing.T) {
 	k.work.mu.Lock()
 	k.work.disk = 0
 	k.work.mu.Unlock()
-	files, _ := filepath.Glob(spoolFilePattern(k.cfg.storeDir))
+	files, _ := openSpoolFiles(k.cfg.storeDir)
 	if len(files) != 0 {
 		t.Fatal("failed spool leaked file")
 	}
@@ -224,14 +223,12 @@ func TestSpoolRemovedAfterSuccessfulTurns(t *testing.T) {
 		}
 	}
 	waitWorking(t, k, 0)
-	files, err := os.ReadDir(filepath.Join(k.cfg.storeDir, spoolDirName))
+	files, err := openSpoolFiles(k.cfg.storeDir)
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, f := range files {
-		if strings.HasPrefix(f.Name(), "turn-") {
-			t.Fatal("success leaked spool")
-		}
+	if len(files) != 0 {
+		t.Fatalf("success leaked spool: %v", files)
 	}
 	k.work.mu.Lock()
 	disk, output := k.work.disk, k.work.output

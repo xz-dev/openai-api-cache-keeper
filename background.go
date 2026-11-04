@@ -504,7 +504,7 @@ func (t *responseTask) follow(w http.ResponseWriter, r *http.Request, after int,
 				}
 				// Hide optional ReaderFrom/WriterTo paths: this window is the
 				// only send-copy buffer and remains charged through blocked writes.
-				copied, err := io.CopyBuffer(struct{ io.Writer }{w}, struct{ io.Reader }{io.NewSectionReader(body.spool.File, body.spool.offset+offset, n)}, copyBuffer)
+				copied, err := io.CopyBuffer(struct{ io.Writer }{w}, struct{ io.Reader }{body.spool.section(offset, n)}, copyBuffer)
 				if err != nil {
 					return err
 				}
@@ -713,7 +713,7 @@ func (k *keeper) taskOperation(w http.ResponseWriter, r *http.Request) bool {
 	w.Header().Set("Content-Type", "application/json")
 	if body != nil {
 		response := make(json.RawMessage, 0, n)
-		err = readSSE(io.NewSectionReader(body.spool.File, body.spool.offset+final+8, n), nil, func(data []byte) error {
+		err = readSSE(body.spool.section(final+8, n), nil, func(data []byte) error {
 			event := struct {
 				Response json.RawMessage `json:"response"`
 			}{Response: response}

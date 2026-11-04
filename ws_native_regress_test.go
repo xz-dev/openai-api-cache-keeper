@@ -7,7 +7,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
-	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -143,7 +142,7 @@ func TestRegressionDisconnectCleanup(t *testing.T) {
 	k.work.mu.Lock()
 	disk, output := k.work.disk, k.work.output
 	k.work.mu.Unlock()
-	paths, _ := filepath.Glob(spoolFilePattern(k.cfg.storeDir))
+	paths, _ := openSpoolFiles(k.cfg.storeDir)
 	if disk != 0 || output != 0 || len(paths) != 0 {
 		t.Fatalf("after client disconnect: disk=%d output=%d spoolFiles=%d; want all zero", disk, output, len(paths))
 	}

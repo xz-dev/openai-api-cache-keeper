@@ -1,84 +1,48 @@
 package main
 
 import (
-	"bytes"
-	"crypto/rand"
-	"encoding/hex"
 	"errors"
+	"fmt"
 	"io"
-	"log"
 	"os"
 	"path/filepath"
-	"strings"
 	"sync"
 
 	"golang.org/x/sys/unix"
 )
 
 const spoolDirName = ".keeper-spools"
-const spoolMarker = "response-keeper-spool-v1:"
 
-// A private marked namespace plus per-file marker identifies our stale files.
-// Merely sharing a filename prefix, directory, or UID is not ownership proof.
-func spoolNamespace(dir string) (string, []byte, error) {
+// Spools are anonymous O_TMPFILE files (design D3): they never have a name,
+// so a crash frees them when the kernel closes the fd. A regular file in the
+// spool directory therefore is not ours and refuses startup.
+func spoolDir(dir string) (string, error) {
 	ns := filepath.Join(dir, spoolDirName)
-	err := os.Mkdir(ns, 0700)
-	if err == nil {
-		var token [32]byte
-		if _, err := rand.Read(token[:]); err != nil {
-			return "", nil, err
-		}
-		marker := []byte(spoolMarker + hex.EncodeToString(token[:]) + "\n")
-		f, err := os.OpenFile(filepath.Join(ns, "owner"), os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
-		if err != nil {
-			return "", nil, err
-		}
-		_, writeErr := f.Write(marker)
-		closeErr := f.Close()
-		if writeErr != nil {
-			return "", nil, writeErr
-		}
-		if closeErr != nil {
-			return "", nil, closeErr
-		}
-		return ns, marker, nil
-	}
-	if !os.IsExist(err) {
-		return "", nil, err
+	if err := os.Mkdir(ns, 0700); err != nil && !os.IsExist(err) {
+		return "", err
 	}
 	info, err := os.Lstat(ns)
-	if err != nil || !info.IsDir() {
-		return "", nil, errors.New("spool namespace is not an owned directory")
-	}
-	f, err := openSpoolRegular(filepath.Join(ns, "owner"))
 	if err != nil {
-		return "", nil, err
+		return "", err
 	}
-	defer f.Close()
-	marker, err := io.ReadAll(io.LimitReader(f, int64(len(spoolMarker)+66)))
-	if err != nil || len(marker) != len(spoolMarker)+65 || !bytes.HasPrefix(marker, []byte(spoolMarker)) || marker[len(marker)-1] != '\n' {
-		return "", nil, errors.New("unrecognized spool namespace owner")
+	if !info.IsDir() || info.Mode().Perm() != 0700 {
+		return "", fmt.Errorf("configuration error: spool dir %s must be a 0700 directory (mode %v)", ns, info.Mode())
 	}
-	if _, err := hex.DecodeString(string(marker[len(spoolMarker) : len(marker)-1])); err != nil {
-		return "", nil, err
-	}
-	return ns, marker, nil
+	return ns, nil
 }
-func openSpoolRegular(path string) (*os.File, error) {
-	fd, err := unix.Open(path, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_NONBLOCK, 0)
+
+func openAnonymous(ns string) (*os.File, error) {
+	fd, err := unix.Open(ns, unix.O_TMPFILE|unix.O_RDWR|unix.O_CLOEXEC, 0600)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("configuration error: spool dir %s rejects O_TMPFILE: %w", ns, err)
 	}
-	f := os.NewFile(uintptr(fd), path)
-	info, err := f.Stat()
-	if err != nil || !info.Mode().IsRegular() {
-		f.Close()
-		return nil, errors.New("not a regular spool file")
-	}
-	return f, nil
+	return os.NewFile(uintptr(fd), filepath.Join(ns, "(anonymous)")), nil
 }
-func cleanupTransient(dir string) error {
-	ns, marker, err := spoolNamespace(dir)
+
+// checkSpools is the startup assert: the spool directory holds no regular
+// file, and its filesystem supports anonymous files. No sweep, no timer.
+func checkSpools(dir string) error {
+	ns, err := spoolDir(dir)
 	if err != nil {
 		return err
 	}
@@ -86,41 +50,16 @@ func cleanupTransient(dir string) error {
 	if err != nil {
 		return err
 	}
-	for _, entry := range entries {
-		if !strings.HasPrefix(entry.Name(), "turn-") {
-			continue
-		}
-		path := filepath.Join(ns, entry.Name())
-		before, err := os.Lstat(path)
-		if err != nil {
-			return err
-		}
-		if !before.Mode().IsRegular() {
-			continue
-		}
-		f, err := openSpoolRegular(path)
-		if err != nil {
-			return err
-		}
-		actual, statErr := f.Stat()
-		header := make([]byte, len(marker))
-		_, readErr := io.ReadFull(f, header)
-		f.Close()
-		if statErr != nil || readErr != nil || !os.SameFile(before, actual) || !bytes.Equal(header, marker) {
-			continue
-		}
-		current, err := os.Lstat(path)
-		if err != nil {
-			return err
-		}
-		if !os.SameFile(actual, current) || !current.Mode().IsRegular() {
-			continue
-		}
-		if err := os.Remove(path); err != nil {
-			return err
+	for _, e := range entries {
+		if e.Type().IsRegular() {
+			return fmt.Errorf("configuration error: spool dir holds regular file %s; spools are anonymous, remove it", filepath.Join(ns, e.Name()))
 		}
 	}
-	return nil
+	f, err := openAnonymous(ns)
+	if err != nil {
+		return err
+	}
+	return f.Close()
 }
 
 type spool struct {
@@ -128,11 +67,11 @@ type spool struct {
 	mem                     *workingSet
 	size, offset, diskBytes int64
 	dropped                 int64 // file offset below which written pages were synced and evicted
+	reads                   readWindow
 	skip                    int64 // reserved prefix bytes requestBody does not send
 	mu                      sync.Mutex
 	refs                    int
 	ownerClosed             bool
-	info                    os.FileInfo
 	inputCredits            []func()
 	state                   *stateLease
 	frameState              *stateLease
@@ -172,27 +111,15 @@ func (k *keeper) newSpool() (_ *spool, err error) {
 			state.Close()
 		}
 	}()
-	ns, marker, err := spoolNamespace(k.cfg.storeDir)
+	ns, err := spoolDir(k.cfg.storeDir)
 	if err != nil {
 		return nil, err
 	}
-	file, err := os.CreateTemp(ns, "turn-*")
+	file, err := openAnonymous(ns)
 	if err != nil {
 		return nil, err
 	}
-	info, err := file.Stat()
-	if err != nil {
-		file.Close()
-		os.Remove(file.Name())
-		return nil, err
-	}
-	f := &spool{File: file, state: state, mem: k.work, refs: 1, info: info, offset: int64(len(marker))}
-	if _, err := f.Write(marker); err != nil {
-		f.Close()
-		return nil, err
-	}
-	f.size = 0
-	return f, nil
+	return &spool{File: file, state: state, mem: k.work, refs: 1}, nil
 }
 func (f *spool) Write(p []byte) (int, error) {
 	f.mem.mu.Lock()
@@ -221,15 +148,13 @@ func (f *spool) Write(p []byte) (int, error) {
 // ReadAt evicts large reads at once (design D3 read-side fadvise).
 func (f *spool) ReadAt(p []byte, off int64) (int, error) {
 	n, err := f.File.ReadAt(p, off+f.offset)
-	if int64(n) >= 1<<20 {
-		dropCache(f.File, off+f.offset, int64(n), false)
-	}
+	f.reads.note(f.File, n)
 	return n, err
 }
 
 // section streams [off, off+n) of the payload with read-side eviction.
 func (f *spool) section(off, n int64) io.Reader {
-	return newCacheDropReader(f.File, f.offset+off, n)
+	return &cacheDropReader{f: f.File, w: &f.reads, off: f.offset + off, end: f.offset + off + n}
 }
 func (f *spool) Close() error {
 	if f == nil {
@@ -263,48 +188,31 @@ func (f *spool) releaseLocked() error {
 		f.state.Close()
 		f.state = nil
 	}
-	current, err := os.Lstat(file.Name())
-	if err == nil && current.Mode().IsRegular() && os.SameFile(f.info, current) {
-		err = os.Remove(file.Name())
-	} else if err == nil {
-		err = errors.New("spool path replaced; refusing unowned cleanup")
-	}
-	if err == nil {
-		f.mem.mu.Lock()
-		f.mem.disk -= f.diskBytes
-		f.mem.mu.Unlock()
-	} else {
-		log.Printf("transient cleanup failed; bytes remain charged: %v", err)
-	}
-	if f.ticket != nil && err == nil { // the bytes are gone; a failed removal keeps the reservation
+	// The last close frees an anonymous file's blocks even when it reports an error.
+	f.mem.mu.Lock()
+	f.mem.disk -= f.diskBytes
+	f.mem.mu.Unlock()
+	if f.ticket != nil {
 		f.ticket.unref()
 		f.ticket = nil
 	}
-	if closeErr != nil {
-		return closeErr
-	}
-	return err
+	return closeErr
 }
 
 // The transport owns a reference until Request.Body.Close, even if RoundTrip
 // returns early. Handler completion alone cannot close/uncharge its open file.
 type spoolBody struct {
 	*io.SectionReader
-	spool   *spool
-	file    *os.File
-	dropped int64 // payload offset below which read pages were evicted
-	once    sync.Once
-	err     error
+	spool *spool
+	file  *os.File
+	once  sync.Once
+	err   error
 }
 
 // Read evicts each sent window (design D3 read-side fadvise).
 func (b *spoolBody) Read(p []byte) (int, error) {
 	n, err := b.SectionReader.Read(p)
-	pos, _ := b.SectionReader.Seek(0, io.SeekCurrent)
-	if pos-b.dropped >= spoolCacheWindow || (err != nil && pos > b.dropped) {
-		dropCache(b.file, b.spool.offset+b.spool.skip+b.dropped, pos-b.dropped, false)
-		b.dropped = pos
-	}
+	b.spool.reads.note(b.file, n)
 	return n, err
 }
 
@@ -321,4 +229,3 @@ func (b *spoolBody) Close() error {
 	b.once.Do(func() { b.spool.mu.Lock(); defer b.spool.mu.Unlock(); b.err = b.spool.releaseLocked() })
 	return b.err
 }
-func spoolFilePattern(dir string) string { return filepath.Join(dir, spoolDirName, "turn-*") }

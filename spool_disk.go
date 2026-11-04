@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"sync/atomic"
 
 	"golang.org/x/sys/unix"
 )
@@ -54,20 +55,30 @@ func dropCache(f *os.File, off, n int64, sync bool) {
 	_ = unix.Fadvise(fd, off, n, unix.FADV_DONTNEED)
 }
 
-// cacheDropReader reads [off, end) of f and evicts each read window, so a
-// full pass over a large spool keeps at most spoolCacheWindow cached.
-type cacheDropReader struct {
-	f                 *os.File
-	off, end, dropped int64
+// readWindow counts the bytes read from one spool through every read path.
+// fadvise drops only whole pages inside its range, so a per-span drop of a
+// small item frees nothing and a pass over many small items would keep the
+// whole spool cached. Instead every spoolCacheWindow of reads drops the
+// whole file's clean pages (design D3 read-side fadvise).
+type readWindow struct{ n atomic.Int64 }
+
+func (w *readWindow) note(f *os.File, n int) {
+	if n > 0 && w.n.Add(int64(n)) >= spoolCacheWindow {
+		w.n.Store(0)
+		_ = unix.Fadvise(int(f.Fd()), 0, 0, unix.FADV_DONTNEED)
+	}
 }
 
-func newCacheDropReader(f *os.File, off, n int64) *cacheDropReader {
-	return &cacheDropReader{f: f, off: off, end: off + n, dropped: off}
+// cacheDropReader reads [off, end) of f, noting each read in its spool's
+// window, so a full pass keeps at most about spoolCacheWindow cached.
+type cacheDropReader struct {
+	f        *os.File
+	w        *readWindow
+	off, end int64
 }
 
 func (r *cacheDropReader) Read(p []byte) (int, error) {
 	if r.off >= r.end {
-		r.drop()
 		return 0, io.EOF
 	}
 	if rem := r.end - r.off; int64(len(p)) > rem {
@@ -75,18 +86,11 @@ func (r *cacheDropReader) Read(p []byte) (int, error) {
 	}
 	n, err := r.f.ReadAt(p, r.off)
 	r.off += int64(n)
-	if r.off-r.dropped >= spoolCacheWindow || r.off >= r.end || err != nil {
-		r.drop()
-	}
+	r.w.note(r.f, n)
 	if err == io.EOF && n > 0 {
 		err = nil
 	}
 	return n, err
-}
-
-func (r *cacheDropReader) drop() {
-	dropCache(r.f, r.dropped, r.off-r.dropped, false)
-	r.dropped = r.off
 }
 
 // checkSpoolDir refuses a memory-backed spool directory at startup.

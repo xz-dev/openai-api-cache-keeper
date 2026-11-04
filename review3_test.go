@@ -11,7 +11,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
-	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
@@ -133,7 +132,7 @@ func TestReview3WriteErrorReleasesInflight(t *testing.T) {
 	k.work.mu.Lock()
 	output := k.work.output
 	k.work.mu.Unlock()
-	paths, _ := filepath.Glob(spoolFilePattern(k.cfg.storeDir))
+	paths, _ := openSpoolFiles(k.cfg.storeDir)
 	if in.c.charged != 0 || output != 0 || !turn.file.ownerClosed {
 		t.Errorf("failed-write cleanup missing: collector=%d output=%d turn.closed=%v files=%d", in.c.charged, output, turn.file.ownerClosed, len(paths))
 	}

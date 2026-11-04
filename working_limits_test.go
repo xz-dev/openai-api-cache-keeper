@@ -1,8 +1,6 @@
 package main
 
 import (
-	"os"
-	"path/filepath"
 	"testing"
 	"time"
 )
@@ -21,35 +19,6 @@ func TestInputWorkingCreditRefusesWithoutWaiting(t *testing.T) {
 	}
 	if time.Since(start) > time.Second {
 		t.Fatal("byte admission waited instead of refusing genuine pressure")
-	}
-}
-func TestStartupTransientCleanup(t *testing.T) {
-	dir := t.TempDir()
-	k := &keeper{cfg: config{storeDir: dir}, work: newWorkingSet()}
-	f, err := k.newSpool()
-	if err != nil {
-		t.Fatal(err)
-	}
-	stale := f.Name()
-	if _, err := f.Write([]byte("private")); err != nil {
-		t.Fatal(err)
-	}
-	// Simulate process death: close FD without normal unlink/account release.
-	if err := f.File.Close(); err != nil {
-		t.Fatal(err)
-	}
-	untouched := filepath.Join(dir, "unrelated")
-	if err := os.WriteFile(untouched, []byte("keep"), 0600); err != nil {
-		t.Fatal(err)
-	}
-	if err := cleanupTransient(dir); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := os.Stat(stale); !os.IsNotExist(err) {
-		t.Fatal("stale file remains")
-	}
-	if _, err := os.Stat(untouched); err != nil {
-		t.Fatal("unrelated file removed")
 	}
 }
 func TestCollectorRefusalBeforeDecode(t *testing.T) {

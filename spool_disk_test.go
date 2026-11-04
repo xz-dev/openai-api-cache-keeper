@@ -140,6 +140,25 @@ func TestSpoolPageCacheBounded(t *testing.T) {
 		t.Fatalf("after body read: %d bytes cached", r)
 	}
 	body.Close()
+	// Many small items (text histories): per-span drops cover no whole page,
+	// so only the spool-wide read window bounds these passes.
+	buf := make([]byte, 1000)
+	for off := int64(0); off+1000 <= f.size; off += 1000 {
+		if _, err := io.Copy(io.Discard, f.section(off, 1000)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if r := residentBytes(t, f.File); r > limit {
+		t.Fatalf("after small-span sections: %d bytes cached", r)
+	}
+	for off := int64(0); off+1000 <= f.size; off += 1000 {
+		if _, err := f.ReadAt(buf, off); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if r := residentBytes(t, f.File); r > limit {
+		t.Fatalf("after small ReadAt pass: %d bytes cached", r)
+	}
 }
 
 func TestCheckSpoolDirRefusesTmpfs(t *testing.T) {

@@ -42,9 +42,9 @@ func newKeeper(cfg config) *keeper {
 		log.Fatalf("store: %v", err)
 	}
 	st.maxEntries = cfg.maxStoreEntries
-	if err := cleanupTransient(cfg.storeDir); err != nil {
+	if err := checkSpools(cfg.storeDir); err != nil {
 		st.close()
-		log.Fatalf("transient cleanup: %v", err)
+		log.Fatalf("spools: %v", err)
 	}
 	ledgerDir, memInfo := cfg.ledgerDir, cfg.memInfoPath
 	if ledgerDir == "" {

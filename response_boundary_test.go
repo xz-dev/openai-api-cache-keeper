@@ -9,8 +9,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
-	"os"
-	"path/filepath"
 	"runtime"
 	"strings"
 	"sync"
@@ -241,44 +239,6 @@ func TestTruncatedWSTurnPreservesAcceptedPin(t *testing.T) {
 	}
 	inspectStore(t, k.store)
 }
-func TestOwnedSpoolCleanupPreservesForeignEntries(t *testing.T) {
-	dir := t.TempDir()
-	k := &keeper{cfg: config{storeDir: dir}, work: newWorkingSet()}
-	f, err := k.newSpool()
-	if err != nil {
-		t.Fatal(err)
-	}
-	owned := f.Name()
-	f.Write([]byte("private"))
-	f.File.Close()
-	ns := filepath.Join(dir, spoolDirName)
-	foreign := []string{filepath.Join(dir, "turn-foreign"), filepath.Join(ns, "turn-foreign"), filepath.Join(ns, "turn-link"), filepath.Join(ns, "turn-dir")}
-	for _, name := range foreign[:2] {
-		if err := os.WriteFile(name, []byte("foreign"), 0600); err != nil {
-			t.Fatal(err)
-		}
-	}
-	target := filepath.Join(t.TempDir(), "outside")
-	os.WriteFile(target, []byte("outside"), 0600)
-	if err := os.Symlink(target, foreign[2]); err != nil {
-		t.Fatal(err)
-	}
-	os.Mkdir(foreign[3], 0700)
-	if err := cleanupTransient(dir); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := os.Lstat(owned); !os.IsNotExist(err) {
-		t.Fatal("owned stale spool survived")
-	}
-	for _, name := range foreign {
-		if _, err := os.Lstat(name); err != nil {
-			t.Fatalf("foreign entry deleted: %s", name)
-		}
-	}
-	if data, err := os.ReadFile(target); err != nil || string(data) != "outside" {
-		t.Fatal("symlink target touched")
-	}
-}
 func TestSpoolBodyOwnsChargeUntilClose(t *testing.T) {
 	_, _, k := newTestKeeper(t)
 	f, err := k.newSpool()
@@ -286,7 +246,6 @@ func TestSpoolBodyOwnsChargeUntilClose(t *testing.T) {
 		t.Fatal(err)
 	}
 	f.Write([]byte("payload"))
-	name := f.Name()
 	body, err := f.requestBody()
 	if err != nil {
 		t.Fatal(err)
@@ -309,7 +268,7 @@ func TestSpoolBodyOwnsChargeUntilClose(t *testing.T) {
 	if k.work.disk != 0 {
 		t.Fatal("body close charge leaked")
 	}
-	if _, err := os.Lstat(name); !os.IsNotExist(err) {
-		t.Fatal("body close leaked spool")
+	if open, _ := openSpoolFiles(k.cfg.storeDir); len(open) != 0 {
+		t.Fatalf("body close leaked spool: %v", open)
 	}
 }

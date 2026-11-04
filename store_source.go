@@ -204,6 +204,9 @@ func (s *store) prepareStoreSource(ctx context.Context, owner [32]byte, source i
 		return nil, e
 	}
 	p.mappingRelease = free
+	if p.file.offset+p.file.size == 0 {
+		return p, nil // an empty history has nothing to map
+	}
 	p.mapped, err = unix.Mmap(int(p.file.File.Fd()), 0, int(p.file.offset+p.file.size), unix.PROT_READ, unix.MAP_PRIVATE)
 	if err != nil {
 		return nil, err

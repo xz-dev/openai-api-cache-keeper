@@ -8,7 +8,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
-	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -302,9 +301,10 @@ func TestBackgroundCompletedTTLAndRestart(t *testing.T) {
 	}
 }
 
-// Event log write failure invalidates the task; failed cleanup keeps bytes charged.
+// Event log write failure invalidates the task. (Anonymous spools have no
+// path to replace, so the old refused-cleanup mode no longer exists.)
 func TestBackgroundLogWriteAndCleanupFailure(t *testing.T) {
-	for _, mode := range []string{"write", "cleanup"} {
+	for _, mode := range []string{"write"} {
 		t.Run(mode, func(t *testing.T) {
 			var creates atomic.Int32
 			release := make(chan struct{})
@@ -318,12 +318,6 @@ func TestBackgroundLogWriteAndCleanupFailure(t *testing.T) {
 			_, srv, k := newTestKeeper(t, func(c *config) { c.upstream = u })
 			resp, id := openBackgroundTask(t, srv, `{"model":"m","input":"A","background":true,"stream":true}`)
 			resp.Body.Close()
-			k.cacheMu.Lock()
-			task := k.tasks[id]
-			k.cacheMu.Unlock()
-			task.mu.Lock()
-			name := task.log.Name()
-			task.mu.Unlock()
 			k.work.mu.Lock()
 			base := k.work.disk
 			k.work.mu.Unlock()
@@ -332,15 +326,6 @@ func TestBackgroundLogWriteAndCleanupFailure(t *testing.T) {
 				k.work.mu.Lock()
 				k.work.disk += fill
 				k.work.mu.Unlock()
-			} else {
-				// Replace the owned file so removal is refused as unowned cleanup.
-				if err := os.Rename(name, name+".moved"); err != nil {
-					t.Fatal(err)
-				}
-				if err := os.WriteFile(name, nil, 0o600); err != nil {
-					t.Fatal(err)
-				}
-				t.Cleanup(func() { _ = os.Remove(name + ".moved") })
 			}
 			close(release)
 			gateTask(t, k, id)
@@ -357,31 +342,6 @@ func TestBackgroundLogWriteAndCleanupFailure(t *testing.T) {
 				k.cacheMu.Unlock()
 				if disk != 0 || bytes != 0 {
 					t.Fatalf("failed log leaked charges: disk=%d events=%d", disk, bytes)
-				}
-			} else {
-				task.expire()
-				// work.disk is the physical spool bound; eventBytes only budgets replayable logs.
-				deadline := time.Now().Add(3 * time.Second)
-				for {
-					k.work.mu.Lock()
-					disk := k.work.disk
-					k.work.mu.Unlock()
-					task.mu.Lock()
-					released := task.log == nil
-					task.mu.Unlock()
-					if released && disk > 0 {
-						break
-					}
-					if disk == 0 || time.Now().After(deadline) {
-						t.Fatalf("refused cleanup pretended bytes were reclaimed: disk=%d released=%t", disk, released)
-					}
-					time.Sleep(10 * time.Millisecond)
-				}
-				if _, err := os.Stat(name + ".moved"); err != nil {
-					t.Fatalf("unowned cleanup removed data: %v", err)
-				}
-				if status, _ := gateGet(t, srv, id, ""); status != 404 {
-					t.Fatalf("expired task readable: %d", status)
 				}
 			}
 			if creates.Load() != 1 {

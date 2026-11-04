@@ -8,8 +8,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
-	"os"
-	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
@@ -48,23 +46,6 @@ func TestFinalMalformedJSONExplicit(t *testing.T) {
 				t.Error("malformed/invalid-terminal successful body not explicitly rejected")
 			}
 		})
-	}
-}
-
-func TestFinalCleanupPreservesNonOwnedEntries(t *testing.T) {
-	dir := t.TempDir()
-	outside := filepath.Join(t.TempDir(), "outside")
-	os.WriteFile(outside, []byte("safe"), 0600)
-	names := []string{"turn-link", "turn-unrelated"}
-	os.Symlink(outside, filepath.Join(dir, names[0]))
-	os.WriteFile(filepath.Join(dir, names[1]), []byte("not a keeper spool"), 0644)
-	if err := cleanupTransient(dir); err != nil {
-		t.Fatal(err)
-	}
-	for _, n := range names {
-		if _, err := os.Lstat(filepath.Join(dir, n)); os.IsNotExist(err) {
-			t.Errorf("cleanup deleted %s", n)
-		}
 	}
 }
 
