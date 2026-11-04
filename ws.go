@@ -67,7 +67,7 @@ func (k *keeper) serveWS(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		return
 	}
-	conn.SetReadLimit(k.cfg.maxRequestBytes)
+	conn.SetReadLimit(k.cfg.maxRequestBytes + 1) // keeper, not the library, refuses (D5)
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
 	header := r.Header.Clone()
@@ -161,7 +161,7 @@ func (k *keeper) wsTurn(ctx context.Context, conn *websocket.Conn, header http.H
 	hasPrev := t.hasPrev
 	resp, err := k.forwardDisk(ctx, upstream, "/v1/responses", "", header, t)
 	if err != nil {
-		return "", wsError(ctx, conn, &apiError{status: http.StatusBadGateway, typ: "upstream_error", message: "upstream request failed"}), hasPrev
+		return "", wsError(ctx, conn, upstreamFailed(requestIDFrom(header), "ws forward", err)), hasPrev
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK || !strings.Contains(resp.Header.Get("Content-Type"), "text/event-stream") {
@@ -186,7 +186,7 @@ func (k *keeper) wsTurn(ctx context.Context, conn *websocket.Conn, header http.H
 		return conn.Write(ctx, websocket.MessageText, wire)
 	}, k, k.work)
 	if err == nil && !c.done && ctx.Err() == nil {
-		status = wsFailure(ctx, conn, c.responseID(), c.nextSeq(), &apiError{status: 502, typ: "upstream_error", message: "upstream stream ended before terminal response"})
+		status = wsFailure(ctx, conn, c.responseID(), c.nextSeq(), upstreamFailed(requestIDFrom(header), "ws relay", errors.New("upstream stream ended before terminal response")))
 	}
 	if err != nil {
 		log.Printf("ws relay ended early: %v", err)

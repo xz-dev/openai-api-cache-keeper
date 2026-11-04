@@ -3,7 +3,6 @@ package main
 import (
 	"errors"
 	"io"
-	"log"
 	"net/http"
 	"net/http/httputil"
 	"strings"
@@ -28,8 +27,7 @@ func (k *keeper) newNativeProxy() *httputil.ReverseProxy {
 		Transport:     k.client.Transport,
 		FlushInterval: -1,
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
-			log.Printf("native proxy: upstream request failed: %v", err)
-			writeAPIError(w, &apiError{status: http.StatusBadGateway, typ: "upstream_error", message: "upstream request failed"})
+			writeAPIError(w, upstreamFailed(requestIDOf(r), "native proxy", err))
 		},
 	}
 }

@@ -175,7 +175,7 @@ func (k *keeper) serveWSNative(w http.ResponseWriter, r *http.Request) {
 		// A body that overflowed or could not be captured is an explicit
 		// upstream error instead of a silently truncated reply.
 		if refused != nil && (refused.overflow || refused.failed) {
-			writeAPIError(w, &apiError{status: http.StatusBadGateway, typ: "upstream_error", message: "upstream rejection body exceeded working limit or could not be read"})
+			writeAPIError(w, upstreamFailed(requestIDOf(r), "ws dial", errors.New("upstream rejection body exceeded working limit or could not be read")))
 			return
 		}
 		if resp != nil && resp.StatusCode != http.StatusSwitchingProtocols {
@@ -190,11 +190,13 @@ func (k *keeper) serveWSNative(w http.ResponseWriter, r *http.Request) {
 			}
 			return
 		}
-		writeAPIError(w, &apiError{status: http.StatusBadGateway, typ: "upstream_error", message: "upstream request failed"})
+		writeAPIError(w, upstreamFailed(requestIDOf(r), "ws dial", err))
 		return
 	}
 	defer upstream.CloseNow()
-	upstream.SetReadLimit(k.cfg.maxRequestBytes)
+	// One byte above our own limit, so keeper's named refusal, not the
+	// library's bare 1009, answers an over-limit message (design D5).
+	upstream.SetReadLimit(k.cfg.maxRequestBytes + 1)
 
 	conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
 		InsecureSkipVerify: true,
@@ -204,7 +206,7 @@ func (k *keeper) serveWSNative(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer conn.CloseNow()
-	conn.SetReadLimit(k.cfg.maxRequestBytes)
+	conn.SetReadLimit(k.cfg.maxRequestBytes + 1)
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
 	owner := k.ownerOf(r)
@@ -244,6 +246,12 @@ func (k *keeper) serveWSNative(w http.ResponseWriter, r *http.Request) {
 					// RFC 6455 §8.1: invalid UTF-8 in a text message fails the
 					// connection with 1007 in the keeper's server role too.
 					_ = upstream.Close(websocket.StatusInvalidFramePayloadData, "invalid UTF-8")
+					upCh <- pumpResult{err: err}
+					return
+				}
+				if errors.Is(err, errWorkSize) {
+					// The turn ends on keeper's named refusal; the socket
+					// closes, so the rest of the frame is not drained.
 					upCh <- pumpResult{err: err}
 					return
 				}
@@ -369,6 +377,8 @@ func (k *keeper) serveWSNative(w http.ResponseWriter, r *http.Request) {
 		}
 		if !turnStart.IsZero() {
 			logTurnEnd(end, reqID, storedID)
+		} else {
+			logSessionEnd(end, reqID)
 		}
 		finishLog(http.StatusBadGateway, storedID)
 		releaseInflight()
@@ -819,14 +829,14 @@ func (k *keeper) wsNativeClientFrame(ctx context.Context, conn, upstream *websoc
 	if err != nil {
 		body.Close()
 		t.file.Close()
-		return "", wsError(ctx, conn, &apiError{status: http.StatusBadGateway, typ: "upstream_error", message: "upstream request failed"}), probe.prevSet
+		return "", wsError(ctx, conn, upstreamFailed(requestIDOf(r), "ws upstream writer", err)), probe.prevSet
 	}
 	_, copyErr := io.Copy(struct{ io.Writer }{w}, body)
 	closeErr := w.Close()
 	body.Close()
 	if copyErr != nil || closeErr != nil {
 		t.file.Close()
-		return "", wsError(ctx, conn, &apiError{status: http.StatusBadGateway, typ: "upstream_error", message: "upstream request failed"}), probe.prevSet
+		return "", wsError(ctx, conn, upstreamFailed(requestIDOf(r), "ws upstream send", errors.Join(copyErr, closeErr))), probe.prevSet
 	}
 	*inflight = &wsNativeInflight{turn: t, owner: owner, sess: sess}
 	return "", http.StatusOK, probe.prevSet
@@ -846,12 +856,18 @@ func (k *keeper) wsNativeUpstreamFrame(ctx context.Context, conn *websocket.Conn
 		inflight.c.release(k.work)
 		return code
 	}
+	// A keeper-side refusal ends the open turn with an explicit event
+	// before the socket closes (never bare).
+	failKeeper := func(err error) int {
+		log.Printf("ws native upstream frame refused: %v", err)
+		wsFailure(ctx, conn, inflight.c.responseID(), inflight.c.nextSeq(), responseError(err))
+		return endTurn(-1)
+	}
 	// The event is the smallest unit: copy it once into a charged buffer so
 	// rewrite and collect share one bounded copy instead of two.
 	raw, err := data.chargedCopy(k.work)
 	if err != nil {
-		log.Printf("ws native upstream frame uncharged: %v", err)
-		return endTurn(-1)
+		return failKeeper(err)
 	}
 	body := &responseBuffer{data: raw, work: k.work}
 	raw = nil
@@ -862,8 +878,7 @@ func (k *keeper) wsNativeUpstreamFrame(ctx context.Context, conn *websocket.Conn
 	}
 	wire, release, _, err := k.responseFrameOwned(ctx, &inflight.c, body, true, inflight.turn.store, prepare, nil)
 	if err != nil {
-		log.Printf("ws native upstream frame failed: %v", err)
-		return endTurn(-1)
+		return failKeeper(err)
 	}
 	defer release()
 	if err := conn.Write(ctx, websocket.MessageText, wire); err != nil {

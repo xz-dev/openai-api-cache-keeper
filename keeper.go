@@ -423,7 +423,7 @@ func (k *keeper) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	hasPrev := t.hasPrev
 	resp, err := k.forwardDisk(r.Context(), upstream, r.URL.Path, r.URL.RawQuery, r.Header, t)
 	if err != nil {
-		writeAPIError(w, &apiError{status: http.StatusBadGateway, typ: "upstream_error", message: "upstream request failed"})
+		writeAPIError(w, upstreamFailed(requestIDOf(r), "http forward", err))
 		logTurn("http", http.StatusBadGateway, hasPrev, "", start, k.store)
 		return
 	}
