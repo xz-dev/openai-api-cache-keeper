@@ -90,7 +90,7 @@ func TestPrepareDiskSnapshotPrevIDWithinCredit(t *testing.T) {
 		if tc.native {
 			body = `{"input":"x","background":true,"previous_response_id":"` + tc.id + `"}`
 		}
-		input, err := k.spoolRequest(context.Background(), strings.NewReader(body))
+		input, err := k.spoolRequest(context.Background(), strings.NewReader(body), nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -138,7 +138,7 @@ func TestProbeWSFramePrevIDCredit(t *testing.T) {
 	_, _, k := newTestKeeper(t, func(c *config) { c.maxRequestBytes = 8 << 20 })
 	n := 1 << 20
 	frame := `{"type":"response.create","previous_response_id":"\n` + strings.Repeat("p", n) + `"}`
-	sp, err := k.spoolRequest(context.Background(), strings.NewReader(frame))
+	sp, err := k.spoolRequest(context.Background(), strings.NewReader(frame), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -252,7 +252,7 @@ func TestDecodeJSONSpanMatchesDecodeJSONString(t *testing.T) {
 	}
 	for _, tok := range toks {
 		want, wantOK := decodeJSONString([]byte(tok))
-		sp, err := k.spoolRequest(context.Background(), strings.NewReader(tok))
+		sp, err := k.spoolRequest(context.Background(), strings.NewReader(tok), nil)
 		if err != nil {
 			t.Fatal(err)
 		}

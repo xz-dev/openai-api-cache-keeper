@@ -77,7 +77,7 @@ func TestParsedEventPendingStoreOwnership(t *testing.T) {
 		t.Run(outcome, func(t *testing.T) {
 			_, _, k := newTestKeeper(t)
 			baseline, fds, gen := admissionSnapshot(k), keeperFDs(t, k), k.store.current
-			input, err := k.spoolRequest(context.Background(), strings.NewReader(`{"input":"tiny","store":true}`))
+			input, err := k.spoolRequest(context.Background(), strings.NewReader(`{"input":"tiny","store":true}`), nil)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -252,7 +252,7 @@ func TestQueuedSSEReadAheadFraming(t *testing.T) {
 		t.Run(fmt.Sprintf("%q", ending), func(t *testing.T) {
 			_, _, k := newTestKeeper(t)
 			baseline, fds, gen := admissionSnapshot(k), keeperFDs(t, k), k.store.current
-			input, err := k.spoolRequest(context.Background(), strings.NewReader(`{"input":"tiny"}`))
+			input, err := k.spoolRequest(context.Background(), strings.NewReader(`{"input":"tiny"}`), nil)
 			if err != nil {
 				t.Fatal(err)
 			}

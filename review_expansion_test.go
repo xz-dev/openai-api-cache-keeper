@@ -24,7 +24,7 @@ func TestReviewCoreUniqueExpansionStaysSmall(t *testing.T) {
 	runtime.GC()
 	var b, a runtime.MemStats
 	runtime.ReadMemStats(&b)
-	raw, err := k.spoolRequest(context.Background(), strings.NewReader(`{"model":"m","input":[],"previous_response_id":"unique-seed"}`))
+	raw, err := k.spoolRequest(context.Background(), strings.NewReader(`{"model":"m","input":[],"previous_response_id":"unique-seed"}`), nil)
 	if err != nil {
 		t.Fatal(err)
 	}

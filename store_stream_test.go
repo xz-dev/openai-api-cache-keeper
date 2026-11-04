@@ -41,7 +41,7 @@ func TestStreamingExpansionHeapBound(t *testing.T) {
 	runtime.ReadMemStats(&b1)
 	raw, err := k2.spoolRequest(context.Background(), io.MultiReader(
 		strings.NewReader(`{"input":"`), strings.NewReader(input),
-		strings.NewReader(`","previous_response_id":"big","model":"m"}`)))
+		strings.NewReader(`","previous_response_id":"big","model":"m"}`)), nil)
 	if err != nil {
 		t.Fatal(err)
 	}

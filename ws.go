@@ -97,7 +97,7 @@ func (k *keeper) serveWS(w http.ResponseWriter, r *http.Request) {
 				wsError(ctx, conn, workingError(stateErr))
 				continue
 			}
-			frame, err := k.spoolRequest(ctx, reader)
+			frame, err := k.spoolRequest(ctx, reader, k.largeBodyAuth(r.Header, r.URL.RawQuery))
 			if err != nil {
 				frameState.Close()
 				wsError(ctx, conn, workingError(err))

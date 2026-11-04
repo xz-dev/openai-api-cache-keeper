@@ -229,7 +229,7 @@ func TestReview4HandshakeSpoolFailureExplicit(t *testing.T) {
 // decoding and re-encoding a multi-megabyte input value.
 func TestReview4PreparedInputMaterialisation(t *testing.T) {
 	_, _, k := newWSNativeKeeper(t, func(c *config) { c.maxRequestBytes = 8 << 20 })
-	raw, e := k.spoolRequest(context.Background(), strings.NewReader(`{"type":"response.create","input":"`+strings.Repeat("x", 4<<20)+`"}`))
+	raw, e := k.spoolRequest(context.Background(), strings.NewReader(`{"type":"response.create","input":"`+strings.Repeat("x", 4<<20)+`"}`), nil)
 	if e != nil {
 		t.Fatal(e)
 	}
@@ -254,7 +254,7 @@ func TestReview4PreparedInputMaterialisation(t *testing.T) {
 // same wire body for a string input (wrapped as a user item).
 func TestReview4PreparedStringInputBody(t *testing.T) {
 	_, _, k := newWSNativeKeeper(t)
-	raw, e := k.spoolRequest(context.Background(), strings.NewReader(`{"type":"response.create","model":"m","input":"hi"}`))
+	raw, e := k.spoolRequest(context.Background(), strings.NewReader(`{"type":"response.create","model":"m","input":"hi"}`), nil)
 	if e != nil {
 		t.Fatal(e)
 	}

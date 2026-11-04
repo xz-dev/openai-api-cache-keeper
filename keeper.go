@@ -151,7 +151,12 @@ func (k *keeper) localCheckpointTurn(w http.ResponseWriter, r *http.Request) (re
 		writeAPIError(w, workingError(requestSizeError(k.cfg.maxRequestBytes)))
 		return nil, false, false, true
 	}
-	raw, err := k.spoolRequest(r.Context(), http.MaxBytesReader(w, r.Body, k.cfg.maxRequestBytes))
+	auth, apiErr := k.headerAuth(r)
+	if apiErr != nil {
+		writeAPIError(w, apiErr)
+		return nil, false, false, true
+	}
+	raw, err := k.spoolRequest(r.Context(), http.MaxBytesReader(w, r.Body, k.cfg.maxRequestBytes), auth)
 	if err != nil {
 		writeAPIError(w, workingError(err))
 		return nil, false, false, true
@@ -177,6 +182,20 @@ func (k *keeper) localCheckpointTurn(w http.ResponseWriter, r *http.Request) (re
 	// the request keeps native semantics end to end.
 	endState := lease.retain()
 	return func() { body.Close(); raw.Close(); endState() }, owned || prevID == "", background, false
+}
+
+// headerAuth authenticates a declared large body at the headers, before any
+// byte is spooled; for an unknown length it returns the step spoolRequest
+// runs once 64 MiB have arrived (design D4).
+func (k *keeper) headerAuth(r *http.Request) (largeAuth, *apiError) {
+	auth := k.largeBodyAuth(r.Header, r.URL.RawQuery)
+	if r.ContentLength < largeBodyBytes {
+		return auth, nil
+	}
+	if err := auth(r.Context()); err != nil {
+		return nil, workingError(err)
+	}
+	return nil, nil
 }
 
 // apiError renders as an OpenAI-shaped error object.
@@ -399,7 +418,15 @@ func (k *keeper) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	defer lease.Close()
 	r = r.WithContext(context.WithValue(r.Context(), requestStateKey{}, lease))
-	raw, err := k.spoolRequest(r.Context(), http.MaxBytesReader(w, r.Body, k.cfg.maxRequestBytes))
+	var auth largeAuth
+	if _, respooled := r.Body.(*spoolBody); !respooled { // a spoolBody was authenticated when first spooled
+		var apiErr *apiError
+		if auth, apiErr = k.headerAuth(r); apiErr != nil {
+			writeAPIError(w, apiErr)
+			return
+		}
+	}
+	raw, err := k.spoolRequest(r.Context(), http.MaxBytesReader(w, r.Body, k.cfg.maxRequestBytes), auth)
 	if err != nil {
 		writeAPIError(w, workingError(err))
 		return

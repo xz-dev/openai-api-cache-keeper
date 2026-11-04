@@ -212,6 +212,7 @@ func (k *keeper) serveWSNative(w http.ResponseWriter, r *http.Request) {
 	owner := k.ownerOf(r)
 	sess := &wsSession{}
 	defer sess.clear()
+	clientAuth := k.largeBodyAuth(r.Header, r.URL.RawQuery)
 
 	// One pump result per direction carries a read error (including a close
 	// frame's status) so the handler can perform the counterpart close
@@ -240,7 +241,7 @@ func (k *keeper) serveWSNative(w http.ResponseWriter, r *http.Request) {
 				}
 				return
 			}
-			f, err := k.spoolRequestUTF8(ctx, reader, typ)
+			f, err := k.spoolRequestUTF8(ctx, reader, typ, nil)
 			if err != nil {
 				if errors.Is(err, errInvalidUTF8) {
 					// RFC 6455 §8.1: invalid UTF-8 in a text message fails the
@@ -299,7 +300,7 @@ func (k *keeper) serveWSNative(w http.ResponseWriter, r *http.Request) {
 				wsError(ctx, conn, workingError(stateErr))
 				continue
 			}
-			f, err := k.spoolRequestUTF8(ctx, reader, typ)
+			f, err := k.spoolRequestUTF8(ctx, reader, typ, clientAuth)
 			if err != nil {
 				frameState.Close()
 				if errors.Is(err, errInvalidUTF8) {
@@ -751,11 +752,11 @@ func (u *utf8CleanReader) Read(p []byte) (int, error) {
 
 // spoolRequestUTF8 spools a text message while validating UTF-8; binary and
 // oversized messages behave like spoolRequest.
-func (k *keeper) spoolRequestUTF8(ctx context.Context, r io.Reader, typ websocket.MessageType) (*spool, error) {
+func (k *keeper) spoolRequestUTF8(ctx context.Context, r io.Reader, typ websocket.MessageType, auth largeAuth) (*spool, error) {
 	if typ == websocket.MessageText {
 		r = &utf8CleanReader{r: r}
 	}
-	return k.spoolRequest(ctx, r)
+	return k.spoolRequest(ctx, r, auth)
 }
 
 // wsNativeClientFrame classifies and forwards one client frame.

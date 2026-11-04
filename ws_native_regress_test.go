@@ -188,7 +188,7 @@ func TestRegressionWriterErrorNoPanic(t *testing.T) {
 	_, srv, k := newWSNativeKeeper(t)
 	c := dialWS(t, srv, "Bearer a")
 	_ = c.CloseNow()
-	raw, e := k.spoolRequest(context.Background(), strings.NewReader(`{"type":"response.create","model":"m","input":"A"}`))
+	raw, e := k.spoolRequest(context.Background(), strings.NewReader(`{"type":"response.create","model":"m","input":"A"}`), nil)
 	if e != nil {
 		t.Fatal(e)
 	}

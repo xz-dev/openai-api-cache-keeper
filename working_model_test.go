@@ -24,7 +24,7 @@ func TestPreparedModelFirst(t *testing.T) {
 				if ws {
 					body = `{"type":"response.create",` + body[1:]
 				}
-				raw, err := k.spoolRequest(context.Background(), strings.NewReader(body))
+				raw, err := k.spoolRequest(context.Background(), strings.NewReader(body), nil)
 				if err != nil {
 					t.Fatal(err)
 				}

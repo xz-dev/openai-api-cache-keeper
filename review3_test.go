@@ -111,7 +111,7 @@ func TestReview3WriteErrorReleasesInflight(t *testing.T) {
 	_, srv, k := newWSNativeKeeper(t)
 	conn := dialWS(t, srv, "Bearer a")
 	conn.CloseNow()
-	raw, e := k.spoolRequest(context.Background(), strings.NewReader(`{"model":"m","input":[]}`))
+	raw, e := k.spoolRequest(context.Background(), strings.NewReader(`{"model":"m","input":[]}`), nil)
 	if e != nil {
 		t.Fatal(e)
 	}
@@ -120,7 +120,7 @@ func TestReview3WriteErrorReleasesInflight(t *testing.T) {
 	if ae != nil {
 		t.Fatal(ae)
 	}
-	data, e := k.spoolRequest(context.Background(), strings.NewReader(`{"type":"response.created","response":{"id":"test_id","status":"in_progress","output":[]}}`))
+	data, e := k.spoolRequest(context.Background(), strings.NewReader(`{"type":"response.created","response":{"id":"test_id","status":"in_progress","output":[]}}`), nil)
 	if e != nil {
 		t.Fatal(e)
 	}
@@ -202,7 +202,7 @@ func TestReview3MixedSSERawPreserved(t *testing.T) {
 func TestReview3ProbeMetadataHeapBound(t *testing.T) {
 	_, _, k := newWSNativeKeeper(t, func(c *config) { c.maxRequestBytes = 8 << 20 })
 	input := `{"type":"response.create","input":"` + strings.Repeat("x", 4<<20) + `","previous_response_id":"resp_native"}`
-	data, e := k.spoolRequest(context.Background(), strings.NewReader(input))
+	data, e := k.spoolRequest(context.Background(), strings.NewReader(input), nil)
 	if e != nil {
 		t.Fatal(e)
 	}

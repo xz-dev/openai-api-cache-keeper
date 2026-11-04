@@ -165,7 +165,7 @@ func TestReviewCoreAcceptedHistoryMustFitReplay(t *testing.T) {
 		t.Fatal(err)
 	}
 	prep := func(id string) (*diskTurn, *apiError) {
-		raw, err := k.spoolRequest(context.Background(), strings.NewReader(`{"model":"m","input":[],"previous_response_id":"`+id+`"}`))
+		raw, err := k.spoolRequest(context.Background(), strings.NewReader(`{"model":"m","input":[],"previous_response_id":"`+id+`"}`), nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -289,7 +289,7 @@ func TestReviewCoreByteExactNontrivialSpans(t *testing.T) {
 	_, _, k := newTestKeeper(t)
 	owner := sha256.Sum256([]byte("owner"))
 	rawText := "{\"model\":\"m\",\"input\": [ \n  { \"type\": \"message\", \"content\": \"<>&\\u0041\" }, \n [1,  2],  \"str\\n\"   ] }"
-	raw, err := k.spoolRequest(context.Background(), strings.NewReader(rawText))
+	raw, err := k.spoolRequest(context.Background(), strings.NewReader(rawText), nil)
 	if err != nil {
 		t.Fatal(err)
 	}

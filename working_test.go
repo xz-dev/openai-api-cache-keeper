@@ -117,7 +117,7 @@ func TestRequestExactCeilingAndOversize(t *testing.T) {
 func TestEncodedInputDoesNotGrowWithHTMLCharacters(t *testing.T) {
 	_, _, k := newTestKeeper(t)
 	text := strings.Repeat("<>&", 100000)
-	raw, err := k.spoolRequest(context.Background(), strings.NewReader(`{"input":"`+text+`"}`))
+	raw, err := k.spoolRequest(context.Background(), strings.NewReader(`{"input":"`+text+`"}`), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -163,7 +163,7 @@ func TestSpoolBudgetAndDiskErrorCleanup(t *testing.T) {
 	k.work.mu.Lock()
 	k.work.disk = maxSpoolBytes
 	k.work.mu.Unlock()
-	if f, err := k.spoolRequest(context.Background(), strings.NewReader("x")); err == nil {
+	if f, err := k.spoolRequest(context.Background(), strings.NewReader("x"), nil); err == nil {
 		f.Close()
 		t.Fatal("disk budget bypass")
 	}
@@ -176,7 +176,7 @@ func TestSpoolBudgetAndDiskErrorCleanup(t *testing.T) {
 	}
 	old := k.cfg.storeDir
 	k.cfg.storeDir = filepath.Join(old, "missing")
-	if _, err := k.spoolRequest(context.Background(), strings.NewReader("x")); err == nil {
+	if _, err := k.spoolRequest(context.Background(), strings.NewReader("x"), nil); err == nil {
 		t.Fatal("expected real filesystem create failure")
 	}
 	k.cfg.storeDir = old

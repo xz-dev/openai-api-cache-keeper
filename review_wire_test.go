@@ -56,7 +56,7 @@ func TestReviewCoreOversizedTerminalRealHTTP(t *testing.T) {
 			status2, body2, _ := post(t, srv, "Bearer review", `{"model":"m","input":[],"previous_response_id":"resp_review_oversized"}`)
 			t.Logf("terminal status=%d terminal_success=%v stored=%v continuation=%d body=%s", status, strings.Contains(body, `"status":"completed"`), stored, status2, body2)
 			// Previous seed itself remains intact; no probe sends real inference.
-			raw, err := k.spoolRequest(context.Background(), strings.NewReader(`{"model":"m","input":[],"previous_response_id":"seed"}`))
+			raw, err := k.spoolRequest(context.Background(), strings.NewReader(`{"model":"m","input":[],"previous_response_id":"seed"}`), nil)
 			if err != nil {
 				t.Fatal(err)
 			}

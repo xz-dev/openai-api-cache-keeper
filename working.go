@@ -99,6 +99,10 @@ func workingError(err error) *apiError {
 	if errors.As(err, &named) {
 		return &apiError{status: 413, typ: "invalid_request_error", code: named.code, message: named.Error()}
 	}
+	var refused *authRefusal
+	if errors.As(err, &refused) {
+		return refused.e
+	}
 	var floor *storageFloorError
 	if errors.As(err, &floor) {
 		return &apiError{status: http.StatusInsufficientStorage, typ: "server_error", code: "insufficient_storage", message: floor.Error()}
@@ -109,7 +113,9 @@ func workingError(err error) *apiError {
 	return &apiError{status: 503, typ: "server_error", code: "working_set_unavailable", message: "Working capacity unavailable; retry later."}
 }
 
-func (k *keeper) spoolRequest(ctx context.Context, r io.Reader) (*spool, error) {
+// spoolRequest copies one request body or message to a new spool. auth,
+// when set, authenticates the caller once 64 MiB have arrived (design D4).
+func (k *keeper) spoolRequest(ctx context.Context, r io.Reader, auth largeAuth) (*spool, error) {
 	release, err := k.work.reserveInput(requestCopyCredit)
 	if err != nil {
 		return nil, err
@@ -120,7 +126,7 @@ func (k *keeper) spoolRequest(ctx context.Context, r io.Reader) (*spool, error) 
 		return nil, err
 	}
 	// Hide os.File.ReadFrom so CopyBuffer cannot bypass byte accounting.
-	n, err := io.CopyBuffer(struct{ io.Writer }{f}, io.LimitReader(contextReader{ctx, r}, k.cfg.maxRequestBytes+1), make([]byte, 32<<10))
+	n, err := copyAuthenticated(ctx, struct{ io.Writer }{f}, contextReader{ctx, r}, k.cfg.maxRequestBytes+1, auth, make([]byte, 32<<10))
 	if err == nil && n > k.cfg.maxRequestBytes {
 		err = requestSizeError(k.cfg.maxRequestBytes)
 	}

@@ -271,7 +271,7 @@ func TestRoutingLookupDoesNotHoldMaterializationPhase(t *testing.T) {
 		c.routingIndex = routingURL(t, index.URL)
 		c.upstreamCPA = c.upstream
 	})
-	raw, err := k.spoolRequest(context.Background(), strings.NewReader(`{"model":"cpa","input":[]}`))
+	raw, err := k.spoolRequest(context.Background(), strings.NewReader(`{"model":"cpa","input":[]}`), nil)
 	if err != nil {
 		t.Fatal(err)
 	}

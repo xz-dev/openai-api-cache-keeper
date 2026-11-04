@@ -11,7 +11,7 @@ import (
 
 func TestInputFlagsPressureAndStrictValidationRelease(t *testing.T) {
 	_, _, k := newTestKeeper(t)
-	raw, err := k.spoolRequest(context.Background(), strings.NewReader(`{"input":"`+strings.Repeat("x", 64<<10)+`","stream":true,"background":true}`))
+	raw, err := k.spoolRequest(context.Background(), strings.NewReader(`{"input":"`+strings.Repeat("x", 64<<10)+`","stream":true,"background":true}`), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -39,7 +39,7 @@ func TestInputFlagsPressureAndStrictValidationRelease(t *testing.T) {
 	if remaining != retained {
 		t.Fatalf("input scratch credit leaked above retained spool: %d want%d", remaining, retained)
 	}
-	invalid, err := k.spoolRequest(context.Background(), strings.NewReader(`{"input":[{"nested":"\q"}],"stream":true}`))
+	invalid, err := k.spoolRequest(context.Background(), strings.NewReader(`{"input":[{"nested":"\q"}],"stream":true}`), nil)
 	if err != nil {
 		t.Fatal(err)
 	}

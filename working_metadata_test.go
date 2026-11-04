@@ -19,7 +19,7 @@ func TestRequestMetadataBoundBeforeGrowth(t *testing.T) {
 		fmt.Fprintf(&request, `,"k%d":0`, i)
 	}
 	request.WriteString("}")
-	raw, err := k.spoolRequest(context.Background(), strings.NewReader(request.String()))
+	raw, err := k.spoolRequest(context.Background(), strings.NewReader(request.String()), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
