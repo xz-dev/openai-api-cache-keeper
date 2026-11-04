@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -24,6 +25,7 @@ type keeper struct {
 	routing             *routingClient
 	work                *workingSet
 	native              *httputil.ReverseProxy
+	gate                *capacityGate
 	cacheMu             sync.Mutex
 	tasks               map[string]*responseTask
 	eventBytes          int64
@@ -44,12 +46,25 @@ func newKeeper(cfg config) *keeper {
 		st.close()
 		log.Fatalf("transient cleanup: %v", err)
 	}
+	ledgerDir, memInfo := cfg.ledgerDir, cfg.memInfoPath
+	if ledgerDir == "" {
+		ledgerDir = filepath.Join(cfg.storeDir, "capacity-ledger")
+	}
+	if memInfo == "" {
+		memInfo = "/proc/meminfo"
+	}
+	gate, err := newCapacityGate(ledgerDir, filepath.Join(cfg.storeDir, "keeper.db"), cfg.maxStoreBytes, memInfo)
+	if err != nil {
+		st.close()
+		log.Fatalf("capacity ledger: %v", err)
+	}
 	var routing *routingClient
 	if cfg.routingIndex != nil {
 		routing = newRoutingClient(cfg.routingIndex)
 	}
 	k := &keeper{
 		routing: routing,
+		gate:    gate,
 		work:    newWorkingSet(),
 		cfg:     cfg,
 		store:   st,
@@ -69,6 +84,15 @@ func (k *keeper) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		_, _ = io.WriteString(w, "ok")
 		return
 	}
+	if r.URL.Path == "/metrics/capacity" && r.Method == http.MethodGet {
+		k.gate.serveTickets(w)
+		return
+	}
+	// Only keeper issues tickets: an inbound ticket is never trusted (D4).
+	r.Header.Del(ticketHeader)
+	ctx, scope := withGateScope(r.Context(), k.gate)
+	r = r.WithContext(ctx)
+	defer scope.done()
 	if k.cfg.upstream != nil && k.taskOperation(w, r) {
 		return
 	}
@@ -168,6 +192,13 @@ func (k *keeper) localCheckpointTurn(w http.ResponseWriter, r *http.Request) (re
 		raw.Close()
 		return nil, false, false, true
 	}
+	if raw.ticket != nil {
+		if e := raw.ticket.resize(raw.size); e != nil { // an unknown length was admitted at the cap
+			raw.Close()
+			writeAPIError(w, e)
+			return nil, false, false, true
+		}
+	}
 	body, err := raw.requestBody()
 	if err != nil {
 		raw.Close()
@@ -187,21 +218,34 @@ func (k *keeper) localCheckpointTurn(w http.ResponseWriter, r *http.Request) (re
 // headerAuth authenticates a declared large body at the headers, before any
 // byte is spooled; for an unknown length it returns the step spoolRequest
 // runs once 64 MiB have arrived (design D4).
+//
+// After authentication the request is admitted by the capacity gate: a
+// declared body for its length, an unknown length at the cap (D4).
 func (k *keeper) headerAuth(r *http.Request) (largeAuth, *apiError) {
 	auth := k.largeBodyAuth(r.Header, r.URL.RawQuery)
+	scope := gateScopeFrom(r.Context())
 	if r.ContentLength < largeBodyBytes {
-		return auth, nil
+		return func(ctx context.Context) error {
+			if err := auth(ctx); err != nil {
+				return err
+			}
+			if e := scope.ensure(k.cfg.maxRequestBytes); e != nil {
+				return &authRefusal{e}
+			}
+			return nil
+		}, nil
 	}
 	if err := auth(r.Context()); err != nil {
 		return nil, workingError(err)
 	}
-	return nil, nil
+	return nil, scope.ensure(r.ContentLength)
 }
 
 // apiError renders as an OpenAI-shaped error object.
 type apiError struct {
 	status                    int
 	typ, code, param, message string
+	retryAfter                string // Retry-After hint for capacity_busy
 }
 
 func (e *apiError) object() map[string]any {
@@ -217,6 +261,9 @@ func (e *apiError) object() map[string]any {
 
 func writeAPIError(w http.ResponseWriter, e *apiError) {
 	w.Header().Set("Content-Type", "application/json")
+	if e.retryAfter != "" {
+		w.Header().Set("Retry-After", e.retryAfter)
+	}
 	w.WriteHeader(e.status)
 	_ = json.NewEncoder(w).Encode(map[string]any{"error": e.object()})
 }
@@ -441,6 +488,9 @@ func (k *keeper) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	t, apiErr := k.prepareDiskSnapshot(r.Context(), raw, owner, func(id string) (*historySnapshot, error) {
 		return k.store.snapshotID(r.Context(), id, owner, false)
 	}, false, false)
+	if apiErr == nil {
+		apiErr = k.admitTurn(r.Context(), raw, t, false, k.largeBodyAuth(r.Header, r.URL.RawQuery))
+	}
 	raw.Close()
 	if apiErr != nil {
 		writeAPIError(w, apiErr)
@@ -448,7 +498,12 @@ func (k *keeper) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	defer t.file.Close()
 	hasPrev := t.hasPrev
-	resp, err := k.forwardDisk(r.Context(), upstream, r.URL.Path, r.URL.RawQuery, r.Header, t)
+	header := r.Header
+	if t.file.ticket != nil {
+		header = r.Header.Clone()
+		header.Set(ticketHeader, t.file.ticket.id())
+	}
+	resp, err := k.forwardDisk(r.Context(), upstream, r.URL.Path, r.URL.RawQuery, header, t)
 	if err != nil {
 		writeAPIError(w, upstreamFailed(requestIDOf(r), "http forward", err))
 		logTurn("http", http.StatusBadGateway, hasPrev, "", start, k.store)

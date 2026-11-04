@@ -128,6 +128,7 @@ type spool struct {
 	mem                     *workingSet
 	size, offset, diskBytes int64
 	dropped                 int64 // file offset below which written pages were synced and evicted
+	skip                    int64 // reserved prefix bytes requestBody does not send
 	mu                      sync.Mutex
 	refs                    int
 	ownerClosed             bool
@@ -135,6 +136,30 @@ type spool struct {
 	inputCredits            []func()
 	state                   *stateLease
 	frameState              *stateLease
+	ticket                  *capTicket // admission ticket kept reserved while this spool lives
+}
+
+// attach makes this spool hold t until its file is closed and removed.
+func (f *spool) attach(t *capTicket) {
+	if t != nil && f.ticket == nil && t.ref() {
+		f.ticket = t
+	}
+}
+
+// setFirstMember fills the reserved frame prefix (see ticketPrefixLen) with
+// `{"<key>":"<value>",`, so the member is the frame's FIRST member: the
+// bridge reads it from a small prefix before spooling (contract with the
+// bridge). value must have the reserved length.
+func (f *spool) setFirstMember(key, value string) error {
+	member := `{"` + key + `":"` + value + `",`
+	if int64(len(member)) != f.skip+1 {
+		return errors.New("frame has no reserved first-member prefix")
+	}
+	if _, err := f.File.WriteAt([]byte(member), f.offset); err != nil {
+		return err
+	}
+	f.skip = 0
+	return nil
 }
 
 func (k *keeper) newSpool() (_ *spool, err error) {
@@ -251,6 +276,10 @@ func (f *spool) releaseLocked() error {
 	} else {
 		log.Printf("transient cleanup failed; bytes remain charged: %v", err)
 	}
+	if f.ticket != nil && err == nil { // the bytes are gone; a failed removal keeps the reservation
+		f.ticket.unref()
+		f.ticket = nil
+	}
 	if closeErr != nil {
 		return closeErr
 	}
@@ -273,7 +302,7 @@ func (b *spoolBody) Read(p []byte) (int, error) {
 	n, err := b.SectionReader.Read(p)
 	pos, _ := b.SectionReader.Seek(0, io.SeekCurrent)
 	if pos-b.dropped >= spoolCacheWindow || (err != nil && pos > b.dropped) {
-		dropCache(b.file, b.spool.offset+b.dropped, pos-b.dropped, false)
+		dropCache(b.file, b.spool.offset+b.spool.skip+b.dropped, pos-b.dropped, false)
 		b.dropped = pos
 	}
 	return n, err
@@ -286,7 +315,7 @@ func (f *spool) requestBody() (*spoolBody, error) {
 		return nil, os.ErrClosed
 	}
 	f.refs++
-	return &spoolBody{SectionReader: io.NewSectionReader(f.File, f.offset, f.size), spool: f, file: f.File}, nil
+	return &spoolBody{SectionReader: io.NewSectionReader(f.File, f.offset+f.skip, f.size-f.skip), spool: f, file: f.File}, nil
 }
 func (b *spoolBody) Close() error {
 	b.once.Do(func() { b.spool.mu.Lock(); defer b.spool.mu.Unlock(); b.err = b.spool.releaseLocked() })

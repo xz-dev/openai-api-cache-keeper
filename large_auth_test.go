@@ -100,7 +100,7 @@ func TestLargeBodyAuthenticatedFirst(t *testing.T) {
 // Bodies under 64 MiB keep today's path: no billing call by keeper.
 func TestSmallBodySkipsLargeAuth(t *testing.T) {
 	srv, _, billing, _ := authKeeper(t, 401)
-	body := largeBody(int(largeBodyBytes) - 1)
+	body := largeBody(int(largeBodyBytes) - 4096) // rebuilt upstream body stays under 64 MiB too
 	if status, out := postBody(t, srv, struct{ io.Reader }{strings.NewReader(body)}, -1); status != 200 || billing.Load() != 0 {
 		t.Fatalf("status=%d billing=%d %.200s", status, billing.Load(), out)
 	}

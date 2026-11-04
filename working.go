@@ -137,7 +137,48 @@ func (k *keeper) spoolRequest(ctx context.Context, r io.Reader, auth largeAuth) 
 		f.Close()
 		return nil, err
 	}
+	if scope := gateScopeFrom(ctx); scope != nil {
+		f.attach(scope.t)
+	}
 	return f, nil
+}
+
+// admitTurn reserves the upstream spool's real size: a request that reached
+// the gate is resized to it, and a small request whose expanded history
+// reaches 64 MiB is authenticated and admitted now, before anything is sent
+// (D4). The turn spool then holds the ticket; a WS frame carries its id as
+// its first member.
+func (k *keeper) admitTurn(ctx context.Context, raw *spool, t *diskTurn, ws bool, auth largeAuth) *apiError {
+	n := t.file.size - t.file.skip
+	tk := raw.ticket
+	if tk == nil {
+		if n < largeBodyBytes {
+			return nil
+		}
+		if err := auth(ctx); err != nil {
+			t.file.Close()
+			return workingError(err)
+		}
+		var e *apiError
+		if tk, e = k.gate.admit(n); e != nil {
+			t.file.Close()
+			return e
+		}
+		t.file.ticket = tk // owns admit's reference
+	} else {
+		if e := tk.resize(n); e != nil {
+			t.file.Close()
+			return e
+		}
+		t.file.attach(tk)
+	}
+	if ws {
+		if err := t.file.setFirstMember(ticketMember, tk.id()); err != nil {
+			t.file.Close()
+			return workingError(err)
+		}
+	}
+	return nil
 }
 
 type itemSpan struct {
@@ -390,6 +431,8 @@ func (k *keeper) prepareDiskSnapshot(ctx context.Context, raw *spool, owner [32]
 				return nil
 			}
 			return putOther(name, start, end)
+		case ticketMember:
+			return nil // only keeper issues tickets (D4)
 		case "store":
 			if v := raw.keySlice(start, end); v != nil {
 				t.store = string(v) != "false"
@@ -473,6 +516,14 @@ func (k *keeper) prepareDiskSnapshot(ctx context.Context, raw *spool, owner [32]
 	t.file = f
 	out := &spoolWriter{f: f, limit: maxHistoryBytes}
 	copyBuf := make([]byte, 32<<10)
+	if wsEnvelope {
+		// Reserve room before `{` for a ticket as the frame's first member;
+		// an unticketed frame skips it, so its bytes are unchanged.
+		if err := out.write(bytes.Repeat([]byte(" "), ticketPrefixLen-1)); err != nil {
+			return fail(err)
+		}
+		f.skip = int64(ticketPrefixLen - 1)
+	}
 	if err := out.write([]byte(`{`)); err != nil {
 		return fail(err)
 	}

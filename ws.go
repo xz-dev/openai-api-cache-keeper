@@ -153,11 +153,18 @@ func (k *keeper) wsTurn(ctx context.Context, conn *websocket.Conn, header http.H
 		}
 		return k.store.snapshotID(ctx, id, owner, false)
 	}, true, false)
+	if apiErr == nil {
+		apiErr = k.admitTurn(ctx, data, t, false, k.largeBodyAuth(header, ""))
+	}
 	data.Close()
 	if apiErr != nil {
 		return "", wsError(ctx, conn, apiErr), false
 	}
 	defer t.file.Close()
+	if t.file.ticket != nil {
+		header = header.Clone()
+		header.Set(ticketHeader, t.file.ticket.id())
+	}
 	hasPrev := t.hasPrev
 	resp, err := k.forwardDisk(ctx, upstream, "/v1/responses", "", header, t)
 	if err != nil {

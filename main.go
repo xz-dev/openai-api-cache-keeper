@@ -32,6 +32,8 @@ type config struct {
 	maxStoreEntries       int64
 	maxRequestBytes       int64
 	storeDir              string
+	ledgerDir             string // CAPACITY_LEDGER_DIR; default STORE_DIR/capacity-ledger
+	memInfoPath           string // CAPACITY_MEMINFO; default /proc/meminfo
 	storeMetaBytes        int64
 	storePinBytes         int64
 	storeCompactBytes     int64
@@ -119,6 +121,8 @@ func loadConfig() (config, error) {
 	if cfg.maxRequestBytes, err = envPositiveInt("MAX_REQUEST_BYTES", 256<<20); err != nil {
 		return config{}, err
 	}
+	cfg.ledgerDir = os.Getenv("CAPACITY_LEDGER_DIR")
+	cfg.memInfoPath = os.Getenv("CAPACITY_MEMINFO")
 	cfg.storeDir = os.Getenv("STORE_DIR")
 	if cfg.storeDir == "" {
 		cfg.storeDir = "/var/tmp/openai-api-cache-keeper"

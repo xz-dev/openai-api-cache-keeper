@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
@@ -300,7 +301,20 @@ func (k *keeper) serveWSNative(w http.ResponseWriter, r *http.Request) {
 				wsError(ctx, conn, workingError(stateErr))
 				continue
 			}
-			f, err := k.spoolRequestUTF8(ctx, reader, typ, clientAuth)
+			// Each message is authenticated and admitted once 64 MiB of it
+			// has arrived; the spool then holds the ticket (D4).
+			fctx, scope := withGateScope(ctx, k.gate)
+			admit := func(c context.Context) error {
+				if err := clientAuth(c); err != nil {
+					return err
+				}
+				if e := scope.ensure(k.cfg.maxRequestBytes); e != nil {
+					return &authRefusal{e}
+				}
+				return nil
+			}
+			f, err := k.spoolRequestUTF8(fctx, reader, typ, admit)
+			scope.done()
 			if err != nil {
 				frameState.Close()
 				if errors.Is(err, errInvalidUTF8) {
@@ -818,6 +832,9 @@ func (k *keeper) wsNativeClientFrame(ctx context.Context, conn, upstream *websoc
 		return k.store.snapshotID(ctx, id, owner, false)
 	}
 	t, apiErr := k.prepareDiskSnapshot(ctx, data, owner, lookup, true, true)
+	if apiErr == nil {
+		apiErr = k.admitTurn(ctx, data, t, true, k.largeBodyAuth(r.Header, r.URL.RawQuery))
+	}
 	if apiErr != nil {
 		return "", wsError(ctx, conn, apiErr), probe.prevSet
 	}
@@ -916,13 +933,40 @@ func (k *keeper) wsRelayFrame(ctx context.Context, dst *websocket.Conn, data *sp
 		return err
 	}
 	defer body.Close()
+	var src io.Reader = body
+	if data.ticket != nil && typ == websocket.MessageText {
+		// A ticketed frame relayed verbatim still carries the ticket as its
+		// FIRST member (bridge contract): `{` becomes `{"<member>":"<id>",`.
+		if src, err = ticketFirst(body, data.ticket.id()); err != nil {
+			return err
+		}
+	}
 	w, err := dst.Writer(ctx, typ)
 	if err != nil {
 		return err
 	}
-	if _, err := io.Copy(struct{ io.Writer }{w}, body); err != nil {
+	if _, err := io.Copy(struct{ io.Writer }{w}, src); err != nil {
 		_ = w.Close()
 		return err
 	}
 	return w.Close()
+}
+
+// ticketFirst returns r with the ticket member inserted right after the
+// opening brace of its non-empty top-level JSON object.
+func ticketFirst(r io.Reader, id string) (io.Reader, error) {
+	br := bufio.NewReaderSize(r, 4096)
+	for {
+		b, err := br.ReadByte()
+		if err != nil {
+			return nil, errors.New("ticketed frame is not a JSON object")
+		}
+		switch b {
+		case ' ', '\t', '\n', '\r':
+			continue
+		case '{':
+			return io.MultiReader(strings.NewReader(`{"`+ticketMember+`":"`+id+`",`), br), nil
+		}
+		return nil, errors.New("ticketed frame is not a JSON object")
+	}
 }

@@ -23,6 +23,9 @@ func (k *keeper) newNativeProxy() *httputil.ReverseProxy {
 		Rewrite: func(pr *httputil.ProxyRequest) {
 			pr.SetURL(k.cfg.upstream) // joins the upstream path; sets scheme and Host
 			pr.Out.Host = k.cfg.upstream.Host
+			if b, ok := pr.In.Body.(*spoolBody); ok && b.spool.ticket != nil {
+				pr.Out.Header.Set(ticketHeader, b.spool.ticket.id())
+			}
 		},
 		Transport:     k.client.Transport,
 		FlushInterval: -1,
