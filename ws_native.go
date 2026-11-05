@@ -9,6 +9,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -374,9 +375,9 @@ func (k *keeper) serveWSNative(w http.ResponseWriter, r *http.Request) {
 			failOpenTurn(r.Context(), conn, inflight, e)
 		}
 	}
-	finishLog := func(status int, storedID string) {
+	finishLog := func(status int, code, storedID string) {
 		if !turnStart.IsZero() {
-			logTurn("ws", status, turnPrevious, storedID, turnStart, k.store)
+			logTurnCode("ws", status, code, turnPrevious, storedID, turnStart, k.store)
 			turnStart = time.Time{}
 		}
 	}
@@ -410,7 +411,7 @@ func (k *keeper) serveWSNative(w http.ResponseWriter, r *http.Request) {
 		} else {
 			logSessionEnd(end, reqID, clock)
 		}
-		finishLog(http.StatusBadGateway, storedID)
+		finishLog(http.StatusBadGateway, "", storedID)
 		releaseInflight()
 		if queued != nil {
 			queued.spool.Close()
@@ -436,7 +437,7 @@ func (k *keeper) serveWSNative(w http.ResponseWriter, r *http.Request) {
 		if create {
 			turnStart, turnPrevious = start, hasPrev
 			if inflight == nil && !nativeOpen {
-				finishLog(status, id)
+				finishLog(status, "", id)
 			}
 		}
 	}
@@ -450,13 +451,13 @@ func (k *keeper) serveWSNative(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if inflight != nil {
-			if status, cause := k.wsNativeUpstreamFrame(ctx, conn, f, sess, inflight); status != 0 {
+			if status, code, cause := k.wsNativeUpstreamFrame(ctx, conn, f, sess, inflight); status != 0 {
 				if status == -1 {
 					endTurn(cause, false)
 					logTurnEnd(cause, reqID, inflight.id, clock)
-					finishLog(http.StatusBadGateway, inflight.id)
+					finishLog(http.StatusBadGateway, "", inflight.id)
 				} else {
-					finishLog(status, inflight.id)
+					finishLog(status, code, inflight.id)
 				}
 				inflight = nil
 				if status == -1 {
@@ -466,9 +467,9 @@ func (k *keeper) serveWSNative(w http.ResponseWriter, r *http.Request) {
 			}
 			return
 		}
-		terminal := false
+		terminal, status, code := false, 0, ""
 		if nativeOpen {
-			terminal = wsNativeTerminal(f.spool)
+			terminal, status, code = wsNativeTerminal(f.spool)
 		}
 		if err := k.wsRelayFrame(ctx, conn, f.spool, f.typ, false); err != nil {
 			endTurn(endFromErr("client", err), false)
@@ -476,7 +477,7 @@ func (k *keeper) serveWSNative(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if terminal {
-			finishLog(http.StatusOK, "")
+			finishLog(status, code, "")
 			nativeOpen = false
 		}
 	}
@@ -709,27 +710,66 @@ func isWSCreate(data *spool) bool {
 }
 
 // wsNativeTerminal reports whether the spooled upstream text frame ends a
-// native turn (terminal response event or a request-level error frame).
-// It scans only the type field; the rest is skipped as spans.
-func wsNativeTerminal(data *spool) bool {
+// native turn (terminal response event or a request-level error frame), and
+// the outcome the turn delivered for the turn log: 200 for a completed or
+// incomplete response; for an error event its own "status" member and
+// error code (M8: an inner 503 is logged as 503, not as the socket's 200).
+// A failure without a status member is logged as 502, like any other failed
+// turn. It reads only the type, status and small error members; the rest is
+// skipped as spans.
+func wsNativeTerminal(data *spool) (terminal bool, status int, code string) {
 	var kind string
+	var errRaw, respRaw []byte
 	s := spoolScanner(data)
 	err := s.objectFields(data.keySlice, func(key string, start, end int64) error {
-		if key == "type" {
+		switch key {
+		case "type":
 			if raw := data.keySlice(start, end); raw != nil {
 				kind, _ = readJSONString(raw)
 			}
+		case "status":
+			if raw := data.keySlice(start, end); raw != nil {
+				status, _ = strconv.Atoi(string(raw))
+			}
+		case "error":
+			errRaw = data.keySlice(start, end)
+		case "response":
+			respRaw = data.keySlice(start, end) // nil when over 64 KiB
 		}
 		return nil
 	})
 	if err != nil {
-		return true // unparseable: stop attributing frames to this turn
+		return true, http.StatusBadGateway, "" // unparseable: stop attributing frames to this turn
+	}
+	var e struct {
+		Code     any `json:"code"`
+		Response struct {
+			Error struct {
+				Code any `json:"code"`
+			} `json:"error"`
+		} `json:"response"`
 	}
 	switch kind {
-	case "response.completed", "response.incomplete", "response.failed", "error":
-		return true
+	case "response.completed", "response.incomplete":
+		return true, http.StatusOK, ""
+	case "response.failed":
+		if json.Unmarshal(append(append([]byte(`{"response":`), respRaw...), '}'), &e) == nil && respRaw != nil {
+			code = fmt.Sprint(e.Response.Error.Code)
+		}
+	case "error":
+		if errRaw != nil && json.Unmarshal(errRaw, &e) == nil && e.Code != nil {
+			code = fmt.Sprint(e.Code)
+		}
+	default:
+		return false, 0, ""
 	}
-	return false
+	if code == "<nil>" {
+		code = ""
+	}
+	if status < 400 || status > 599 {
+		status = http.StatusBadGateway
+	}
+	return true, status, code
 }
 
 // utf8CleanReader wraps an io.Reader and validates that all bytes read form
@@ -893,7 +933,7 @@ func innerEndsTurn(nativeOpen *bool, requestID, where string, err error) int {
 // non-zero status marks the turn finished (-1: connection-level failure).
 // Every non-zero return releases the turn's spool and collector charge, so
 // the caller only clears its pointer.
-func (k *keeper) wsNativeUpstreamFrame(ctx context.Context, conn *websocket.Conn, f *wsFrame, sess *wsSession, inflight *wsNativeInflight) (status int, cause turnEnd) {
+func (k *keeper) wsNativeUpstreamFrame(ctx context.Context, conn *websocket.Conn, f *wsFrame, sess *wsSession, inflight *wsNativeInflight) (status int, code string, cause turnEnd) {
 	data := f.spool
 	endTurn := func(code int) int {
 		inflight.failed = code == -1
@@ -903,10 +943,10 @@ func (k *keeper) wsNativeUpstreamFrame(ctx context.Context, conn *websocket.Conn
 	}
 	// A keeper-side refusal ends the open turn with an explicit event
 	// before the socket closes (never bare).
-	failKeeper := func(err error) (int, turnEnd) {
+	failKeeper := func(err error) (int, string, turnEnd) {
 		log.Printf("ws native upstream frame refused: %v", err)
 		wsFailure(ctx, conn, inflight.c.responseID(), inflight.c.nextSeq(), responseError(err))
-		return endTurn(-1), turnEnd{side: "keeper", code: -1, cause: "upstream frame refused: " + err.Error()}
+		return endTurn(-1), "", turnEnd{side: "keeper", code: -1, cause: "upstream frame refused: " + err.Error()}
 	}
 	// The event is the smallest unit: copy it once into a charged buffer so
 	// rewrite and collect share one bounded copy instead of two.
@@ -917,7 +957,7 @@ func (k *keeper) wsNativeUpstreamFrame(ctx context.Context, conn *websocket.Conn
 	body := &responseBuffer{data: raw, work: k.work}
 	raw = nil
 	defer body.close()
-	terminal := wsNativeTerminal(data)
+	terminal, status, code := wsNativeTerminal(data)
 	prepare := func() (*responseAcceptance, error) {
 		return k.prepareSocketAcceptance(ctx, &inflight.c, inflight.turn, inflight.owner, sess, &inflight.id)
 	}
@@ -928,12 +968,12 @@ func (k *keeper) wsNativeUpstreamFrame(ctx context.Context, conn *websocket.Conn
 	defer release()
 	if err := conn.Write(ctx, websocket.MessageText, wire); err != nil {
 		// The client socket failed, not keeper: name it with its error.
-		return endTurn(-1), endFromErr("client", fmt.Errorf("write to client: %w", err))
+		return endTurn(-1), "", endFromErr("client", fmt.Errorf("write to client: %w", err))
 	}
 	if terminal {
-		return endTurn(http.StatusOK), turnEnd{}
+		return endTurn(status), code, turnEnd{}
 	}
-	return 0, turnEnd{}
+	return 0, "", turnEnd{}
 }
 
 // chargedCopy reads the whole spool once into an output-charged buffer; the

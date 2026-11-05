@@ -125,7 +125,7 @@ func TestReview3WriteErrorReleasesInflight(t *testing.T) {
 	}
 	defer data.Close()
 	in := &wsNativeInflight{turn: turn}
-	status, cause := k.wsNativeUpstreamFrame(context.Background(), conn, &wsFrame{typ: websocket.MessageText, spool: data}, &wsSession{}, in)
+	status, _, cause := k.wsNativeUpstreamFrame(context.Background(), conn, &wsFrame{typ: websocket.MessageText, spool: data}, &wsSession{}, in)
 	if status != -1 {
 		t.Fatalf("want writer failure; got %d", status)
 	}

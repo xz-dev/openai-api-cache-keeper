@@ -5,6 +5,7 @@ import (
 	"regexp"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/coder/websocket"
 )
@@ -62,5 +63,37 @@ func TestIncidentReplayInnerLimitErrorEvent(t *testing.T) {
 	c = dialWS(t, srv, "Bearer a")
 	if ev := wsTerminal(t, c, frame); ev["type"] != "response.completed" {
 		t.Fatalf("replay at 256 MiB: %v", ev)
+	}
+}
+
+// M8: a WS continuation that ends in an inner 503 error event is logged with
+// that status and code, not with the socket's 200; on a local (recorded)
+// continuation and on a native-parent one.
+func TestWSTurnLogCarriesErrorEventStatus(t *testing.T) {
+	logs := captureLog(t)
+	up, srv, _ := newWSNativeKeeper(t)
+	c := dialWS(t, srv, "Bearer a")
+	ev := wsCreate(t, c, `{"type":"response.create","model":"m","input":"A"}`)
+	if ev["type"] != "response.completed" {
+		t.Fatalf("turn1: %v", ev)
+	}
+	id1 := ev["response"].(map[string]any)["id"].(string)
+	up.errFrame.Store(`{"type":"error","status":503,"error":{"type":"server_error","code":"capacity_busy","message":"inner busy"}}`)
+	const want = `transport=ws status=503 code="capacity_busy" previous=true`
+	for i, prev := range []string{id1, "resp_native"} {
+		ev = wsCreate(t, c, `{"type":"response.create","model":"m","input":"B","previous_response_id":"`+prev+`"}`)
+		if ev["type"] != "error" {
+			t.Fatalf("continuation %d: %v", i, ev)
+		}
+		deadline := time.Now().Add(time.Minute)
+		for strings.Count(logs.String(), want) < i+1 && time.Now().Before(deadline) {
+			time.Sleep(10 * time.Millisecond)
+		}
+		if got := strings.Count(logs.String(), want); got != i+1 {
+			t.Fatalf("continuation %d (previous %s): want %d turn lines %q, logs:\n%s", i, prev, i+1, want, logs.String())
+		}
+	}
+	if strings.Contains(logs.String(), "transport=ws status=200 previous=true") {
+		t.Fatalf("an error turn was logged as 200:\n%s", logs.String())
 	}
 }

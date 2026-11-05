@@ -32,9 +32,11 @@ func TestWSNativeLogsAtTurnEnd(t *testing.T) {
 	}{
 		{name: "completed", kind: "response.completed", stored: true, status: 200},
 		{name: "incomplete", kind: "response.incomplete", stored: true, status: 200},
-		{name: "failed", kind: "response.failed", status: 200},
-		{name: "error", kind: "error", status: 200},
-		{name: "native parent", kind: "error", parent: "resp_downstream", status: 200},
+		// M8: a failed turn logs the outcome it delivered, not the socket's
+		// 200; a failure event without a status member logs 502.
+		{name: "failed", kind: "response.failed", status: 502},
+		{name: "error", kind: "error", status: 502},
+		{name: "native parent", kind: "error", parent: "resp_downstream", status: 502},
 		{name: "abort", abort: true, status: 502},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

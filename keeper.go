@@ -13,6 +13,7 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -678,7 +679,16 @@ func copyHeader(dst, src http.Header) {
 }
 
 func logTurn(transport string, status int, hasPrev bool, storedID string, start time.Time, s *store) {
+	logTurnCode(transport, status, "", hasPrev, storedID, start, s)
+}
+
+// logTurnCode is logTurn plus the error code the turn delivered, if any.
+func logTurnCode(transport string, status int, code string, hasPrev bool, storedID string, start time.Time, s *store) {
 	entries, size := s.stats()
-	log.Printf("transport=%s status=%d previous=%t stored=%t duration=%s store_entries=%d store_bytes=%d",
-		transport, status, hasPrev, storedID != "", time.Since(start).Round(time.Millisecond), entries, size)
+	codeField := ""
+	if code != "" {
+		codeField = " code=" + strconv.Quote(code)
+	}
+	log.Printf("transport=%s status=%d%s previous=%t stored=%t duration=%s store_entries=%d store_bytes=%d",
+		transport, status, codeField, hasPrev, storedID != "", time.Since(start).Round(time.Millisecond), entries, size)
 }

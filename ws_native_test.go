@@ -25,6 +25,7 @@ type wsFakeUpstream struct {
 	frames    []string
 	n         int
 	readLimit atomic.Int64 // 0 = the library default
+	errFrame  atomic.Value // string: when set, the reply to every create
 }
 
 func (f *wsFakeUpstream) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -63,6 +64,10 @@ func (f *wsFakeUpstream) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		f.n++
 		n := f.n
 		f.mu.Unlock()
+		if e, _ := f.errFrame.Load().(string); e != "" {
+			_ = conn.Write(r.Context(), websocket.MessageText, []byte(e))
+			continue
+		}
 		if doc.Generate != nil && !*doc.Generate {
 			id := fmt.Sprintf("pre_%d", n)
 			_ = conn.Write(r.Context(), websocket.MessageText, []byte(fmt.Sprintf(
