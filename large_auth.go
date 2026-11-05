@@ -50,15 +50,20 @@ func (k *keeper) largeBodyAuth(hdr http.Header, rawQuery string) largeAuth {
 		case resp.StatusCode >= 200 && resp.StatusCode < 300:
 			return nil
 		case resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden:
-			return &authRefusal{&apiError{status: resp.StatusCode, typ: "invalid_request_error", code: "invalid_api_key",
-				message: fmt.Sprintf("keeper: authentication failed (status %d); a body of %d bytes or more is admitted only for an authenticated caller", resp.StatusCode, largeBodyBytes)}}
+			return &authRefusal{authFailed(resp.StatusCode)}
 		}
 		return &authRefusal{authUnavailable(fmt.Sprintf("billing revalidation returned status %d", resp.StatusCode))}
 	}
 }
 
+// authFailed refuses a large body whose caller the billing check rejected.
+func authFailed(status int) *apiError {
+	return &apiError{status: status, typ: "invalid_request_error", code: "invalid_api_key", hop: keeperHop,
+		message: fmt.Sprintf("keeper: authentication failed (status %d); a body of %d bytes or more is admitted only for an authenticated caller", status, largeBodyBytes)}
+}
+
 func authUnavailable(cause string) *apiError {
-	return &apiError{status: http.StatusServiceUnavailable, typ: "server_error", code: "auth_unavailable",
+	return &apiError{status: http.StatusServiceUnavailable, typ: "server_error", code: "auth_unavailable", hop: keeperHop,
 		message: "keeper: caller authentication is unavailable, so the large request was not admitted: " + boundedText(cause)}
 }
 

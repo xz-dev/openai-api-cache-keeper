@@ -117,15 +117,21 @@ func orDash(s string) string {
 	return s
 }
 
+// upstreamHop names keeper's inner hop (its upstream) in the hop field when
+// that hop refused: keeper knows only that it is the hop behind it, not its
+// name, and never exposes the upstream address.
+const upstreamHop = "upstream"
+
 // innerEndError is the client-visible error for an upstream socket that
 // ended while a turn was open: never a bare close (design D7).
 func innerEndError(e turnEnd) *apiError {
 	switch {
 	case e.side == "keeper":
-		return &apiError{status: http.StatusBadGateway, typ: "upstream_error", code: "upstream_frame_too_large",
+		return &apiError{status: http.StatusBadGateway, typ: "upstream_error", code: "upstream_frame_too_large", hop: keeperHop,
 			message: "keeper: an upstream frame was refused and the turn was ended: " + boundedText(e.cause)}
 	case e.code == websocket.StatusMessageTooBig:
-		return &apiError{status: http.StatusRequestEntityTooLarge, typ: "invalid_request_error", code: "request_too_large", hop: keeperHop,
+		// The inner hop refused the message, not keeper (re-review minor).
+		return &apiError{status: http.StatusRequestEntityTooLarge, typ: "invalid_request_error", code: "request_too_large", hop: upstreamHop,
 			message: fmt.Sprintf("keeper: the inner hop closed the WebSocket with 1009 (message too big): %s", boundedText(e.reason))}
 	case e.code >= 0:
 		return &apiError{status: http.StatusBadGateway, typ: "upstream_error", code: "upstream_closed",
