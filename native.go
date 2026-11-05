@@ -53,6 +53,11 @@ func (k *keeper) serveNative(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		defer lease.Close()
+		if r.Method == http.MethodGet {
+			// A native non-Responses socket: each message is capped at L.
+			k.serveNativeTunnel(w, r)
+			return
+		}
 	}
 	k.native.ServeHTTP(w, r)
 }
