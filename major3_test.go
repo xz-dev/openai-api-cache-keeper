@@ -169,3 +169,28 @@ func TestFallbackPathRefusedAboveL(t *testing.T) {
 	}
 	waitLedgerEmpty(t, k)
 }
+
+// Major 3 (4): a request with a body on any method is bounded by L, so a
+// PATCH or DELETE body is refused above L like a POST one.
+func TestFallbackNonPOSTBodyBounded(t *testing.T) {
+	srv, _, gu := gateKeeper(t, 901*mib)
+	for _, method := range []string{http.MethodPatch, http.MethodDelete, http.MethodPut} {
+		for _, chunked := range []bool{false, true} {
+			path := "/v1/custom-voices/v1"
+			before := len(upstreamPOSTs(gu))
+			if status, out := postPath(t, srv, method, path, "Bearer big", fallbackBodyOf(int(fallbackLimit)), chunked); status == 413 {
+				t.Fatalf("%s at exactly L (chunked %t): %.300s", method, chunked, out)
+			}
+			if got := len(upstreamPOSTs(gu)); got != before+1 {
+				t.Fatalf("%s at exactly L (chunked %t) did not reach the upstream", method, chunked)
+			}
+			status, out := postPath(t, srv, method, path, "Bearer big", fallbackBodyOf(int(fallbackLimit)+1), chunked)
+			if status != 413 || !strings.Contains(out, `"code":"request_too_large"`) || !strings.Contains(out, `"hop":"keeper"`) {
+				t.Fatalf("%s at L+1 (chunked %t): %d %.300s", method, chunked, status, out)
+			}
+			if got := len(upstreamPOSTs(gu)); !chunked && got != before+1 {
+				t.Fatalf("%s at L+1 with a length reached the upstream", method)
+			}
+		}
+	}
+}

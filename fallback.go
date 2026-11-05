@@ -35,14 +35,14 @@ func fallbackTooLarge(path string, size int64) *apiError {
 	return &apiError{status: http.StatusRequestEntityTooLarge, typ: "invalid_request_error", code: "request_too_large", hop: keeperHop, message: msg}
 }
 
-// boundFallback applies L to a request with a body on a fallback path. A
+// boundFallback applies L to a request with a body on a fallback path, for
+// every method: a PATCH or DELETE body is bounded like a POST one. A
 // declared length above L is refused here, before any upstream call, spool
 // write, ticket or billing call; it returns false after writing the 413. A
 // body without a length is counted as it streams: past L the read fails
 // with fallbackOverLimit and the native proxy answers the same 413.
 func (k *keeper) boundFallback(w http.ResponseWriter, r *http.Request) bool {
-	if r.Method != http.MethodPost || coveredPath(r.URL.Path) || fallbackExempt(r.URL.Path) ||
-		r.Body == nil || r.Body == http.NoBody {
+	if coveredPath(r.URL.Path) || fallbackExempt(r.URL.Path) || r.Body == nil || r.Body == http.NoBody {
 		return true
 	}
 	if r.ContentLength > fallbackLimit {
