@@ -428,7 +428,7 @@ func (k *keeper) serveWSNative(w http.ResponseWriter, r *http.Request) {
 	processUpstream := func(f *wsFrame) {
 		defer f.spool.Close()
 		if f.typ != websocket.MessageText {
-			if err := k.wsRelayFrame(ctx, conn, f.spool, f.typ); err != nil {
+			if err := k.wsRelayFrame(ctx, conn, f.spool, f.typ, false); err != nil {
 				endTurn(endFromErr("client", err), false)
 				cancel()
 			}
@@ -454,7 +454,7 @@ func (k *keeper) serveWSNative(w http.ResponseWriter, r *http.Request) {
 		if nativeOpen {
 			terminal = wsNativeTerminal(f.spool)
 		}
-		if err := k.wsRelayFrame(ctx, conn, f.spool, f.typ); err != nil {
+		if err := k.wsRelayFrame(ctx, conn, f.spool, f.typ, false); err != nil {
 			endTurn(endFromErr("client", err), false)
 			cancel()
 			return
@@ -539,7 +539,7 @@ func (k *keeper) serveWSNative(w http.ResponseWriter, r *http.Request) {
 			// has no turn ordering and relays immediately; it must never
 			// evict the held create.
 			if !isWSCreate(f.spool) {
-				if err := k.wsRelayFrame(ctx, upstream, f.spool, f.typ); err != nil {
+				if err := k.wsRelayFrame(ctx, upstream, f.spool, f.typ, true); err != nil {
 					endTurn(endFromErr("upstream", err), true)
 					f.spool.Close()
 					clCh = nil
@@ -778,7 +778,7 @@ func (k *keeper) wsNativeClientFrame(ctx context.Context, conn, upstream *websoc
 	data := f.spool
 	if f.typ != websocket.MessageText {
 		// Binary/opaque frames relay verbatim.
-		if err := k.wsRelayFrame(ctx, upstream, data, f.typ); err != nil {
+		if err := k.wsRelayFrame(ctx, upstream, data, f.typ, true); err != nil {
 			return "", http.StatusBadGateway, false
 		}
 		return "", http.StatusOK, false
@@ -786,7 +786,7 @@ func (k *keeper) wsNativeClientFrame(ctx context.Context, conn, upstream *websoc
 	probe := probeWSFrame(data)
 	defer probe.close()
 	if !probe.isCreate {
-		if err := k.wsRelayFrame(ctx, upstream, data, f.typ); err != nil {
+		if err := k.wsRelayFrame(ctx, upstream, data, f.typ, true); err != nil {
 			return "", http.StatusBadGateway, false
 		}
 		return "", http.StatusOK, false
@@ -812,7 +812,7 @@ func (k *keeper) wsNativeClientFrame(ctx context.Context, conn, upstream *websoc
 				// Native parent: the delta is meaningful only downstream.
 				// Forward verbatim and mark the turn so its events stay
 				// untouched.
-				if err := k.wsRelayFrame(ctx, upstream, data, f.typ); err != nil {
+				if err := k.wsRelayFrame(ctx, upstream, data, f.typ, true); err != nil {
 					return "", http.StatusBadGateway, true
 				}
 				*nativeOpen = true
@@ -923,18 +923,22 @@ func (s *spool) chargedCopy(m *workingSet) ([]byte, error) {
 }
 
 // wsRelayFrame forwards one spooled message verbatim over an upstream or
-// client socket.
-func (k *keeper) wsRelayFrame(ctx context.Context, dst *websocket.Conn, data *spool, typ websocket.MessageType) error {
+// client socket. A client text frame loses any ticket member it carries:
+// keeper is the only hop that strips one (D4).
+func (k *keeper) wsRelayFrame(ctx context.Context, dst *websocket.Conn, data *spool, typ websocket.MessageType, fromClient bool) error {
 	body, err := data.requestBody()
 	if err != nil {
 		return err
 	}
 	defer body.Close()
 	var src io.Reader = body
+	if fromClient && typ == websocket.MessageText {
+		src = stripTicketMember(data, src)
+	}
 	if data.ticket != nil && typ == websocket.MessageText {
 		// A ticketed frame relayed verbatim still carries the ticket as its
 		// FIRST member (bridge contract): `{` becomes `{"<member>":"<id>",`.
-		if src, err = ticketFirst(body, data.ticket.id()); err != nil {
+		if src, err = ticketFirst(src, data.ticket.id()); err != nil {
 			return err
 		}
 	}
@@ -948,6 +952,46 @@ func (k *keeper) wsRelayFrame(ctx context.Context, dst *websocket.Conn, data *sp
 	}
 	return w.Close()
 }
+
+// stripTicketMember returns the frame without its top-level ticket members,
+// streamed from the spool; a frame without one, or that is not a JSON
+// object, comes back unchanged as body.
+func stripTicketMember(data *spool, body io.Reader) io.Reader {
+	type member struct {
+		ks, ve int64
+		ticket bool
+	}
+	var ms []member
+	found := false
+	s := spoolScanner(data)
+	err := s.objectFields(data.keySlice, func(key string, _, end int64) error {
+		ms = append(ms, member{s.keyStart, end, key == ticketMember})
+		found = found || key == ticketMember
+		return nil
+	})
+	if err != nil && found {
+		return errorReader{errors.New("keeper: frame carries a ticket member it cannot strip")}
+	}
+	if err != nil || !found {
+		return body
+	}
+	parts := []io.Reader{data.section(0, ms[0].ks)}
+	for _, m := range ms {
+		if m.ticket {
+			continue
+		}
+		if len(parts) > 1 {
+			parts = append(parts, strings.NewReader(","))
+		}
+		parts = append(parts, data.section(m.ks, m.ve-m.ks))
+	}
+	last := ms[len(ms)-1].ve
+	return io.MultiReader(append(parts, data.section(last, data.size-last))...)
+}
+
+type errorReader struct{ err error }
+
+func (r errorReader) Read([]byte) (int, error) { return 0, r.err }
 
 // ticketFirst returns r with the ticket member inserted right after the
 // opening brace of its non-empty top-level JSON object.

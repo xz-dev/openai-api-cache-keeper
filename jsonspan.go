@@ -22,6 +22,9 @@ type jsonScanner struct {
 	base int64  // absolute offset of buf[0]
 	err  error
 	eof  bool
+	// keyStart is the offset of the current member's key while objectFields
+	// calls its fn.
+	keyStart int64
 }
 
 func newJSONScanner(r io.Reader) *jsonScanner {
@@ -194,6 +197,7 @@ func (s *jsonScanner) objectFields(readSpan func(start, end int64) []byte, fn fu
 		}
 		s.skipWS()
 		ks := s.offset()
+		s.keyStart = ks
 		if err := s.skipString(); err != nil {
 			return err
 		}
