@@ -43,16 +43,34 @@ func checkDiskFloor(m *workingSet, f *os.File, need int64) error {
 	return nil
 }
 
-// dropCache syncs and evicts [off, off+n) of f from the page cache.
-func dropCache(f *os.File, off, n int64, sync bool) {
-	if n <= 0 {
+// writeBack is the pipelined writeback of one spool (design D3 page-cache
+// bound): when window k = [next, end) is complete, its writeback starts
+// (SYNC_FILE_RANGE_WRITE, no wait), then window k-1 = [pending, next) is
+// waited for and evicted. At most about two windows stay cached.
+//
+// Spools are anonymous O_TMPFILE files that never outlive the process, so
+// they need no durability point: sync_file_range only bounds the page
+// cache, with no journal commit or device flush per window (Q3). A
+// filesystem without sync_file_range falls back to fdatasync.
+type writeBack struct {
+	pending, next int64 // [pending, next) is under writeback; next = first unsubmitted byte
+}
+
+func (w *writeBack) advance(f *os.File, end int64) {
+	if end-w.next < spoolCacheWindow {
 		return
 	}
 	fd := int(f.Fd())
-	if sync {
+	if unix.SyncFileRange(fd, w.next, end-w.next, unix.SYNC_FILE_RANGE_WRITE) != nil {
 		_ = unix.Fdatasync(fd)
 	}
-	_ = unix.Fadvise(fd, off, n, unix.FADV_DONTNEED)
+	if w.next > w.pending {
+		if unix.SyncFileRange(fd, w.pending, w.next-w.pending, unix.SYNC_FILE_RANGE_WAIT_BEFORE|unix.SYNC_FILE_RANGE_WRITE|unix.SYNC_FILE_RANGE_WAIT_AFTER) != nil {
+			_ = unix.Fdatasync(fd)
+		}
+		_ = unix.Fadvise(fd, w.pending, w.next-w.pending, unix.FADV_DONTNEED)
+	}
+	w.pending, w.next = w.next, end
 }
 
 // readWindow counts the bytes read from one spool through every read path.

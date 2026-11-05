@@ -114,14 +114,21 @@ func TestSpoolPageCacheBounded(t *testing.T) {
 	}
 	defer f.Close()
 	chunk := make([]byte, 32<<10)
+	// Pipelined writeback keeps the window under writeback plus the one
+	// being filled: about two windows, sampled at every MiB while writing.
+	limit := 2 * spoolCacheWindow
+	var peak int64
 	for i := 0; i < (48<<20)/len(chunk); i++ {
 		if _, err := f.Write(chunk); err != nil {
 			t.Fatal(err)
 		}
+		if f.size%(1<<20) == 0 {
+			peak = max(peak, residentBytes(t, f.File))
+		}
 	}
-	limit := 2 * spoolCacheWindow
-	if r := residentBytes(t, f.File); r > limit {
-		t.Fatalf("after write: %d bytes cached", r)
+	t.Logf("write peak resident %d bytes (limit %d)", peak, limit)
+	if peak > limit || peak == 0 {
+		t.Fatalf("while writing: %d bytes cached, limit %d", peak, limit)
 	}
 	if _, err := io.Copy(io.Discard, f.section(0, f.size)); err != nil {
 		t.Fatal(err)

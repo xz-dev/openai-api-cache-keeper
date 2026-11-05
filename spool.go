@@ -66,7 +66,7 @@ type spool struct {
 	*os.File
 	mem                     *workingSet
 	size, offset, diskBytes int64
-	dropped                 int64 // file offset below which written pages were synced and evicted
+	wb                      writeBack
 	reads                   readWindow
 	skip                    int64 // reserved prefix bytes requestBody does not send
 	mu                      sync.Mutex
@@ -139,10 +139,7 @@ func (f *spool) Write(p []byte) (int, error) {
 	f.mem.mu.Lock()
 	f.mem.disk -= int64(len(p) - n)
 	f.mem.mu.Unlock()
-	if end := f.offset + f.size; end-f.dropped >= spoolCacheWindow {
-		dropCache(f.File, f.dropped, end-f.dropped, true)
-		f.dropped = end
-	}
+	f.wb.advance(f.File, f.offset+f.size)
 	return n, err
 }
 
