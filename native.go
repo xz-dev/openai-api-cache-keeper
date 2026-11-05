@@ -33,7 +33,7 @@ func (k *keeper) newNativeProxy() *httputil.ReverseProxy {
 			var over *fallbackOverLimit
 			if errors.As(err, &over) {
 				// A chunked fallback body crossed L while it streamed.
-				writeAPIError(w, fallbackTooLarge(over.path, -1))
+				writeAPIError(w, fallbackTooLarge(over.what, -1))
 				return
 			}
 			writeAPIError(w, upstreamFailed(requestIDOf(r), "native proxy", err))

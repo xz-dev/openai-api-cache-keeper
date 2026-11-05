@@ -34,6 +34,11 @@ func (k *keeper) serveNativeTunnel(w http.ResponseWriter, r *http.Request) {
 	out.Header.Set("Upgrade", r.Header.Get("Upgrade"))
 	resp, err := k.client.Transport.RoundTrip(out)
 	if err != nil {
+		var over *fallbackOverLimit
+		if errors.As(err, &over) { // a counted handshake body crossed L
+			writeAPIError(w, fallbackTooLarge(over.what, -1))
+			return
+		}
 		writeAPIError(w, upstreamFailed(requestIDOf(r), "native tunnel", err))
 		return
 	}

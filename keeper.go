@@ -89,8 +89,10 @@ func (k *keeper) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		k.gate.serveTickets(w)
 		return
 	}
-	// A fallback path is refused above L before anything else happens: no
-	// upstream call, spool byte, ticket or billing call (D2, review M3).
+	// A request the gate does not admit (a fallback path, or a covered path
+	// with any method/Upgrade other than POST or GET+Upgrade) is refused
+	// above L before anything else happens: no upstream call, spool byte,
+	// ticket or billing call (D2, review M3 and 2026-11-05 M1).
 	if !k.boundFallback(w, r) {
 		return
 	}
