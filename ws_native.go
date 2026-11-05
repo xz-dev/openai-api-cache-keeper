@@ -559,6 +559,10 @@ func (k *keeper) serveWSNative(w http.ResponseWriter, r *http.Request) {
 			// evict the held create.
 			if !isWSCreate(f.spool) {
 				if err := k.wsRelayFrame(ctx, upstream, f.spool, f.typ, true); err != nil {
+					if _, refused := refuseClientFrame(r.Context(), conn, err); refused {
+						f.spool.Close()
+						continue
+					}
 					endTurn(endFromErr("upstream", err), true)
 					f.spool.Close()
 					clCh = nil
@@ -841,7 +845,8 @@ func (k *keeper) wsNativeClientFrame(ctx context.Context, conn, upstream *websoc
 	defer probe.close()
 	if !probe.isCreate {
 		if err := k.wsRelayFrame(ctx, upstream, data, f.typ, true); err != nil {
-			return "", http.StatusBadGateway, false
+			status, _ := refuseClientFrame(r.Context(), conn, err)
+			return "", status, false
 		}
 		return "", http.StatusOK, false
 	}
@@ -867,7 +872,8 @@ func (k *keeper) wsNativeClientFrame(ctx context.Context, conn, upstream *websoc
 				// Forward verbatim and mark the turn so its events stay
 				// untouched.
 				if err := k.wsRelayFrame(ctx, upstream, data, f.typ, true); err != nil {
-					return "", http.StatusBadGateway, true
+					status, _ := refuseClientFrame(r.Context(), conn, err)
+					return "", status, true
 				}
 				*nativeOpen = true
 				return "", http.StatusOK, true
@@ -989,21 +995,35 @@ func (s *spool) chargedCopy(m *workingSet) ([]byte, error) {
 }
 
 // wsRelayFrame forwards one spooled message verbatim over an upstream or
-// client socket. A client text frame loses any ticket member it carries:
-// keeper is the only hop that strips one (D4).
+// client socket. A client text frame loses every top-level ticket member it
+// carries: keeper is the only hop that strips one (D4). A client text frame
+// that is not one parseable JSON object is refused (*clientFrameError)
+// before anything is written to dst; it is never relayed unstripped.
 func (k *keeper) wsRelayFrame(ctx context.Context, dst *websocket.Conn, data *spool, typ websocket.MessageType, fromClient bool) error {
-	body, err := data.requestBody()
-	if err != nil {
-		return err
-	}
-	defer body.Close()
-	var src io.Reader = body
+	var src io.Reader
 	if fromClient && typ == websocket.MessageText {
-		src = stripTicketMember(data, src)
+		found, err := ticketMemberIn(data)
+		if err != nil {
+			return err
+		}
+		if found {
+			stripped := stripTicketMember(data)
+			defer stripped.Close()
+			src = stripped
+		}
+	}
+	if src == nil {
+		body, err := data.requestBody()
+		if err != nil {
+			return err
+		}
+		defer body.Close()
+		src = body
 	}
 	if data.ticket != nil && typ == websocket.MessageText {
 		// A ticketed frame relayed verbatim still carries the ticket as its
 		// FIRST member (bridge contract): `{` becomes `{"<member>":"<id>",`.
+		var err error
 		if src, err = ticketFirst(src, data.ticket.id()); err != nil {
 			return err
 		}
@@ -1019,45 +1039,126 @@ func (k *keeper) wsRelayFrame(ctx context.Context, dst *websocket.Conn, data *sp
 	return w.Close()
 }
 
-// stripTicketMember returns the frame without its top-level ticket members,
-// streamed from the spool; a frame without one, or that is not a JSON
-// object, comes back unchanged as body.
-func stripTicketMember(data *spool, body io.Reader) io.Reader {
-	type member struct {
-		ks, ve int64
-		ticket bool
+// clientFrameError refuses a client text frame keeper cannot parse as one
+// JSON object, so it cannot tell whether a ticket member is inside.
+type clientFrameError struct{ err error }
+
+func (e *clientFrameError) Error() string {
+	return fmt.Sprintf("%s: the client WebSocket text frame is not one JSON object %s can parse (%v); it is refused, never relayed unstripped", keeperHop, keeperHop, e.err)
+}
+
+func (e *clientFrameError) apiError() *apiError {
+	return &apiError{status: http.StatusBadRequest, typ: "invalid_request_error", code: "client_frame_unparseable", hop: keeperHop, message: e.Error()}
+}
+
+// refuseClientFrame names a refused client frame to the client and returns
+// its status; any other relay error returns 502 as before.
+func refuseClientFrame(ctx context.Context, conn *websocket.Conn, err error) (int, bool) {
+	var refused *clientFrameError
+	if errors.As(err, &refused) {
+		return wsError(ctx, conn, refused.apiError()), true
 	}
-	var ms []member
+	return http.StatusBadGateway, false
+}
+
+// ticketMemberIn parses the whole frame as one JSON object, with no member
+// cap and nothing kept per member, and reports a top-level ticket member.
+// Trailing bytes other than whitespace fail the parse.
+func ticketMemberIn(data *spool) (bool, error) {
 	found := false
 	s := spoolScanner(data)
-	err := s.objectFields(data.keySlice, func(key string, _, end int64) error {
-		ms = append(ms, member{s.keyStart, end, key == ticketMember})
+	err := s.allObjectFields(data.keySlice, func(key string, _, _ int64) error {
 		found = found || key == ticketMember
 		return nil
 	})
-	if err != nil && found {
-		return errorReader{errors.New("keeper: frame carries a ticket member it cannot strip")}
-	}
-	if err != nil || !found {
-		return body
-	}
-	parts := []io.Reader{data.section(0, ms[0].ks)}
-	for _, m := range ms {
-		if m.ticket {
-			continue
+	if err == nil {
+		s.skipWS()
+		if _, more := s.peek(); more {
+			err = errors.New("bytes after the object")
+		} else if s.err != nil {
+			err = s.err
 		}
-		if len(parts) > 1 {
-			parts = append(parts, strings.NewReader(","))
-		}
-		parts = append(parts, data.section(m.ks, m.ve-m.ks))
 	}
-	last := ms[len(ms)-1].ve
-	return io.MultiReader(append(parts, data.section(last, data.size-last))...)
+	if err != nil {
+		return false, &clientFrameError{err}
+	}
+	return found, nil
 }
 
-type errorReader struct{ err error }
+// stripTicketMember streams the frame without any top-level ticket member,
+// wherever it appears, re-scanning the spool as the reader pulls; nothing
+// per member is kept. The frame must have passed ticketMemberIn. Close
+// waits for the scanning goroutine, so the spool may be closed after it.
+func stripTicketMember(data *spool) io.ReadCloser {
+	pr, pw := io.Pipe()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		pw.CloseWithError(writeStripped(pw, data))
+	}()
+	return &strippedFrame{PipeReader: pr, done: done}
+}
 
-func (r errorReader) Read([]byte) (int, error) { return 0, r.err }
+type strippedFrame struct {
+	*io.PipeReader
+	done chan struct{}
+}
+
+func (f *strippedFrame) Close() error {
+	err := f.PipeReader.Close()
+	<-f.done
+	return err
+}
+
+// writeStripped copies data to w, cutting each ticket member with one
+// adjacent comma: after a kept member it cuts from that member's end to the
+// ticket's end; before the first kept member it cuts from the ticket's key
+// to the next kept key (or, with no kept member, to the last ticket's end).
+func writeStripped(w io.Writer, data *spool) error {
+	pos, lastKept, lead, lastTicket := int64(0), int64(-1), int64(-1), int64(-1)
+	emit := func(end int64) error {
+		if end > pos {
+			if _, err := io.Copy(w, data.section(pos, end-pos)); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	s := spoolScanner(data)
+	err := s.allObjectFields(data.keySlice, func(key string, _, end int64) error {
+		ks := s.keyStart
+		if key != ticketMember {
+			if lead >= 0 {
+				if err := emit(lead); err != nil {
+					return err
+				}
+				pos, lead = ks, -1
+			}
+			lastKept = end
+			return nil
+		}
+		if lastKept >= 0 {
+			if err := emit(lastKept); err != nil {
+				return err
+			}
+			pos = end
+		} else if lead < 0 {
+			lead = ks
+		}
+		lastTicket = end
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	if lead >= 0 {
+		if err := emit(lead); err != nil {
+			return err
+		}
+		pos = lastTicket
+	}
+	return emit(data.size)
+}
 
 // ticketFirst returns r with the ticket member inserted right after the
 // opening brace of its non-empty top-level JSON object.

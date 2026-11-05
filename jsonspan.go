@@ -181,6 +181,17 @@ func (s *jsonScanner) skipValue() (start, end int64, err error) {
 // Keys are read back through fn's own bounded read (64 KiB cap); large or
 // absent keys surface as empty strings.
 func (s *jsonScanner) objectFields(readSpan func(start, end int64) []byte, fn func(key string, start, end int64) error) error {
+	return s.objectFieldsUpTo(256, readSpan, fn)
+}
+
+// allObjectFields is objectFields with no member cap, for a scan that keeps
+// nothing per member (stripping the ticket member must see every member).
+func (s *jsonScanner) allObjectFields(readSpan func(start, end int64) []byte, fn func(key string, start, end int64) error) error {
+	return s.objectFieldsUpTo(-1, readSpan, fn)
+}
+
+// objectFieldsUpTo fails with errWorkSize past maxFields members; < 0: no cap.
+func (s *jsonScanner) objectFieldsUpTo(maxFields int, readSpan func(start, end int64) []byte, fn func(key string, start, end int64) error) error {
 	s.skipWS()
 	if b, _ := s.peek(); b != '{' {
 		return errJSONSyntax
@@ -192,7 +203,7 @@ func (s *jsonScanner) objectFields(readSpan func(start, end int64) []byte, fn fu
 		return nil
 	}
 	for fields := 0; ; fields++ {
-		if fields >= 256 {
+		if maxFields >= 0 && fields >= maxFields {
 			return errWorkSize
 		}
 		s.skipWS()
