@@ -17,6 +17,7 @@ type preparedStoreItem struct {
 }
 type preparedStoreSource struct {
 	file      *spool
+	hold      *spoolBody // set when items are read in place from the caller's spool
 	plan      *chainPlan
 	items     []preparedStoreItem
 	credits   []func()
@@ -27,7 +28,9 @@ type preparedStoreSource struct {
 }
 
 func (p *preparedStoreSource) Close() {
-	if p.file != nil {
+	if p.hold != nil {
+		_ = p.hold.Close()
+	} else if p.file != nil {
 		_ = p.file.Close()
 	}
 	if p.gen != nil {
@@ -118,10 +121,6 @@ func (s *store) prepareStoreSource(ctx context.Context, owner [32]byte, source i
 		}
 	}()
 	k := &keeper{cfg: config{storeDir: s.dir}, work: s.inputWork}
-	p.file, err = k.newSpool()
-	if err != nil {
-		return nil, err
-	}
 	// One small-item buffer plus the streaming validator of a large item.
 	window, err := s.inputWork.reserveInput(64<<10 + jsonValidateCredit)
 	if err != nil {
@@ -164,11 +163,31 @@ func (s *store) prepareStoreSource(ctx context.Context, owner [32]byte, source i
 		if int64(len(p.items)+2)*nodeMetaOverhead > s.maxMeta {
 			return nil, errStoreBudget
 		}
-		if p.file.size+n > maxSpoolBytes {
+		// An item already on a stable spool is staged from there in place:
+		// no second full-size copy (keeper disk 2N, gate k_disk 2, D4).
+		inPlace, ok := r.(*spoolItemReader)
+		switch {
+		case p.file == nil && ok:
+			if p.hold, err = inPlace.f.requestBody(); err != nil {
+				return nil, err
+			}
+			p.file = inPlace.f
+		case p.file == nil:
+			if p.file, err = k.newSpool(); err != nil {
+				return nil, err
+			}
+		case ok != (p.hold != nil) || (ok && inPlace.f != p.file):
+			return nil, errors.New("store source mixes spools")
+		}
+		if !ok && p.file.size+n > maxSpoolBytes {
 			return nil, errWorkSize
 		}
 		var hash [32]byte
 		offset := p.file.size
+		var sink io.Writer = p.file
+		if ok {
+			offset, sink = inPlace.off, io.Discard
+		}
 		if n <= int64(len(buf)) {
 			item := buf[:n]
 			if _, err = io.ReadFull(r, item); err != nil {
@@ -179,7 +198,7 @@ func (s *store) prepareStoreSource(ctx context.Context, owner [32]byte, source i
 			}
 			hash = sha256.Sum256(item)
 			if _, seen := seenSpans[hash]; !seen {
-				if _, err = p.file.Write(item); err != nil {
+				if _, err = sink.Write(item); err != nil {
 					return nil, err
 				}
 			}
@@ -187,13 +206,14 @@ func (s *store) prepareStoreSource(ctx context.Context, owner [32]byte, source i
 			// A large item streams through the validator into the spool;
 			// a duplicate's copy stays unused there (disk only, in budget).
 			h := sha256.New()
-			if err = validJSONStream(ctx, io.TeeReader(io.LimitReader(r, n), io.MultiWriter(h, p.file))); err != nil {
+			counted := &countingWriter{w: io.MultiWriter(h, sink)}
+			if err = validJSONStream(ctx, io.TeeReader(io.LimitReader(r, n), counted)); err != nil {
 				if errors.Is(err, errJSONSyntax) {
 					err = errUpstreamData
 				}
 				return nil, err
 			}
-			if p.file.size-offset != n {
+			if counted.n != n {
 				return nil, io.ErrUnexpectedEOF
 			}
 			h.Sum(hash[:0])
@@ -212,6 +232,25 @@ func (s *store) prepareStoreSource(ctx context.Context, owner [32]byte, source i
 	}
 	p.plan.tip = parent
 	return p, nil
+}
+
+// spoolItemReader streams one item stored at payload offset off of f; the
+// store stages it in place while f stays held.
+type spoolItemReader struct {
+	io.Reader
+	f   *spool
+	off int64
+}
+
+type countingWriter struct {
+	w io.Writer
+	n int64
+}
+
+func (c *countingWriter) Write(p []byte) (int, error) {
+	n, err := c.w.Write(p)
+	c.n += int64(n)
+	return n, err
 }
 
 // storePiece is one bounded Put: a whole small item, or one chunk of a

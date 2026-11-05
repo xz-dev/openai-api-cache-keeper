@@ -56,32 +56,26 @@ func turnBody(prev, input string) string {
 }
 
 // waitSpoolsClosed waits for every turn to end, asserts no spool byte is
-// live and restarts the spool high-water mark.
-func waitSpoolsClosed(t *testing.T, k *keeper) {
+// live, and returns and restarts the spool high-water mark.
+func waitSpoolsClosed(t *testing.T, k *keeper) int64 {
 	t.Helper()
 	waitWorking(t, k, 0)
 	deadline := time.Now().Add(5 * time.Second)
 	for {
 		k.work.mu.Lock()
-		d := k.work.disk
+		d, peak := k.work.disk, k.work.diskPeak
 		if d == 0 {
 			k.work.diskPeak = 0
 		}
 		k.work.mu.Unlock()
 		if d == 0 {
-			return
+			return peak
 		}
 		if time.Now().After(deadline) {
 			t.Fatalf("spool bytes still live: %d", d)
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
-}
-
-func spoolPeak(k *keeper) int64 {
-	k.work.mu.Lock()
-	defer k.work.mu.Unlock()
-	return k.work.diskPeak
 }
 
 func wsTerminal(t *testing.T, c *websocket.Conn, frame string) map[string]any {
@@ -125,7 +119,7 @@ func TestExpansionAdmittedBeforeSpool(t *testing.T) {
 	if status != 200 {
 		t.Fatalf("http turn2 %d %.200s", status, out)
 	}
-	if d := p.reset(); len(d) != 1 || d[0] > 2*int64(len(delta)) { // x2: B1 removes the re-spool
+	if d := p.reset(); len(d) != 1 || d[0] > int64(len(delta)) {
 		t.Fatalf("http: spool bytes at admission %v, want one decision holding only the %d-byte request", d, len(delta))
 	}
 	waitLedgerEmpty(t, k)
@@ -159,8 +153,35 @@ func TestExpansionOverCapRefusedBeforeSpool(t *testing.T) {
 	if status != 413 || !strings.Contains(out, "history_too_large") {
 		t.Fatalf("over cap: %d %.300s", status, out)
 	}
-	if peak := spoolPeak(k); peak > 2*int64(len(body)) { // x2: B1 removes the re-spool
+	if peak := waitSpoolsClosed(t, k); peak > int64(len(body)) {
 		t.Fatalf("spool peak %d > raw request %d: expansion bytes written before the cap check", peak, len(body))
 	}
 	waitLedgerEmpty(t, k)
+}
+
+// B1: keeper's spool bytes stay within the gate's k_disk 2 (gate.go): the
+// first body spool is reused, never copied, so a first turn peaks at its raw
+// request plus its expansion, and a continuation at its expansion plus delta.
+func TestSpoolPeakWithinTwoN(t *testing.T) {
+	srv, k, _ := expansionKeeper(t)
+	body := turnBody("", strings.Repeat("x", 70<<20))
+	status, out, _ := post(t, srv, "Bearer big", body)
+	if status != 200 {
+		t.Fatalf("turn1 %d %.200s", status, out)
+	}
+	// The expansion wraps the string input in a user item: N is the larger.
+	n := int64(len(body)) + 64
+	if peak := waitSpoolsClosed(t, k); peak == 0 || peak > 2*n {
+		t.Fatalf("first turn spool peak %d, want <= 2N = %d", peak, 2*n)
+	}
+	id1 := completedID(t, out)
+	delta := turnBody(id1, strings.Repeat("y", 1<<20))
+	status, out, _ = post(t, srv, "Bearer big", delta)
+	if status != 200 {
+		t.Fatalf("turn2 %d %.200s", status, out)
+	}
+	n += int64(len(delta))
+	if peak := waitSpoolsClosed(t, k); peak > 2*n {
+		t.Fatalf("continuation spool peak %d, want <= 2N = %d", peak, 2*n)
+	}
 }

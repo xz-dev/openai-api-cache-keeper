@@ -203,7 +203,7 @@ func (t *diskTurn) itemStream() itemStreamFactory {
 			}
 			span := t.spans[i]
 			i++
-			return int64(span.n), t.file.section(span.off, int64(span.n)), nil
+			return int64(span.n), &spoolItemReader{t.file.section(span.off, int64(span.n)), t.file, span.off}, nil
 		}
 	}
 }

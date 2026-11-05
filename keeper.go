@@ -206,13 +206,14 @@ func (k *keeper) localCheckpointTurn(w http.ResponseWriter, r *http.Request) (re
 		return nil, false, false, true
 	}
 	r.Body = body
+	raw.Close() // body holds the spool from here; its handler releases it early
 	background = decodeErr == nil && streamFlag && backgroundFlag
 	// A turn is local when the keeper can replay its full input: either it
 	// carries no parent at all, or it names one the keeper stored for this
 	// owner. Any other previous_response_id is an opaque native reference and
 	// the request keeps native semantics end to end.
 	endState := lease.retain()
-	return func() { body.Close(); raw.Close(); endState() }, owned || prevID == "", background, false
+	return func() { body.Close(); endState() }, owned || prevID == "", background, false
 }
 
 // headerAuth authenticates a declared large body at the headers, before any
@@ -455,6 +456,25 @@ func (k *keeper) forwardReader(ctx context.Context, upstream *url.URL, path, raw
 	return k.client.Do(req)
 }
 
+// httpRequestSpool returns the request body's spool and the release of this
+// handler's hold on it. A body localCheckpointTurn already spooled (and
+// authenticated) is reused, never copied, so keeper's peak disk is the raw
+// request plus its expansion, 2N (gate k_disk 2, design D4).
+func (k *keeper) httpRequestSpool(w http.ResponseWriter, r *http.Request) (*spool, func(), *apiError) {
+	if b, ok := r.Body.(*spoolBody); ok {
+		return b.spool, func() { b.Close() }, nil
+	}
+	auth, apiErr := k.headerAuth(r)
+	if apiErr != nil {
+		return nil, nil, apiErr
+	}
+	raw, err := k.spoolRequest(r.Context(), http.MaxBytesReader(w, r.Body, k.cfg.maxRequestBytes), auth)
+	if err != nil {
+		return nil, nil, workingError(err)
+	}
+	return raw, func() { raw.Close() }, nil
+}
+
 func (k *keeper) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	task, _ := r.Context().Value(backgroundTaskKey{}).(*responseTask)
 	start := time.Now()
@@ -465,20 +485,12 @@ func (k *keeper) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	defer lease.Close()
 	r = r.WithContext(context.WithValue(r.Context(), requestStateKey{}, lease))
-	var auth largeAuth
-	if _, respooled := r.Body.(*spoolBody); !respooled { // a spoolBody was authenticated when first spooled
-		var apiErr *apiError
-		if auth, apiErr = k.headerAuth(r); apiErr != nil {
-			writeAPIError(w, apiErr)
-			return
-		}
-	}
-	raw, err := k.spoolRequest(r.Context(), http.MaxBytesReader(w, r.Body, k.cfg.maxRequestBytes), auth)
-	if err != nil {
-		writeAPIError(w, workingError(err))
+	raw, releaseRaw, apiErr := k.httpRequestSpool(w, r)
+	if apiErr != nil {
+		writeAPIError(w, apiErr)
 		return
 	}
-	defer raw.Close()
+	defer releaseRaw()
 	upstream, stream, routeErr := k.routeRequest(r.Context(), raw, false)
 	if routeErr != nil {
 		writeRoutingError(w, routeErr, stream)
@@ -488,7 +500,7 @@ func (k *keeper) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	t, apiErr := k.prepareDiskAdmit(r.Context(), raw, owner, func(id string) (*historySnapshot, error) {
 		return k.store.snapshotID(r.Context(), id, owner, false)
 	}, false, false, k.admitTurn(r.Context(), raw, k.largeBodyAuth(r.Header, r.URL.RawQuery)))
-	raw.Close()
+	releaseRaw()
 	if apiErr != nil {
 		writeAPIError(w, apiErr)
 		return
