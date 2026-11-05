@@ -7,7 +7,9 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/coder/websocket"
 )
@@ -19,12 +21,15 @@ type boundUpstream struct {
 	requests []string // "METHOD path bytes"
 	bytes    int64
 	billing  int
+	active   atomic.Int64 // upstream handlers still running
 }
 
 func boundKeeper(t *testing.T) (*httptest.Server, *boundUpstream) {
 	t.Helper()
 	bu := &boundUpstream{}
 	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		bu.active.Add(1)
+		defer bu.active.Add(-1)
 		if r.URL.Path == "/v1/sub2api/billing" {
 			bu.mu.Lock()
 			bu.billing++
@@ -55,7 +60,17 @@ func boundKeeper(t *testing.T) (*httptest.Server, *boundUpstream) {
 	return srv, bu
 }
 
-func (bu *boundUpstream) snapshot() (int, int64, int) {
+// snapshot waits until no upstream handler runs (an aborted body is still
+// being counted after keeper answered), then reads the counters.
+func (bu *boundUpstream) snapshot(t *testing.T) (int, int64, int) {
+	t.Helper()
+	deadline := time.Now().Add(time.Minute)
+	for bu.active.Load() != 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("upstream handlers still running after 1 min")
+		}
+		time.Sleep(time.Millisecond)
+	}
 	bu.mu.Lock()
 	defer bu.mu.Unlock()
 	return len(bu.requests), bu.bytes, bu.billing
@@ -63,7 +78,9 @@ func (bu *boundUpstream) snapshot() (int, int64, int) {
 
 // sendBound sends method to path with an optional WebSocket Upgrade and a
 // body of size bytes (size < 0: no body), declared or chunked.
-func sendBound(t *testing.T, srv *httptest.Server, method, path string, upgrade bool, size int, chunked bool) (int, string) {
+// A transport error is returned, not fatal: a gated handshake that keeper
+// answers while the body is still being written can reset the write.
+func sendBound(t *testing.T, srv *httptest.Server, method, path string, upgrade bool, size int, chunked bool) (int, string, error) {
 	t.Helper()
 	var body io.Reader
 	if size >= 0 {
@@ -82,14 +99,14 @@ func sendBound(t *testing.T, srv *httptest.Server, method, path string, upgrade 
 	}
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		t.Fatalf("%s %s upgrade=%t size=%d chunked=%t: %v", method, path, upgrade, size, chunked, err)
+		return 0, "", err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode == http.StatusSwitchingProtocols {
-		return resp.StatusCode, ""
+		return resp.StatusCode, "", nil
 	}
 	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<16))
-	return resp.StatusCode, string(raw)
+	return resp.StatusCode, string(raw), nil
 }
 
 // Review 2026-11-05 M1: on a covered path only POST without Upgrade and GET
@@ -117,9 +134,12 @@ func TestCoveredPathUngatedRequestsBounded(t *testing.T) {
 					if upgrade {
 						name += " +Upgrade"
 					}
-					reqs0, bytes0, bill0 := bu.snapshot()
-					status, out := sendBound(t, srv, method, path, upgrade, b.size, b.chunked)
-					reqs, bytes, bill := bu.snapshot()
+					reqs0, bytes0, bill0 := bu.snapshot(t)
+					status, out, err := sendBound(t, srv, method, path, upgrade, b.size, b.chunked)
+					if err != nil && !(gated && upgrade) {
+						t.Fatalf("%s size=%d chunked=%t: %v", name, b.size, b.chunked, err)
+					}
+					reqs, bytes, bill := bu.snapshot(t)
 					sent := bytes - bytes0
 					notGated := strings.Contains(out, "is not a gated Responses request")
 					switch {
