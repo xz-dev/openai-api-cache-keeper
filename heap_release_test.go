@@ -51,6 +51,46 @@ func TestHeapReleaseSingleFlightRateLimited(t *testing.T) {
 	}
 }
 
+// A release that is still running refuses a second caller even once the
+// interval has passed: the busy flag, not the clock, refuses it.
+func TestHeapReleaseRefusedWhileRunning(t *testing.T) {
+	var now atomic.Int64
+	now.Store(int64(time.Hour))
+	var runs atomic.Int32
+	started := make(chan struct{}, 2)
+	gate := make(chan struct{})
+	h := &heapRelease{clock: now.Load, run: func() {
+		runs.Add(1)
+		started <- struct{}{}
+		<-gate
+	}}
+	h.request()
+	<-started
+	now.Add(10 * int64(heapReleaseInterval))
+	h.request()
+	if n := runs.Load(); n != 1 || !h.busy.Load() {
+		t.Fatalf("second caller during a release: runs %d busy %t", n, h.busy.Load())
+	}
+	select {
+	case <-started:
+		t.Fatal("second release started while the first ran")
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(gate)
+	for h.busy.Load() {
+		time.Sleep(time.Millisecond)
+	}
+	// The refused caller did not move the interval: the next request runs.
+	h.request()
+	<-started
+	for h.busy.Load() {
+		time.Sleep(time.Millisecond)
+	}
+	if n := runs.Load(); n != 2 {
+		t.Fatalf("runs %d after the first finished, want 2", n)
+	}
+}
+
 // A ticketed request asks for the release when its last holder lets go,
 // not before.
 func TestTicketEndRequestsHeapRelease(t *testing.T) {
