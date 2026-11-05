@@ -25,6 +25,7 @@ type capacityGate struct {
 	memAvailable func() (int64, error)
 	diskFree     func() (int64, error)
 	waiters      sync.WaitGroup
+	heap         heapRelease // returns a ticketed request's heap when it ends
 }
 
 // newCapacityGate opens the ledger and starts one release waiter per ticket

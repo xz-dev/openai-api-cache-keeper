@@ -95,7 +95,8 @@ func (t *capTicket) ref() bool {
 	return true
 }
 
-// unref drops one holder; the last one starts the release waiter.
+// unref drops one holder; the last one ends the large request: it starts
+// the release waiter and asks for the heap release.
 func (t *capTicket) unref() {
 	t.mu.Lock()
 	t.refs--
@@ -104,6 +105,7 @@ func (t *capTicket) unref() {
 	t.mu.Unlock()
 	if last {
 		t.g.wait(rec, t.f)
+		t.g.heap.request()
 	}
 }
 
