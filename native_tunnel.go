@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"crypto/rand"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -12,6 +13,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 // serveNativeTunnel relays a native WebSocket on a non-Responses path (for
@@ -207,7 +209,21 @@ func (t *wsTunnel) down(r *bufio.Reader) {
 // placed then; the close still names the cause).
 func (t *wsTunnel) refuse(event bool, code uint16, reason string) {
 	t.refusing.Store(true)
-	t.back.Close() // unblocks down; the upstream never sees the message
+	// The upstream may already hold the message's first fragments. A bare
+	// TCP close at a frame boundary can read as the message's end to some
+	// WebSocket readers (coder/websocket returns the partial message), so it
+	// gets a close frame first; only up() writes to back, at a frame
+	// boundary. The write is bounded so a stalled upstream cannot hold up.
+	wrote := make(chan struct{})
+	go func() {
+		defer close(wrote)
+		_, _ = t.back.Write(wsClientFrame(0x8, append(binary.BigEndian.AppendUint16(nil, code), reason...)))
+	}()
+	select {
+	case <-wrote:
+	case <-time.After(5 * time.Second):
+	}
+	t.back.Close() // unblocks down and a stalled close write
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	if t.downPartial {
@@ -222,6 +238,18 @@ func (t *wsTunnel) refuse(event bool, code uint16, reason string) {
 		}
 	}
 	_, _ = t.client.Write(wsServerFrame(0x8, append(binary.BigEndian.AppendUint16(nil, code), reason...)))
+}
+
+// wsClientFrame encodes one masked, unfragmented client frame (payload of
+// at most 125 bytes, as for a close frame).
+func wsClientFrame(op byte, payload []byte) []byte {
+	var key [4]byte
+	_, _ = rand.Read(key[:])
+	b := append([]byte{0x80 | op, 0x80 | byte(len(payload))}, key[:]...)
+	for i, c := range payload {
+		b = append(b, c^key[i%4])
+	}
+	return b
 }
 
 // wsServerFrame encodes one unmasked, unfragmented server frame.
