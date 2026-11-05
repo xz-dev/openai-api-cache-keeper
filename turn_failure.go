@@ -2,10 +2,13 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
 	"errors"
 	"fmt"
 	"log"
 	"net/http"
+	"sync/atomic"
+	"time"
 
 	"github.com/coder/websocket"
 )
@@ -51,16 +54,53 @@ func requestIDFrom(hdr http.Header) string {
 	return "-"
 }
 
-func logTurnEnd(e turnEnd, requestID, storedID string) {
-	log.Printf("ws turn ended early: side=%s close_code=%d reason=%q cause=%q request_id=%s response=%s",
-		e.side, e.code, boundedText(e.reason), boundedText(e.cause), requestID, orDash(storedID))
+// then appends a later cause to the first one, which is never overwritten:
+// the first side to fail is the one that explains a close (Q4).
+func (e turnEnd) then(later turnEnd) turnEnd {
+	e.cause = boundedText(fmt.Sprintf("%s; then side=%s close_code=%d reason=%q cause=%q", e.cause, later.side, later.code, boundedText(later.reason), boundedText(later.cause)))
+	return e
+}
+
+// wsClock is a socket's age and the time its last frame arrived from each
+// side, so a close can be matched to idle or keepalive timers (Q4).
+type wsClock struct {
+	start                 time.Time
+	lastClient, lastInner atomic.Int64 // UnixNano of the last frame read; 0 = none
+}
+
+func newWSClock() *wsClock { return &wsClock{start: time.Now()} }
+
+func since(nanos int64, now time.Time) string {
+	if nanos == 0 {
+		return "none"
+	}
+	return now.Sub(time.Unix(0, nanos)).Round(time.Millisecond).String()
+}
+
+func (c *wsClock) String() string {
+	now := time.Now()
+	return fmt.Sprintf("age=%s since_client_frame=%s since_upstream_frame=%s",
+		now.Sub(c.start).Round(time.Millisecond), since(c.lastClient.Load(), now), since(c.lastInner.Load(), now))
+}
+
+func logTurnEnd(e turnEnd, requestID, storedID string, clock *wsClock) {
+	log.Printf("ws turn ended early: side=%s close_code=%d reason=%q cause=%q request_id=%s response=%s %s",
+		e.side, e.code, boundedText(e.reason), boundedText(e.cause), requestID, orDash(storedID), clock)
 }
 
 // logSessionEnd records the close cause of a socket with no open turn, so
 // every WS cleanup has a cause line.
-func logSessionEnd(e turnEnd, requestID string) {
-	log.Printf("ws session closed: side=%s close_code=%d reason=%q cause=%q request_id=%s",
-		e.side, e.code, boundedText(e.reason), boundedText(e.cause), requestID)
+func logSessionEnd(e turnEnd, requestID string, clock *wsClock) {
+	log.Printf("ws session closed: side=%s close_code=%d reason=%q cause=%q request_id=%s %s",
+		e.side, e.code, boundedText(e.reason), boundedText(e.cause), requestID, clock)
+}
+
+// ensureRequestID gives a request without an outer request id a keeper one,
+// sent on to the inner hop, so both sides' logs carry the same id (Q4).
+func ensureRequestID(r *http.Request) {
+	if requestIDOf(r) == "-" {
+		r.Header.Set("X-Request-Id", "keeper-"+rand.Text())
+	}
 }
 
 func boundedText(s string) string {

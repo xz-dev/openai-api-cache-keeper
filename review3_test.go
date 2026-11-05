@@ -125,9 +125,13 @@ func TestReview3WriteErrorReleasesInflight(t *testing.T) {
 	}
 	defer data.Close()
 	in := &wsNativeInflight{turn: turn}
-	status := k.wsNativeUpstreamFrame(context.Background(), conn, &wsFrame{typ: websocket.MessageText, spool: data}, &wsSession{}, in)
+	status, cause := k.wsNativeUpstreamFrame(context.Background(), conn, &wsFrame{typ: websocket.MessageText, spool: data}, &wsSession{}, in)
 	if status != -1 {
 		t.Fatalf("want writer failure; got %d", status)
+	}
+	// Q4: a failed client write is the client's side, with its error.
+	if cause.side != "client" || !strings.Contains(cause.cause, "write to client") {
+		t.Fatalf("writer failure cause: %+v", cause)
 	}
 	k.work.mu.Lock()
 	output := k.work.output

@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -124,6 +125,7 @@ func (f closerFunc) Close() error { return f() }
 // Turns serialize exactly once: while a turn is in flight, later create frames
 // wait. Every other frame — upstream or client — relays immediately.
 func (k *keeper) serveWSNative(w http.ResponseWriter, r *http.Request) {
+	ensureRequestID(r)
 	lease, err := k.work.state(socketStateBytes(r.Header), &k.work.activeSockets)
 	if err != nil {
 		writeAPIError(w, workingError(err))
@@ -208,6 +210,7 @@ func (k *keeper) serveWSNative(w http.ResponseWriter, r *http.Request) {
 	}
 	defer conn.CloseNow()
 	conn.SetReadLimit(k.cfg.maxRequestBytes + 1)
+	clock := newWSClock()
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
 	owner := k.ownerOf(r)
@@ -235,6 +238,9 @@ func (k *keeper) serveWSNative(w http.ResponseWriter, r *http.Request) {
 		defer cancel()
 		for {
 			typ, reader, err := upstream.Reader(context.Background())
+			if err == nil {
+				clock.lastInner.Store(time.Now().UnixNano())
+			}
 			if err != nil {
 				select {
 				case upCh <- pumpResult{err: err}:
@@ -285,6 +291,9 @@ func (k *keeper) serveWSNative(w http.ResponseWriter, r *http.Request) {
 		defer cancel()
 		for {
 			typ, reader, err := conn.Reader(context.Background())
+			if err == nil {
+				clock.lastClient.Store(time.Now().UnixNano())
+			}
 			if err != nil {
 				select {
 				case clCh <- pumpResult{err: err}:
@@ -351,10 +360,16 @@ func (k *keeper) serveWSNative(w http.ResponseWriter, r *http.Request) {
 	var turnPrevious bool
 	reqID := requestIDOf(r)
 	end := turnEnd{side: "keeper", code: -1, cause: "handler ended"}
-	// endTurn records the cause and, while a turn is open, ends it with an
-	// explicit error event before the client socket closes (never bare).
+	endSet := false
+	// endTurn records the FIRST cause (later ones are appended, never
+	// overwrite it) and, while a turn is open, ends it with an explicit
+	// error event before the client socket closes (never bare).
 	endTurn := func(e turnEnd, tellClient bool) {
-		end = e
+		if endSet {
+			end = end.then(e)
+		} else {
+			end, endSet = e, true
+		}
 		if tellClient && (inflight != nil || nativeOpen) {
 			failOpenTurn(r.Context(), conn, inflight, e)
 		}
@@ -391,9 +406,9 @@ func (k *keeper) serveWSNative(w http.ResponseWriter, r *http.Request) {
 			storedID = inflight.id
 		}
 		if !turnStart.IsZero() {
-			logTurnEnd(end, reqID, storedID)
+			logTurnEnd(end, reqID, storedID, clock)
 		} else {
-			logSessionEnd(end, reqID)
+			logSessionEnd(end, reqID, clock)
 		}
 		finishLog(http.StatusBadGateway, storedID)
 		releaseInflight()
@@ -435,9 +450,10 @@ func (k *keeper) serveWSNative(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if inflight != nil {
-			if status := k.wsNativeUpstreamFrame(ctx, conn, f, sess, inflight); status != 0 {
+			if status, cause := k.wsNativeUpstreamFrame(ctx, conn, f, sess, inflight); status != 0 {
 				if status == -1 {
-					logTurnEnd(turnEnd{side: "keeper", code: -1, cause: "upstream frame could not be relayed"}, reqID, inflight.id)
+					endTurn(cause, false)
+					logTurnEnd(cause, reqID, inflight.id, clock)
 					finishLog(http.StatusBadGateway, inflight.id)
 				} else {
 					finishLog(status, inflight.id)
@@ -776,6 +792,9 @@ func (k *keeper) spoolRequestUTF8(ctx context.Context, r io.Reader, typ websocke
 // wsNativeClientFrame classifies and forwards one client frame.
 func (k *keeper) wsNativeClientFrame(ctx context.Context, conn, upstream *websocket.Conn, r *http.Request, owner [32]byte, f *wsFrame, sess *wsSession, inflight **wsNativeInflight, nativeOpen *bool) (string, int, bool) {
 	data := f.spool
+	// Error events use the handler's context, not the pump context: an
+	// inner hop that closes (e.g. 1009 on an over-limit frame) cancels the
+	// pumps, and the client must still get the event, never a bare close (D9).
 	if f.typ != websocket.MessageText {
 		// Binary/opaque frames relay verbatim.
 		if err := k.wsRelayFrame(ctx, upstream, data, f.typ, true); err != nil {
@@ -792,7 +811,7 @@ func (k *keeper) wsNativeClientFrame(ctx context.Context, conn, upstream *websoc
 		return "", http.StatusOK, false
 	}
 	if probe.err != nil {
-		return "", wsError(ctx, conn, workingError(probe.err)), true
+		return "", wsError(r.Context(), conn, workingError(probe.err)), true
 	}
 	if probe.prevSet {
 		known, valid := k.store.ownedID(probe.prev, owner)
@@ -807,7 +826,7 @@ func (k *keeper) wsNativeClientFrame(ctx context.Context, conn, upstream *websoc
 			}
 			if !valid {
 				if known || pinned || strings.HasPrefix(probe.prev, keeperResponsePrefix) || probe.prev == sess.lastID {
-					return "", wsError(ctx, conn, previousNotFound(probe.prev)), true
+					return "", wsError(r.Context(), conn, previousNotFound(probe.prev)), true
 				}
 				// Native parent: the delta is meaningful only downstream.
 				// Forward verbatim and mark the turn so its events stay
@@ -833,28 +852,39 @@ func (k *keeper) wsNativeClientFrame(ctx context.Context, conn, upstream *websoc
 	}
 	t, apiErr := k.prepareDiskAdmit(ctx, data, owner, lookup, true, true, k.admitTurn(ctx, data, k.largeBodyAuth(r.Header, r.URL.RawQuery)))
 	if apiErr != nil {
-		return "", wsError(ctx, conn, apiErr), probe.prevSet
+		return "", wsError(r.Context(), conn, apiErr), probe.prevSet
 	}
 	body, err := t.file.requestBody()
 	if err != nil {
 		t.file.Close()
-		return "", wsError(ctx, conn, workingError(err)), probe.prevSet
+		return "", wsError(r.Context(), conn, workingError(err)), probe.prevSet
 	}
 	w, err := upstream.Writer(ctx, websocket.MessageText)
 	if err != nil {
 		body.Close()
 		t.file.Close()
-		return "", wsError(ctx, conn, upstreamFailed(requestIDOf(r), "ws upstream writer", err)), probe.prevSet
+		return "", innerEndsTurn(nativeOpen, requestIDOf(r), "ws upstream writer", err), probe.prevSet
 	}
 	_, copyErr := io.Copy(struct{ io.Writer }{w}, body)
 	closeErr := w.Close()
 	body.Close()
 	if copyErr != nil || closeErr != nil {
 		t.file.Close()
-		return "", wsError(ctx, conn, upstreamFailed(requestIDOf(r), "ws upstream send", errors.Join(copyErr, closeErr))), probe.prevSet
+		return "", innerEndsTurn(nativeOpen, requestIDOf(r), "ws upstream send", errors.Join(copyErr, closeErr)), probe.prevSet
 	}
 	*inflight = &wsNativeInflight{turn: t, owner: owner, sess: sess}
 	return "", http.StatusOK, probe.prevSet
+}
+
+// innerEndsTurn handles a failed send of a turn frame: the inner hop's
+// socket is gone, and its close (for example 1009 from a 16 MiB limit)
+// reaches the handler next. The turn stays open until then, so the client
+// gets an error event carrying that close code and reason, naming keeper
+// (D9, task 3.1), instead of the bare write error or a bare close.
+func innerEndsTurn(nativeOpen *bool, requestID, where string, err error) int {
+	upstreamFailed(requestID, where, err) // logs the send side
+	*nativeOpen = true
+	return http.StatusBadGateway
 }
 
 // wsNativeUpstreamFrame relays one upstream text frame through the collector,
@@ -863,7 +893,7 @@ func (k *keeper) wsNativeClientFrame(ctx context.Context, conn, upstream *websoc
 // non-zero status marks the turn finished (-1: connection-level failure).
 // Every non-zero return releases the turn's spool and collector charge, so
 // the caller only clears its pointer.
-func (k *keeper) wsNativeUpstreamFrame(ctx context.Context, conn *websocket.Conn, f *wsFrame, sess *wsSession, inflight *wsNativeInflight) (status int) {
+func (k *keeper) wsNativeUpstreamFrame(ctx context.Context, conn *websocket.Conn, f *wsFrame, sess *wsSession, inflight *wsNativeInflight) (status int, cause turnEnd) {
 	data := f.spool
 	endTurn := func(code int) int {
 		inflight.failed = code == -1
@@ -873,10 +903,10 @@ func (k *keeper) wsNativeUpstreamFrame(ctx context.Context, conn *websocket.Conn
 	}
 	// A keeper-side refusal ends the open turn with an explicit event
 	// before the socket closes (never bare).
-	failKeeper := func(err error) int {
+	failKeeper := func(err error) (int, turnEnd) {
 		log.Printf("ws native upstream frame refused: %v", err)
 		wsFailure(ctx, conn, inflight.c.responseID(), inflight.c.nextSeq(), responseError(err))
-		return endTurn(-1)
+		return endTurn(-1), turnEnd{side: "keeper", code: -1, cause: "upstream frame refused: " + err.Error()}
 	}
 	// The event is the smallest unit: copy it once into a charged buffer so
 	// rewrite and collect share one bounded copy instead of two.
@@ -897,12 +927,13 @@ func (k *keeper) wsNativeUpstreamFrame(ctx context.Context, conn *websocket.Conn
 	}
 	defer release()
 	if err := conn.Write(ctx, websocket.MessageText, wire); err != nil {
-		return endTurn(-1)
+		// The client socket failed, not keeper: name it with its error.
+		return endTurn(-1), endFromErr("client", fmt.Errorf("write to client: %w", err))
 	}
 	if terminal {
-		return endTurn(http.StatusOK)
+		return endTurn(http.StatusOK), turnEnd{}
 	}
-	return 0
+	return 0, turnEnd{}
 }
 
 // chargedCopy reads the whole spool once into an output-charged buffer; the
