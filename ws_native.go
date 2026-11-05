@@ -434,6 +434,15 @@ func (k *keeper) serveWSNative(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Every exit, including a panic, kills both sockets first (so the pumps
+	// return and close their channels) and then runs cleanup: no spool,
+	// ticket or socket slot outlives the handler.
+	defer func() {
+		conn.CloseNow()
+		upstream.CloseNow()
+		cleanup()
+	}()
+
 	processClient := func(f *wsFrame) {
 		start := time.Now()
 		create := f.typ == websocket.MessageText && isWSCreate(f.spool)
@@ -507,9 +516,6 @@ func (k *keeper) serveWSNative(w http.ResponseWriter, r *http.Request) {
 				// treat like a transport EOF.
 				endTurn(endFromErr("upstream", nil), true)
 				upCh = nil
-				conn.CloseNow()
-				upstream.CloseNow()
-				cleanup()
 				return
 			}
 			if res.err != nil {
@@ -524,9 +530,6 @@ func (k *keeper) serveWSNative(w http.ResponseWriter, r *http.Request) {
 					_ = conn.Close(websocket.StatusInvalidFramePayloadData, "invalid UTF-8")
 				}
 				upCh = nil
-				conn.CloseNow()
-				upstream.CloseNow()
-				cleanup()
 				return
 			}
 			f := res.frame
@@ -535,9 +538,6 @@ func (k *keeper) serveWSNative(w http.ResponseWriter, r *http.Request) {
 			if !ok {
 				endTurn(endFromErr("client", nil), false)
 				clCh = nil
-				conn.CloseNow()
-				upstream.CloseNow()
-				cleanup()
 				return
 			}
 			if res.err != nil {
@@ -547,9 +547,6 @@ func (k *keeper) serveWSNative(w http.ResponseWriter, r *http.Request) {
 					_ = upstream.Close(ce.Code, ce.Reason)
 				}
 				clCh = nil
-				conn.CloseNow()
-				upstream.CloseNow()
-				cleanup()
 				return
 			}
 			f := res.frame
@@ -565,10 +562,6 @@ func (k *keeper) serveWSNative(w http.ResponseWriter, r *http.Request) {
 					endTurn(endFromErr("upstream", err), true)
 					f.spool.Close()
 					clCh = nil
-					conn.CloseNow()
-					upstream.CloseNow()
-					cleanup()
-					cancel()
 					return
 				}
 				f.spool.Close()
@@ -614,12 +607,9 @@ func (k *keeper) serveWSNative(w http.ResponseWriter, r *http.Request) {
 				}
 			default:
 			}
-			// Kill both sockets first: the pumps read with
-			// context.Background(), so their Readers return only after this,
+			// The deferred exit kills both sockets first: the pumps read with
+			// context.Background(), so their Readers return only after that,
 			// closing the channels cleanup drains.
-			conn.CloseNow()
-			upstream.CloseNow()
-			cleanup()
 			return
 		}
 	}

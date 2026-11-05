@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"unicode/utf8"
 	"unsafe"
@@ -233,6 +234,11 @@ func (c *collector) eventFields(raw []byte, ms []jsonMember) error {
 		if !smallInt(memberValue(raw, ms, "output_index"), &index) || index < 0 || len(item) == 0 {
 			return errUpstreamData
 		}
+		if index > maxOutputIndex {
+			// Refused before any multiplication: slots for this index alone
+			// exceed the collection bound, and grown*itemSlotBytes could wrap.
+			return &outputIndexError{index: index}
+		}
 		if index >= cap(c.items) {
 			// Slots are charged, never counted: the old and new header
 			// overlap while copying (D5).
@@ -274,9 +280,24 @@ func (c *collector) eventFields(raw []byte, ms []jsonMember) error {
 	return nil
 }
 
+// maxOutputIndex is the largest output_index whose item slots fit the
+// collection bound; a larger index is refused before any slot arithmetic.
+const maxOutputIndex = int(maxCollectedBytes / itemSlotBytes)
+
+// outputIndexError refuses an upstream output_index above maxOutputIndex.
+type outputIndexError struct{ index int }
+
+func (e *outputIndexError) Error() string {
+	return fmt.Sprintf("upstream output_index %d exceeds %d: its %d-byte item slots would exceed the %d-byte collection limit of %s", e.index, maxOutputIndex, itemSlotBytes, maxCollectedBytes, keeperHop)
+}
+
 func responseError(err error) *apiError {
+	var index *outputIndexError
+	if errors.As(err, &index) {
+		return &apiError{status: 502, typ: "upstream_error", code: "upstream_output_index_too_large", hop: keeperHop, limit: maxCollectedBytes, message: index.Error()}
+	}
 	if errors.Is(err, errUpstreamData) || errors.Is(err, io.ErrUnexpectedEOF) {
-		return &apiError{status: 502, typ: "upstream_error", message: "upstream response malformed or incomplete"}
+		return &apiError{status: 502, typ: "upstream_error", code: "upstream_response_malformed", hop: keeperHop, message: "upstream response malformed or incomplete"}
 	}
 	return workingError(err)
 }
@@ -354,12 +375,22 @@ func (c *collector) collect(raw []byte, m *workingSet, event bool) error {
 		scratch += n
 		return true
 	}
+	// A panic while decoding (a keeper bug) still frees the scratch, so a
+	// recovered task or a closed socket leaves no output charge behind.
+	decoded := false
+	defer func() {
+		if !decoded {
+			c.reserve = nil
+			m.freeOutput(scratch)
+		}
+	}()
 	var err error
 	if event {
 		err = c.event(raw)
 	} else {
 		err = c.response(raw)
 	}
+	decoded = true
 	c.reserve = nil
 	if err != nil {
 		m.freeOutput(scratch)

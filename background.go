@@ -8,8 +8,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync"
@@ -58,6 +60,34 @@ func (t *responseTask) signal() {
 	t.changed = make(chan struct{})
 }
 
+// errBackgroundPanic fails a task whose producer panicked.
+var errBackgroundPanic = errors.New("background task failed: keeper internal error")
+
+// runBackground runs the task's producer. A panic is a keeper bug: it is
+// logged loudly with its stack, the task fails with errBackgroundPanic (a
+// task with no status yet records a named 500), and the caller's deferred
+// releases and task finalization run as for any failure, instead of the
+// panic killing the whole process from this goroutine.
+func (k *keeper) runBackground(t *responseTask, w *taskWriter, req *http.Request) {
+	defer func() {
+		v := recover()
+		if v == nil {
+			return
+		}
+		log.Printf("BUG: background task %s panicked: %v\n%s", t.id, v, debug.Stack())
+		t.mu.Lock()
+		noStatus := t.status == 0
+		t.mu.Unlock()
+		if noStatus {
+			writeAPIError(w, &apiError{status: http.StatusInternalServerError, typ: "server_error", code: "internal_error", hop: keeperHop, message: errBackgroundPanic.Error()})
+		}
+		t.mu.Lock()
+		t.err = errBackgroundPanic
+		t.mu.Unlock()
+	}()
+	k.serveHTTP(w, req)
+}
+
 func (k *keeper) startBackground(w http.ResponseWriter, r *http.Request) {
 	if err := r.Context().Err(); err != nil {
 		return
@@ -102,7 +132,7 @@ func (k *keeper) startBackground(w http.ResponseWriter, r *http.Request) {
 		defer body.Close()
 		defer cancel()
 		writer := &taskWriter{task: t, header: make(http.Header)}
-		k.serveHTTP(writer, req)
+		k.runBackground(t, writer, req)
 		t.mu.Lock()
 		t.done = true
 		if t.stream && !t.complete && t.err == nil {
