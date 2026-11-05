@@ -97,7 +97,7 @@ func (k *keeper) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if k.cfg.upstream != nil && k.taskOperation(w, r) {
 		return
 	}
-	if r.URL.Path != "/v1/responses" && r.URL.Path != "/responses" {
+	if !coveredPath(r.URL.Path) {
 		// Native default path: the fixed single upstream decides every other
 		// path, method, and query itself. Routed deployments have no single
 		// upstream, so nothing transparent exists to forward to.
@@ -139,6 +139,18 @@ func (k *keeper) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	k.serveNative(w, r)
+}
+
+// coveredPath reports a covered Responses endpoint (design D2): the paths
+// keeper records, gates and tickets. /backend-api/codex/responses (Codex CLI)
+// is covered like /v1/responses (leader decision 2026-11-05, review M3); its
+// requests keep their own path upstream.
+func coveredPath(path string) bool {
+	switch path {
+	case "/v1/responses", "/responses", "/backend-api/codex/responses":
+		return true
+	}
+	return false
 }
 
 // serveLocalTurn dispatches the existing local-history handlers: the WS
