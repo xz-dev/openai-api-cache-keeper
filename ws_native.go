@@ -234,9 +234,14 @@ func (k *keeper) serveWSNative(w http.ResponseWriter, r *http.Request) {
 	// (setupReadTimeout), which would silently kill the socket before the
 	// peer's close status can be relayed. Socket teardown always goes
 	// through CloseNow/Close, which unblocks these readers.
+	//
+	// This pump never cancels the session: frames it already queued (an
+	// inner error event right before the inner close) must still reach the
+	// client, and the handler ends the session when it takes the pump's
+	// final result. Cancelling here raced the relay of that event and left
+	// a bare close (3.1 acceptance at 193ef2f).
 	go func() {
 		defer close(upCh)
-		defer cancel()
 		for {
 			typ, reader, err := upstream.Reader(context.Background())
 			if err == nil {

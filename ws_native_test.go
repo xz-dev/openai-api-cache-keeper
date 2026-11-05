@@ -26,6 +26,7 @@ type wsFakeUpstream struct {
 	n         int
 	readLimit atomic.Int64 // 0 = the library default
 	errFrame  atomic.Value // string: when set, the reply to every create
+	errClose  atomic.Bool  // close 1000 right after sending errFrame, as the bridge does
 }
 
 func (f *wsFakeUpstream) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -66,6 +67,10 @@ func (f *wsFakeUpstream) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		f.mu.Unlock()
 		if e, _ := f.errFrame.Load().(string); e != "" {
 			_ = conn.Write(r.Context(), websocket.MessageText, []byte(e))
+			if f.errClose.Load() {
+				_ = conn.Close(websocket.StatusNormalClosure, "request too large")
+				return
+			}
 			continue
 		}
 		if doc.Generate != nil && !*doc.Generate {

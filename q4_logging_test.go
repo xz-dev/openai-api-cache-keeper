@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"regexp"
 	"strings"
@@ -95,5 +96,46 @@ func TestWSTurnLogCarriesErrorEventStatus(t *testing.T) {
 	}
 	if strings.Contains(logs.String(), "transport=ws status=200 previous=true") {
 		t.Fatalf("an error turn was logged as 200:\n%s", logs.String())
+	}
+}
+
+// Acceptance 3.1 at 193ef2f: the bridge answers an over-limit turn with its
+// named error event and at once a normal close. The upstream pump read the
+// close and cancelled the session while the handler was still relaying the
+// error event, so the client got a bare close. Every repeat must deliver
+// the inner error event before the close, on a local and a native-parent
+// continuation.
+func TestWSInnerErrorThenCloseNeverBare(t *testing.T) {
+	up, srv, _ := newWSNativeKeeper(t)
+	for i := 0; i < 20; i++ {
+		up.errFrame.Store("")
+		up.errClose.Store(false)
+		c := dialWS(t, srv, "Bearer a")
+		ev := wsCreate(t, c, `{"type":"response.create","model":"m","input":"A"}`)
+		if ev["type"] != "response.completed" {
+			t.Fatalf("repeat %d turn1: %v", i, ev)
+		}
+		prev := ev["response"].(map[string]any)["id"].(string)
+		if i%2 == 1 {
+			prev = "resp_native"
+		}
+		up.errFrame.Store(`{"type":"error","status":413,"error":{"type":"invalid_request_error","code":"request_too_large","hop":"responses-ws-sse-bridge","message":"too large","limit":16777216}}`)
+		up.errClose.Store(true)
+		ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+		if err := c.Write(ctx, websocket.MessageText, []byte(`{"type":"response.create","model":"m","input":"B","previous_response_id":"`+prev+`"}`)); err != nil {
+			t.Fatalf("repeat %d write: %v", i, err)
+		}
+		var got []string
+		for {
+			_, data, err := c.Read(ctx)
+			if err != nil {
+				if !strings.Contains(strings.Join(got, ""), `"code":"request_too_large"`) {
+					t.Fatalf("repeat %d (previous %s): bare close %v after frames %q", i, prev, err, got)
+				}
+				break
+			}
+			got = append(got, string(data))
+		}
+		cancel()
 	}
 }
