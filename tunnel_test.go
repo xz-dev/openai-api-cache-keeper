@@ -136,3 +136,22 @@ func TestNativeTunnelRelaysRefusedHandshake(t *testing.T) {
 		t.Fatalf("refused upgrade body %q", b)
 	}
 }
+
+// Admin sockets are exempt like admin bodies: no keeper cap.
+func TestNativeTunnelAdminSocketUncapped(t *testing.T) {
+	srv, received := tunnelKeeper(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+	c := dialWSPath(t, srv, "/api/v1/admin/ops/ws", "Bearer a")
+	c.SetReadLimit(-1)
+	over := strings.Repeat("o", int(fallbackLimit)+1)
+	if err := c.Write(ctx, websocket.MessageText, []byte(over)); err != nil {
+		t.Fatalf("write L+1: %v", err)
+	}
+	if _, b, err := c.Read(ctx); err != nil || len(b) != len(over) {
+		t.Fatalf("admin echo of L+1: %d bytes, %v", len(b), err)
+	}
+	if got := received(); len(got) != 1 || got[0] != len(over) {
+		t.Fatalf("upstream received %v", got)
+	}
+}

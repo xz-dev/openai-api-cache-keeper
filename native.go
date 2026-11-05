@@ -53,8 +53,9 @@ func (k *keeper) serveNative(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		defer lease.Close()
-		if r.Method == http.MethodGet {
+		if r.Method == http.MethodGet && !fallbackExempt(r.URL.Path) {
 			// A native non-Responses socket: each message is capped at L.
+			// Admin sockets keep the opaque tunnel, like admin bodies.
 			k.serveNativeTunnel(w, r)
 			return
 		}
