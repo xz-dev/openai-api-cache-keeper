@@ -22,14 +22,22 @@ func TestFinalOutputMetadataBeforeAllocation(t *testing.T) {
 	runtime.ReadMemStats(&a)
 	err := c.boundedResponse(raw, m)
 	runtime.ReadMemStats(&b)
+	var live runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&live)
 	t.Logf("source=%d outputItems=%d charged=%d totalAllocDelta=%d heapAllocDelta=%d err=%v", len(raw), len(c.output), m.output, b.TotalAlloc-a.TotalAlloc, int64(b.HeapAlloc)-int64(a.HeapAlloc), err)
 	// No item count cap (D5): 200,000 items are accepted, and every header
 	// slot is charged before it is allocated.
 	if err != nil || len(c.output) != 200000 {
 		t.Fatalf("collection refused: %v / %d", err, len(c.output))
 	}
-	if alloc := int64(b.TotalAlloc - a.TotalAlloc); m.output < alloc-64<<10 {
-		t.Errorf("charged %d < allocated %d", m.output, alloc)
+	// The reservation held while collecting covers everything allocated,
+	// and the charge kept afterwards covers what stays live.
+	if alloc := int64(b.TotalAlloc - a.TotalAlloc); m.outputPeak < alloc {
+		t.Errorf("peak reservation %d < allocated %d", m.outputPeak, alloc)
+	}
+	if kept := int64(live.HeapAlloc) - int64(a.HeapAlloc); m.output < kept {
+		t.Errorf("held charge %d < live heap %d", m.output, kept)
 	}
 	c.release(m)
 }

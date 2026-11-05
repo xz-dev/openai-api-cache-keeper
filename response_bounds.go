@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
-	"slices"
 	"unicode/utf8"
 	"unsafe"
 )
@@ -102,11 +101,13 @@ func cloneItems(raw []byte, reserve func(int64) bool) ([]json.RawMessage, error)
 	}); err != nil || count == 0 {
 		return nil, err
 	}
-	if reserve != nil && !reserve(int64(count)*itemSlotBytes) {
+	if reserve != nil && !reserve(heapBytes(count*int(itemSlotBytes))) {
 		return nil, errWorkSize
 	}
 	items := make([]json.RawMessage, 0, count)
-	buf := slices.Grow([]byte(nil), size)
+	// One allocation whose cap covers its size class, so the charged caps
+	// bound the real allocation (slices.Grow allocates twice under -race).
+	buf := make([]byte, 0, heapBytes(size))
 	_ = arraySpans(raw, func(start, end int) error {
 		off := len(buf)
 		buf = append(buf, raw[start:end]...)
@@ -236,7 +237,7 @@ func (c *collector) eventFields(raw []byte, ms []jsonMember) error {
 			// Slots are charged, never counted: the old and new header
 			// overlap while copying (D5).
 			grown := max(2*cap(c.items), index+1)
-			if c.reserve == nil || !c.reserve(int64(grown+cap(c.items))*itemSlotBytes) {
+			if c.reserve == nil || !c.reserve(heapBytes(grown*int(itemSlotBytes))+heapBytes(cap(c.items)*int(itemSlotBytes))) {
 				return errWorkSize
 			}
 			c.items = append(make([]json.RawMessage, 0, grown), c.items...)
@@ -288,11 +289,12 @@ func (m *workingSet) reserveOutput(n int64) bool {
 		return false
 	}
 	m.output += n
+	m.outputPeak = max(m.outputPeak, m.output)
 	return true
 }
 func (m *workingSet) freeOutput(n int64) { m.mu.Lock(); m.output -= n; m.mu.Unlock() }
 func (c *collector) bytes() int64 {
-	n := c.idBytes() + int64(cap(c.items)+cap(c.output))*itemSlotBytes
+	n := c.idBytes() + heapBytes(cap(c.items)*int(itemSlotBytes)) + heapBytes(cap(c.output)*int(itemSlotBytes))
 	for _, v := range c.items {
 		n += int64(cap(v))
 	}

@@ -13,7 +13,7 @@ import (
 
 func firstUpstreamFrame(t *testing.T, gu *ticketUpstream, want int) string {
 	t.Helper()
-	deadline := time.Now().Add(20 * time.Second)
+	deadline := time.Now().Add(2 * time.Minute)
 	for {
 		gu.mu.Lock()
 		n := len(gu.tails)
@@ -36,7 +36,7 @@ func firstUpstreamFrame(t *testing.T, gu *ticketUpstream, want int) string {
 // strips it from every client frame, including frames relayed verbatim.
 func TestClientTicketMemberStrippedFromRelayedFrames(t *testing.T) {
 	srv, k, gu := gateKeeper(t, 901*mib)
-	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 	defer cancel()
 	frames := []struct{ send, head string }{
 		// a native-parent create, relayed verbatim

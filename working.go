@@ -68,6 +68,7 @@ type workingSet struct {
 	disk          int64
 	diskPeak      int64 // high-water mark of disk (measured by tests)
 	output        int64
+	outputPeak    int64 // high-water mark of output (measured by tests)
 	input         int64
 	statfs        func(fd int, st *unix.Statfs_t) error // free-space source; nil = unix.Fstatfs
 	cg            *cgroupMem

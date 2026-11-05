@@ -136,13 +136,13 @@ func TestGateHTTPRefusals(t *testing.T) {
 func TestGateWSTicketMember(t *testing.T) {
 	srv, k, gu := gateKeeper(t, 901*mib)
 	c := dialWS(t, srv, "Bearer big")
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 	defer cancel()
 	frame := `{"type":"response.create","ai_gateway_capacity_ticket":"forged",` + largeBody(int(largeBodyBytes))[1:]
 	if err := c.Write(ctx, websocket.MessageText, []byte(frame)); err != nil {
 		t.Fatal(err)
 	}
-	deadline := time.Now().Add(20 * time.Second)
+	deadline := time.Now().Add(2 * time.Minute)
 	for {
 		gu.mu.Lock()
 		n := len(gu.tails)
@@ -169,7 +169,7 @@ func TestGateWSTicketMember(t *testing.T) {
 func TestGateWSUnticketedFrameUnchanged(t *testing.T) {
 	srv, k, gu := gateKeeper(t, 901*mib)
 	c := dialWS(t, srv, "Bearer big")
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 	defer cancel()
 	if err := c.Write(ctx, websocket.MessageText, []byte(`{"type":"response.create","model":"m","input":"small"}`)); err != nil {
 		t.Fatal(err)
@@ -222,13 +222,13 @@ func TestGateHTTPExpansionAdmitted(t *testing.T) {
 func TestGateWSNativeRelayTicketFirst(t *testing.T) {
 	srv, k, gu := gateKeeper(t, 901*mib)
 	c := dialWS(t, srv, "Bearer big")
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 	defer cancel()
 	frame := `{"type":"response.create","previous_response_id":"resp_native",` + largeBody(int(largeBodyBytes))[1:]
 	if err := c.Write(ctx, websocket.MessageText, []byte(frame)); err != nil {
 		t.Fatal(err)
 	}
-	deadline := time.Now().Add(20 * time.Second)
+	deadline := time.Now().Add(2 * time.Minute)
 	for {
 		gu.mu.Lock()
 		n := len(gu.tails)

@@ -29,6 +29,7 @@ func (p *admissionProbe) reset() []int64 {
 
 func expansionKeeper(t *testing.T) (*httptest.Server, *keeper, *admissionProbe) {
 	up, srv, k := newWSNativeKeeper(t, func(c *config) {
+		c.ttl = time.Hour // a -race run of the 70 MiB turns outlasts the default minute
 		c.maxRequestBytes = 140 << 20
 		c.maxStoreBytes, c.storePinBytes, c.storeMetaBytes, c.storeCompactBytes = 1<<30, 256<<20, 32<<20, 1<<30
 	})
