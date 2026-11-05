@@ -61,7 +61,8 @@ func turnBody(prev, input string) string {
 func waitSpoolsClosed(t *testing.T, k *keeper) int64 {
 	t.Helper()
 	waitWorking(t, k, 0)
-	deadline := time.Now().Add(5 * time.Second)
+	const wait = 2 * time.Minute // generous: a passing test never waits for it
+	deadline := time.Now().Add(wait)
 	for {
 		k.work.mu.Lock()
 		d, peak := k.work.disk, k.work.diskPeak
@@ -73,7 +74,7 @@ func waitSpoolsClosed(t *testing.T, k *keeper) int64 {
 			return peak
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("spool bytes still live: %d", d)
+			t.Fatalf("wait for the spools to close expired after %v: %d bytes still live", wait, d)
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
@@ -81,15 +82,17 @@ func waitSpoolsClosed(t *testing.T, k *keeper) int64 {
 
 func wsTerminal(t *testing.T, c *websocket.Conn, frame string) map[string]any {
 	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	// Generous: a -race run of a 70 MiB turn on a loaded host took 3 minutes.
+	const wait = 10 * time.Minute
+	ctx, cancel := context.WithTimeout(context.Background(), wait)
 	defer cancel()
 	if err := c.Write(ctx, websocket.MessageText, []byte(frame)); err != nil {
-		t.Fatal(err)
+		t.Fatalf("ws write of a %d-byte frame (limit %v): %v", len(frame), wait, err)
 	}
 	for {
 		_, data, err := c.Read(ctx)
 		if err != nil {
-			t.Fatal(err)
+			t.Fatalf("wait for the ws terminal event (limit %v): %v", wait, err)
 		}
 		var ev map[string]any
 		if json.Unmarshal(data, &ev) != nil {

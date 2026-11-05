@@ -19,10 +19,40 @@ type ticketUpstream struct {
 	headers []string // ticket header per forwarded POST
 	tails   []string // first bytes of each forwarded WS frame
 	fake    fakeUpstream
+	// recorded gets a token each time a WS frame is appended to tails.
+	recorded chan struct{}
+}
+
+// upstreamFrameWait bounds a wait for the fake upstream to record a WS frame.
+// It is generous: a 64 MiB frame through keeper under -race on a loaded host
+// has taken minutes. A test that passes never waits for it.
+const upstreamFrameWait = 10 * time.Minute
+
+// waitUpstreamFrames blocks until the fake upstream has recorded at least
+// want WS frames and returns the recorded tails. It wakes on the upstream's
+// signal, not on a poll; what names the wait in the failure message.
+func waitUpstreamFrames(t *testing.T, gu *ticketUpstream, want int, what string) []string {
+	t.Helper()
+	timer := time.NewTimer(upstreamFrameWait)
+	defer timer.Stop()
+	for {
+		gu.mu.Lock()
+		tails := append([]string(nil), gu.tails...)
+		gu.mu.Unlock()
+		if len(tails) >= want {
+			return tails
+		}
+		select {
+		case <-gu.recorded:
+		case <-timer.C:
+			t.Fatalf("wait for the upstream to record WS frame %d (%s) expired after %v; it recorded %d: %q",
+				want, what, upstreamFrameWait, len(tails), tails)
+		}
+	}
 }
 
 func gateKeeper(t *testing.T, mem int64) (*httptest.Server, *keeper, *ticketUpstream) {
-	gu := &ticketUpstream{}
+	gu := &ticketUpstream{recorded: make(chan struct{}, 1)}
 	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case r.URL.Path == "/v1/sub2api/billing":
@@ -43,6 +73,10 @@ func gateKeeper(t *testing.T, mem int64) (*httptest.Server, *keeper, *ticketUpst
 				}
 				gu.tails = append(gu.tails, tail)
 				gu.mu.Unlock()
+				select {
+				case gu.recorded <- struct{}{}:
+				default: // a token is already pending; the waiter re-reads tails
+				}
 			}
 			_, _, _ = c.Read(r.Context())
 			return
@@ -65,14 +99,15 @@ func gateKeeper(t *testing.T, mem int64) (*httptest.Server, *keeper, *ticketUpst
 
 func waitLedgerEmpty(t *testing.T, k *keeper) {
 	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
+	const wait = 2 * time.Minute
+	deadline := time.Now().Add(wait)
 	for {
 		m, _ := filepath.Glob(filepath.Join(k.gate.dir, "*"+ticketSuffix))
 		if len(m) == 0 {
 			return
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("ledger not empty: %v", m)
+			t.Fatalf("wait for the ticket ledger to empty expired after %v: %v", wait, m)
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
@@ -136,25 +171,13 @@ func TestGateHTTPRefusals(t *testing.T) {
 func TestGateWSTicketMember(t *testing.T) {
 	srv, k, gu := gateKeeper(t, 901*mib)
 	c := dialWS(t, srv, "Bearer big")
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), upstreamFrameWait)
 	defer cancel()
 	frame := `{"type":"response.create","ai_gateway_capacity_ticket":"forged",` + largeBody(int(largeBodyBytes))[1:]
 	if err := c.Write(ctx, websocket.MessageText, []byte(frame)); err != nil {
-		t.Fatal(err)
+		t.Fatalf("client write of the 64 MiB frame (limit %v): %v", upstreamFrameWait, err)
 	}
-	deadline := time.Now().Add(2 * time.Minute)
-	for {
-		gu.mu.Lock()
-		n := len(gu.tails)
-		gu.mu.Unlock()
-		if n > 0 || time.Now().After(deadline) {
-			break
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	gu.mu.Lock()
-	tails := append([]string(nil), gu.tails...)
-	gu.mu.Unlock()
+	tails := waitUpstreamFrames(t, gu, 1, "the rebuilt 64 MiB frame")
 	// Bridge contract: the ticket is the FIRST member of the frame object,
 	// so the bridge can lease it from a small prefix before spooling.
 	if len(tails) != 1 || !strings.HasPrefix(tails[0], `{"ai_gateway_capacity_ticket":"`) ||
@@ -174,19 +197,7 @@ func TestGateWSUnticketedFrameUnchanged(t *testing.T) {
 	if err := c.Write(ctx, websocket.MessageText, []byte(`{"type":"response.create","model":"m","input":"small"}`)); err != nil {
 		t.Fatal(err)
 	}
-	deadline := time.Now().Add(10 * time.Second)
-	for {
-		gu.mu.Lock()
-		n := len(gu.tails)
-		gu.mu.Unlock()
-		if n > 0 || time.Now().After(deadline) {
-			break
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	gu.mu.Lock()
-	head := append([]string(nil), gu.tails...)
-	gu.mu.Unlock()
+	head := waitUpstreamFrames(t, gu, 1, "the small unticketed frame")
 	if len(head) != 1 || !strings.HasPrefix(head[0], `{"model":"m"`) {
 		t.Fatalf("unticketed frame head: %q", head)
 	}
@@ -222,25 +233,13 @@ func TestGateHTTPExpansionAdmitted(t *testing.T) {
 func TestGateWSNativeRelayTicketFirst(t *testing.T) {
 	srv, k, gu := gateKeeper(t, 901*mib)
 	c := dialWS(t, srv, "Bearer big")
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), upstreamFrameWait)
 	defer cancel()
 	frame := `{"type":"response.create","previous_response_id":"resp_native",` + largeBody(int(largeBodyBytes))[1:]
 	if err := c.Write(ctx, websocket.MessageText, []byte(frame)); err != nil {
-		t.Fatal(err)
+		t.Fatalf("client write of the 64 MiB native-parent frame (limit %v): %v", upstreamFrameWait, err)
 	}
-	deadline := time.Now().Add(2 * time.Minute)
-	for {
-		gu.mu.Lock()
-		n := len(gu.tails)
-		gu.mu.Unlock()
-		if n > 0 || time.Now().After(deadline) {
-			break
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	gu.mu.Lock()
-	head := append([]string(nil), gu.tails...)
-	gu.mu.Unlock()
+	head := waitUpstreamFrames(t, gu, 1, "the relayed 64 MiB native-parent frame")
 	want := `","type":"response.create","previous_response_id":"resp_native"`
 	if len(head) != 1 || !strings.HasPrefix(head[0], `{"ai_gateway_capacity_ticket":"`) || !strings.Contains(head[0], want) {
 		t.Fatalf("relayed head: %q", head)

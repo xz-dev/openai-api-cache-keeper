@@ -18,14 +18,15 @@ import (
 
 func waitWorking(t *testing.T, k *keeper, want int) {
 	t.Helper()
-	deadline := time.Now().Add(3 * time.Second)
+	const wait = time.Minute // generous: a passing test never waits for it
+	deadline := time.Now().Add(wait)
 	for time.Now().Before(deadline) {
 		if k.work.activeTurns.Load() == int64(want) {
 			return
 		}
 		time.Sleep(time.Millisecond)
 	}
-	t.Fatalf("turn slots=%d want=%d", k.work.activeTurns.Load(), want)
+	t.Fatalf("wait for %d active turn slots expired after %v: have %d", want, wait, k.work.activeTurns.Load())
 }
 func TestQueuedWSPingAndCancellation(t *testing.T) {
 	_, srv, k := newLocalTestKeeper(t)

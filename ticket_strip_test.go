@@ -2,41 +2,25 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"os"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/coder/websocket"
 )
 
-func firstUpstreamFrame(t *testing.T, gu *ticketUpstream, want int) string {
+func firstUpstreamFrame(t *testing.T, gu *ticketUpstream, want int, what string) string {
 	t.Helper()
-	deadline := time.Now().Add(2 * time.Minute)
-	for {
-		gu.mu.Lock()
-		n := len(gu.tails)
-		var tail string
-		if n >= want {
-			tail = gu.tails[want-1]
-		}
-		gu.mu.Unlock()
-		if n >= want {
-			return tail
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("upstream saw %d frames, want %d", n, want)
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
+	return waitUpstreamFrames(t, gu, want, what)[want-1]
 }
 
 // M4: keeper is the only hop that strips a client ticket member (D4), so it
 // strips it from every client frame, including frames relayed verbatim.
 func TestClientTicketMemberStrippedFromRelayedFrames(t *testing.T) {
 	srv, k, gu := gateKeeper(t, 901*mib)
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), upstreamFrameWait)
 	defer cancel()
 	frames := []struct{ send, head string }{
 		// a native-parent create, relayed verbatim
@@ -50,9 +34,9 @@ func TestClientTicketMemberStrippedFromRelayedFrames(t *testing.T) {
 	for i, f := range frames {
 		c := dialWS(t, srv, "Bearer big")
 		if err := c.Write(ctx, websocket.MessageText, []byte(f.send)); err != nil {
-			t.Fatal(err)
+			t.Fatalf("client write of frame %d (limit %v): %v", i, upstreamFrameWait, err)
 		}
-		if got := firstUpstreamFrame(t, gu, i+1); got != f.head {
+		if got := firstUpstreamFrame(t, gu, i+1, fmt.Sprintf("small frame %d", i)); got != f.head {
 			t.Fatalf("frame %d forwarded as %q, want %q", i, got, f.head)
 		}
 		c.Close(websocket.StatusNormalClosure, "")
@@ -61,9 +45,9 @@ func TestClientTicketMemberStrippedFromRelayedFrames(t *testing.T) {
 	c := dialWS(t, srv, "Bearer big")
 	frame := `{"type":"response.create","previous_response_id":"resp_native","ai_gateway_capacity_ticket":"forged",` + largeBody(int(largeBodyBytes))[1:]
 	if err := c.Write(ctx, websocket.MessageText, []byte(frame)); err != nil {
-		t.Fatal(err)
+		t.Fatalf("client write of the 64 MiB ticketed relay frame (limit %v): %v", upstreamFrameWait, err)
 	}
-	got := firstUpstreamFrame(t, gu, len(frames)+1)
+	got := firstUpstreamFrame(t, gu, len(frames)+1, "the ticketed 64 MiB relay frame")
 	if !strings.HasPrefix(got, `{"ai_gateway_capacity_ticket":"`) || strings.Contains(got, "FORGED") || strings.Count(got, ticketMember) != 1 {
 		t.Fatalf("ticketed relay head: %q", got)
 	}
