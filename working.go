@@ -144,6 +144,14 @@ func (k *keeper) spoolRequest(ctx context.Context, r io.Reader, auth largeAuth) 
 	if scope := gateScopeFrom(ctx); scope != nil {
 		f.attach(scope.t)
 	}
+	if f.ticket != nil {
+		// An unknown length (chunked body, WS message) was admitted at the
+		// cap; the real size is known now (D4: lowering is always safe).
+		if e := f.ticket.resize(f.size); e != nil {
+			f.Close()
+			return nil, &authRefusal{e}
+		}
+	}
 	return f, nil
 }
 

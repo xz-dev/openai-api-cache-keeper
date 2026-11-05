@@ -192,13 +192,6 @@ func (k *keeper) localCheckpointTurn(w http.ResponseWriter, r *http.Request) (re
 		raw.Close()
 		return nil, false, false, true
 	}
-	if raw.ticket != nil {
-		if e := raw.ticket.resize(raw.size); e != nil { // an unknown length was admitted at the cap
-			raw.Close()
-			writeAPIError(w, e)
-			return nil, false, false, true
-		}
-	}
 	body, err := raw.requestBody()
 	if err != nil {
 		raw.Close()

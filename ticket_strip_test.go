@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"net/http"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -85,4 +86,37 @@ func TestClientTicketHeaderStrippedOnNativePath(t *testing.T) {
 	if len(gu.headers) != 1 || gu.headers[0] != "" {
 		t.Fatalf("forwarded ticket headers: %q", gu.headers)
 	}
+}
+
+// Minor 7: a message of unknown length is admitted at the cap once 64 MiB
+// have arrived; when the whole message is spooled, its ticket (record and
+// ledger file) is lowered to the real size, so a WS frame relayed verbatim
+// does not stay reserved at the cap.
+func TestUnknownLengthTicketLoweredToRealSize(t *testing.T) {
+	_, k, _ := gateKeeper(t, 901*mib)
+	ctx, scope := withGateScope(context.Background(), k.gate)
+	admit := func(context.Context) error {
+		if e := scope.ensure(k.cfg.maxRequestBytes); e != nil {
+			return &authRefusal{e}
+		}
+		return nil
+	}
+	body := largeBody(int(largeBodyBytes) + 1000)
+	f, err := k.spoolRequest(ctx, strings.NewReader(body), admit)
+	scope.done()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if f.ticket == nil || f.ticket.rec.n != int64(len(body)) {
+		t.Fatalf("ticket %+v, want n=%d", f.ticket, len(body))
+	}
+	raw, err := os.ReadFile(k.gate.ticketPath(f.ticket.id()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec, err := parseTicket(raw); err != nil || rec.n != int64(len(body)) {
+		t.Fatalf("ledger record %+v %v, want n=%d", rec, err, len(body))
+	}
+	f.Close()
+	waitLedgerEmpty(t, k)
 }
