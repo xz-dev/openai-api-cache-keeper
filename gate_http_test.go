@@ -18,6 +18,7 @@ type ticketUpstream struct {
 	mu      sync.Mutex
 	headers []string // ticket header per forwarded POST
 	paths   []string // upstream path per forwarded POST, and per WS upgrade
+	billing int      // auth (billing) calls
 	tails   []string // first bytes of each forwarded WS frame
 	fake    fakeUpstream
 	// recorded gets a token each time a WS frame is appended to tails.
@@ -57,6 +58,9 @@ func gateKeeper(t *testing.T, mem int64) (*httptest.Server, *keeper, *ticketUpst
 	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case r.URL.Path == "/v1/sub2api/billing":
+			gu.mu.Lock()
+			gu.billing++
+			gu.mu.Unlock()
 			return
 		case isUpgradeRequest(r):
 			gu.mu.Lock()

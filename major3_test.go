@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -87,5 +88,84 @@ func TestCodexResponsesPathTicketed(t *testing.T) {
 		t.Fatalf("codex WS upstream path %q", paths)
 	}
 	c.Close(websocket.StatusNormalClosure, "")
+	waitLedgerEmpty(t, k)
+}
+
+func fallbackBodyOf(n int) string {
+	head, tail := `{"contents":"`, `"}`
+	return head + strings.Repeat("x", n-len(head)-len(tail)) + tail
+}
+
+func upstreamPOSTs(gu *ticketUpstream) []string {
+	gu.mu.Lock()
+	defer gu.mu.Unlock()
+	return append([]string(nil), gu.paths...)
+}
+
+// Major 3 (2, 4): a fallback path above L gets the named 413 before any
+// upstream call, ticket or spool byte. The shape is Sub2API's
+// unconverted-route 413, with keeper as the hop.
+func TestFallbackPathRefusedAboveL(t *testing.T) {
+	srv, k, gu := gateKeeper(t, 901*mib)
+	var admissions atomic.Int64 // every ticket admission reads the memory ledger
+	k.gate.memAvailable = func() (int64, error) { admissions.Add(1); return 901 * mib, nil }
+	status, out := postPath(t, srv, http.MethodPost, "/v1/chat/completions", "Bearer big", fallbackBodyOf(70<<20), false)
+	want := `{"error":{"code":"request_too_large","hop":"keeper","message":"keeper: /v1/chat/completions is a fallback path; its limit is 16777216 bytes and the body has 73400320","param":null,"type":"invalid_request_error"}}`
+	if status != 413 || strings.TrimSpace(out) != want {
+		t.Fatalf("70 MiB chat: %d %s", status, out)
+	}
+	k.work.mu.Lock()
+	peak := k.work.diskPeak
+	k.work.mu.Unlock()
+	gu.mu.Lock()
+	billing := gu.billing
+	gu.mu.Unlock()
+	if p := upstreamPOSTs(gu); len(p) != 0 || peak != 0 || admissions.Load() != 0 || billing != 0 {
+		t.Fatalf("70 MiB chat reached upstream %q, spooled %d bytes, %d ticket admissions, %d billing calls", p, peak, admissions.Load(), billing)
+	}
+	waitLedgerEmpty(t, k)
+
+	// Just under and just over L on the Gemini and Antigravity routes, with
+	// a declared length and counted as a chunked body.
+	for _, path := range []string{"/v1beta/models/g:generateContent", "/antigravity/v1/messages"} {
+		for _, chunked := range []bool{false, true} {
+			before := len(upstreamPOSTs(gu))
+			if status, out := postPath(t, srv, http.MethodPost, path, "Bearer big", fallbackBodyOf(int(fallbackLimit)), chunked); status == 413 {
+				t.Fatalf("%s at exactly L (chunked %t): %d %.300s", path, chunked, status, out)
+			}
+			if got := len(upstreamPOSTs(gu)); got != before+1 {
+				t.Fatalf("%s at exactly L (chunked %t) did not reach the upstream", path, chunked)
+			}
+			status, out := postPath(t, srv, http.MethodPost, path, "Bearer big", fallbackBodyOf(int(fallbackLimit)+1), chunked)
+			msg := "keeper: " + path + " is a fallback path; its limit is 16777216 bytes"
+			if !chunked {
+				msg += " and the body has 16777217"
+				if got := len(upstreamPOSTs(gu)); got != before+1 {
+					t.Fatalf("%s at L+1 with a length reached the upstream", path)
+				}
+			}
+			if status != 413 || !strings.Contains(out, `"message":"`+msg+`"`) || !strings.Contains(out, `"hop":"keeper"`) {
+				t.Fatalf("%s at L+1 (chunked %t): %d %.300s", path, chunked, status, out)
+			}
+		}
+	}
+
+	// Admin and management routes keep today's behaviour: no keeper limit.
+	before := len(upstreamPOSTs(gu))
+	if status, out := postPath(t, srv, http.MethodPost, "/api/v1/admin/accounts/data", "Bearer big", fallbackBodyOf(int(fallbackLimit)+1), false); status == 413 {
+		t.Fatalf("admin import refused: %.300s", out)
+	}
+	if got := len(upstreamPOSTs(gu)); got != before+1 {
+		t.Fatal("admin import did not reach the upstream")
+	}
+
+	// A Responses body of 64 MiB still goes through auth and the gate.
+	status, out = postPath(t, srv, http.MethodPost, "/v1/responses", "Bearer big", largeBody(int(largeBodyBytes)), false)
+	gu.mu.Lock()
+	last := gu.headers[len(gu.headers)-1]
+	gu.mu.Unlock()
+	if status != 200 || len(last) != 32 || admissions.Load() == 0 {
+		t.Fatalf("64 MiB Responses: %d ticket %q %.200s", status, last, out)
+	}
 	waitLedgerEmpty(t, k)
 }

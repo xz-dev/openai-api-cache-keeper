@@ -89,6 +89,11 @@ func (k *keeper) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		k.gate.serveTickets(w)
 		return
 	}
+	// A fallback path is refused above L before anything else happens: no
+	// upstream call, spool byte, ticket or billing call (D2, review M3).
+	if !k.boundFallback(w, r) {
+		return
+	}
 	// Only keeper issues tickets: an inbound ticket is never trusted (D4).
 	r.Header.Del(ticketHeader)
 	ctx, scope := withGateScope(r.Context(), k.gate)
@@ -253,6 +258,8 @@ type apiError struct {
 	status                    int
 	typ, code, param, message string
 	retryAfter                string // Retry-After hint for capacity_busy
+	hop                       string // the refusing hop, on the named size refusals of D2
+	limit                     int64  // the WS message limit, on the bridge-shaped error event
 }
 
 func (e *apiError) object() map[string]any {
@@ -262,6 +269,12 @@ func (e *apiError) object() map[string]any {
 	}
 	if e.param != "" {
 		obj["param"] = e.param
+	}
+	if e.hop != "" {
+		obj["hop"] = e.hop
+	}
+	if e.limit != 0 {
+		obj["limit"] = e.limit
 	}
 	return obj
 }
