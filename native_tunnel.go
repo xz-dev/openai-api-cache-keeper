@@ -30,6 +30,10 @@ func (k *keeper) serveNativeTunnel(w http.ResponseWriter, r *http.Request) {
 	out.URL, out.Host, out.RequestURI = &target, k.cfg.upstream.Host, ""
 	out.Header = http.Header{}
 	copyHeader(out.Header, r.Header) // drops hop-by-hop headers, including Upgrade
+	// No extension is negotiated on keeper's side: with permessage-deflate
+	// the frames would carry compressed bytes and L would count those, not
+	// the real message bytes (re-review 4).
+	out.Header.Del("Sec-WebSocket-Extensions")
 	out.Header.Set("Connection", "Upgrade")
 	out.Header.Set("Upgrade", r.Header.Get("Upgrade"))
 	resp, err := k.client.Transport.RoundTrip(out)
@@ -47,6 +51,12 @@ func (k *keeper) serveNativeTunnel(w http.ResponseWriter, r *http.Request) {
 		copyHeader(w.Header(), resp.Header)
 		w.WriteHeader(resp.StatusCode)
 		_, _ = io.Copy(w, resp.Body)
+		return
+	}
+	if ext := resp.Header.Get("Sec-WebSocket-Extensions"); ext != "" {
+		resp.Body.Close() // an extension keeper did not offer (RFC 6455 §9.1)
+		writeAPIError(w, &apiError{status: http.StatusBadGateway, typ: "upstream_error", code: "upstream_extension_not_offered", hop: keeperHop,
+			message: fmt.Sprintf("%s: the upstream accepted the WebSocket with extension %q, which %s did not offer", keeperHop, ext, keeperHop)})
 		return
 	}
 	back, ok := resp.Body.(io.ReadWriteCloser)
@@ -136,13 +146,20 @@ func (t *wsTunnel) up(r *bufio.Reader, requestID, path string) {
 	var h wsFrameHead
 	var msg int64
 	for readWSFrameHead(r, &h) == nil {
-		if h.op < 8 { // data or continuation; control frames are at most 125 bytes
+		if h.op >= 8 && (h.n > 125 || !h.fin) {
+			// RFC 6455 §5.5: a control frame has at most 125 payload bytes
+			// and is never fragmented; the connection is failed with 1002.
+			log.Printf("ws native tunnel control frame refused: path=%s opcode=%d bytes=%d fin=%t limit=125 request_id=%s", path, h.op, h.n, h.fin, requestID)
+			t.refuse(false, 1002, "control frame over 125 bytes or fragmented")
+			return
+		}
+		if h.op < 8 { // data or continuation
 			if h.op != 0 {
 				msg = 0
 			}
 			if msg += h.n; msg > fallbackLimit {
 				log.Printf("ws native tunnel message refused: path=%s bytes>%d limit=%d request_id=%s", path, msg, fallbackLimit, requestID)
-				t.refuse()
+				t.refuse(true, 1000, "request too large")
 				return
 			}
 		}
@@ -183,11 +200,12 @@ func (t *wsTunnel) down(r *bufio.Reader) {
 	}
 }
 
-// refuse ends the socket on an over-limit client message: the upstream
-// connection closes without the message, and the client gets the bridge's
-// named error event and a normal close, unless the upstream was mid-message
-// (the event cannot be placed then; the close still names the cause).
-func (t *wsTunnel) refuse() {
+// refuse ends the socket on a refused client frame: the upstream connection
+// closes without it, and the client gets a close with code and reason. For
+// an over-limit message (event) the bridge's named error event precedes a
+// normal close, unless the upstream was mid-message (the event cannot be
+// placed then; the close still names the cause).
+func (t *wsTunnel) refuse(event bool, code uint16, reason string) {
 	t.refusing.Store(true)
 	t.back.Close() // unblocks down; the upstream never sees the message
 	t.mu.Lock()
@@ -195,7 +213,7 @@ func (t *wsTunnel) refuse() {
 	if t.downPartial {
 		return
 	}
-	if !t.downMid {
+	if event && !t.downMid {
 		ev, _ := json.Marshal(map[string]any{"type": "error", "status": http.StatusRequestEntityTooLarge, "error": map[string]any{
 			"type": "invalid_request_error", "code": "request_too_large", "hop": keeperHop, "limit_bytes": fallbackLimit,
 			"message": fmt.Sprintf("Request exceeds the %d-byte WebSocket message limit of %s.", fallbackLimit, keeperHop)}})
@@ -203,7 +221,7 @@ func (t *wsTunnel) refuse() {
 			return
 		}
 	}
-	_, _ = t.client.Write(wsServerFrame(0x8, append([]byte{0x03, 0xe8}, "request too large"...))) // 1000
+	_, _ = t.client.Write(wsServerFrame(0x8, append(binary.BigEndian.AppendUint16(nil, code), reason...)))
 }
 
 // wsServerFrame encodes one unmasked, unfragmented server frame.
