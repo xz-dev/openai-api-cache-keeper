@@ -485,12 +485,9 @@ func (k *keeper) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	owner := k.ownerOf(r)
-	t, apiErr := k.prepareDiskSnapshot(r.Context(), raw, owner, func(id string) (*historySnapshot, error) {
+	t, apiErr := k.prepareDiskAdmit(r.Context(), raw, owner, func(id string) (*historySnapshot, error) {
 		return k.store.snapshotID(r.Context(), id, owner, false)
-	}, false, false)
-	if apiErr == nil {
-		apiErr = k.admitTurn(r.Context(), raw, t, false, k.largeBodyAuth(r.Header, r.URL.RawQuery))
-	}
+	}, false, false, k.admitTurn(r.Context(), raw, k.largeBodyAuth(r.Header, r.URL.RawQuery)))
 	raw.Close()
 	if apiErr != nil {
 		writeAPIError(w, apiErr)

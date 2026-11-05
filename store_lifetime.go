@@ -268,6 +268,30 @@ func (r *snapshotItemReader) Read(dst []byte) (int, error) {
 	return n, err
 }
 
+// storedSize sums the stored lengths of the snapshot's items without
+// reading their contents (the expansion pre-check, task 1.2).
+func (h *historySnapshot) storedSize(ctx context.Context) (total, items int64, err error) {
+	var zero [32]byte
+	err = h.gen.db.View(func(tx *bolt.Tx) error {
+		for _, hash := range h.hashes {
+			if hash == zero {
+				continue
+			}
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			size, err := storedItemSize(tx, hash[:])
+			if err != nil {
+				return err
+			}
+			total += size
+			items++
+		}
+		return nil
+	})
+	return total, items, err
+}
+
 func (h *historySnapshot) each(ctx context.Context, fn func(int64, io.Reader) error) error {
 	for _, hash := range h.hashes {
 		if err := ctx.Err(); err != nil {

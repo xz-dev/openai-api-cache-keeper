@@ -128,6 +128,7 @@ func (f *spool) Write(p []byte) (int, error) {
 		return 0, errors.New("transient disk budget exceeded")
 	}
 	f.mem.disk += int64(len(p))
+	f.mem.diskPeak = max(f.mem.diskPeak, f.mem.disk)
 	f.mem.mu.Unlock()
 	n, err := 0, checkDiskFloor(f.mem, f.File, int64(len(p)))
 	if err == nil {

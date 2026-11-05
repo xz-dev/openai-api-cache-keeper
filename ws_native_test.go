@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -20,9 +21,10 @@ import (
 // is answered with a created/output/completed sequence; any frame carrying a
 // previous_response_id is rejected, proving expanded turns reach it whole.
 type wsFakeUpstream struct {
-	mu     sync.Mutex
-	frames []string
-	n      int
+	mu        sync.Mutex
+	frames    []string
+	n         int
+	readLimit atomic.Int64 // 0 = the library default
 }
 
 func (f *wsFakeUpstream) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -35,6 +37,9 @@ func (f *wsFakeUpstream) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer conn.CloseNow()
+	if n := f.readLimit.Load(); n != 0 {
+		conn.SetReadLimit(n)
+	}
 	for {
 		typ, raw, err := conn.Read(r.Context())
 		if err != nil {

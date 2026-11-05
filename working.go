@@ -69,6 +69,7 @@ type workingSet struct {
 	activeTasks   atomic.Int64
 	mu            sync.Mutex
 	disk          int64
+	diskPeak      int64 // high-water mark of disk (measured by tests)
 	output        int64
 	input         int64
 	statfs        func(fd int, st *unix.Statfs_t) error // free-space source; nil = unix.Fstatfs
@@ -149,42 +150,31 @@ func (k *keeper) spoolRequest(ctx context.Context, r io.Reader, auth largeAuth) 
 	return f, nil
 }
 
-// admitTurn reserves the upstream spool's real size: a request that reached
-// the gate is resized to it, and a small request whose expanded history
-// reaches 64 MiB is authenticated and admitted now, before anything is sent
-// (D4). The turn spool then holds the ticket; a WS frame carries its id as
-// its first member.
-func (k *keeper) admitTurn(ctx context.Context, raw *spool, t *diskTurn, ws bool, auth largeAuth) *apiError {
-	n := t.file.size - t.file.skip
-	tk := raw.ticket
-	if tk == nil {
-		if n < largeBodyBytes {
-			return nil
+// admitTurn reserves the upstream spool's planned size before it is
+// written: a request that reached the gate is resized to it, and a small
+// request whose expanded history reaches 64 MiB is authenticated and
+// admitted now (D4). The turn spool then holds the ticket; a WS envelope
+// carries its id as its first member.
+func (k *keeper) admitTurn(ctx context.Context, raw *spool, auth largeAuth) turnAdmit {
+	return func(n int64) (*capTicket, *apiError) {
+		tk := raw.ticket
+		if tk == nil {
+			if n < largeBodyBytes {
+				return nil, nil
+			}
+			if err := auth(ctx); err != nil {
+				return nil, workingError(err)
+			}
+			return k.gate.admit(n)
 		}
-		if err := auth(ctx); err != nil {
-			t.file.Close()
-			return workingError(err)
-		}
-		var e *apiError
-		if tk, e = k.gate.admit(n); e != nil {
-			t.file.Close()
-			return e
-		}
-		t.file.ticket = tk // owns admit's reference
-	} else {
 		if e := tk.resize(n); e != nil {
-			t.file.Close()
-			return e
+			return nil, e
 		}
-		t.file.attach(tk)
-	}
-	if ws {
-		if err := t.file.setFirstMember(ticketMember, tk.id()); err != nil {
-			t.file.Close()
-			return workingError(err)
+		if !tk.ref() {
+			return nil, nil
 		}
+		return tk, nil
 	}
-	return nil
 }
 
 type itemSpan struct {
@@ -309,6 +299,18 @@ func (k *keeper) prepareDiskEnv(ctx context.Context, raw *spool, owner [32]byte,
 }
 
 func (k *keeper) prepareDiskSnapshot(ctx context.Context, raw *spool, owner [32]byte, lookup func(string) (*historySnapshot, error), ws, wsEnvelope bool) (*diskTurn, *apiError) {
+	return k.prepareDiskAdmit(ctx, raw, owner, lookup, ws, wsEnvelope, nil)
+}
+
+// turnAdmit admits an expansion of n bytes before any of it is written. A
+// returned ticket carries one reference, owned by the turn spool from then on.
+type turnAdmit func(n int64) (*capTicket, *apiError)
+
+// prepareDiskAdmit is prepareDiskSnapshot that first computes the expanded
+// size from the stored item lengths and the request spans, refuses over the
+// cap, and calls admit, all before the first expansion byte is written
+// (task 1.2, design D4). A nil admit admits nothing.
+func (k *keeper) prepareDiskAdmit(ctx context.Context, raw *spool, owner [32]byte, lookup func(string) (*historySnapshot, error), ws, wsEnvelope bool, admit turnAdmit) (*diskTurn, *apiError) {
 	releaseInput, err := k.work.reserveInput(inputParseCredit(raw))
 	if err != nil {
 		return nil, workingError(err)
@@ -528,11 +530,94 @@ func (k *keeper) prepareDiskSnapshot(ctx context.Context, raw *spool, owner [32]
 		}
 		return nil, workingError(err)
 	}
+	// Plan the upstream spool before writing it: the stored history, the
+	// remaining fields and the exact byte count.
+	if prevID != "" && selected == nil {
+		var err error
+		if selected, err = lookup(prevID); errors.Is(err, errMissingItem) {
+			return nil, previousNotFound(prevID)
+		} else if err != nil {
+			return nil, workingError(err)
+		}
+	}
+	var histBytes, histItems int64
+	if prevID != "" {
+		var err error
+		if histBytes, histItems, err = selected.storedSize(ctx); err != nil {
+			return nil, workingError(err)
+		}
+	}
+	keys := make([]string, 0, len(other)+len(extra))
+	spans := map[string]fieldSpan{}
+	for _, fs := range other {
+		if drop[fs.key] || fs.key == "model" {
+			continue
+		}
+		if _, dup := spans[fs.key]; !dup {
+			spans[fs.key] = fs
+			keys = append(keys, fs.key)
+		}
+	}
+	for k := range extra {
+		if _, dup := spans[k]; !dup {
+			keys = append(keys, k)
+		}
+	}
+	sort.Strings(keys)
+	names := make([][]byte, len(keys))
+	var skip int64
+	if wsEnvelope {
+		skip = int64(ticketPrefixLen - 1)
+	}
+	planned := skip + int64(len(`{"input":[]}`)) + histBytes
+	if i, ok := seen["model"]; ok {
+		planned += int64(len(`"model":,`)) + other[i].end - other[i].start
+	}
+	items := histItems + int64(len(inSpans))
+	for _, span := range inSpans {
+		planned += int64(span.n)
+	}
+	if inputIsString {
+		items++
+		planned += int64(len(`{"content":,"role":"user"}`)) + inputSpan.end - inputSpan.start
+	}
+	if items > 0 {
+		planned += items - 1 // separators
+	}
+	for i, key := range keys {
+		var keyJSON bytes.Buffer
+		enc := json.NewEncoder(&keyJSON)
+		enc.SetEscapeHTML(false)
+		if e := enc.Encode(key); e != nil {
+			return nil, workingError(e)
+		}
+		names[i] = bytes.TrimRight(keyJSON.Bytes(), "\n")
+		planned += int64(len(",:") + len(names[i]))
+		if v, ok := extra[key]; ok {
+			planned += int64(len(v))
+		} else {
+			planned += spans[key].end - spans[key].start
+		}
+	}
+	if planned > maxHistoryBytes {
+		return nil, workingError(errHistorySize)
+	}
+	var tk *capTicket
+	if admit != nil {
+		var e *apiError
+		if tk, e = admit(planned - skip); e != nil {
+			return nil, e
+		}
+	}
 	// Upstream spool: {"model":..., "input":[ <history> , <input items> ], ...fields }
 	f, err := k.newSpool()
 	if err != nil {
+		if tk != nil {
+			tk.unref()
+		}
 		return nil, workingError(err)
 	}
+	f.ticket = tk
 	t.file = f
 	out := &spoolWriter{f: f, limit: maxHistoryBytes}
 	copyBuf := make([]byte, 32<<10)
@@ -569,18 +654,7 @@ func (k *keeper) prepareDiskSnapshot(ctx context.Context, raw *spool, owner [32]
 	nItems := 0
 	if prevID != "" {
 		history := selected
-		var err error
-		if history == nil {
-			history, err = lookup(prevID)
-		}
-		if errors.Is(err, errMissingItem) {
-			f.Close()
-			return nil, previousNotFound(prevID)
-		}
-		if err != nil {
-			return fail(err)
-		}
-		err = history.each(ctx, func(size int64, item io.Reader) error {
+		err := history.each(ctx, func(size int64, item io.Reader) error {
 			var separator int64
 			if nItems > 0 {
 				separator = 1
@@ -665,35 +739,11 @@ func (k *keeper) prepareDiskSnapshot(ctx context.Context, raw *spool, owner [32]
 	if err := out.write([]byte("]")); err != nil {
 		return fail(err)
 	}
-	keys := make([]string, 0, len(other)+len(extra))
-	spans := map[string]fieldSpan{}
-	for _, fs := range other {
-		if drop[fs.key] {
-			continue
-		}
-		if _, dup := spans[fs.key]; !dup {
-			spans[fs.key] = fs
-			keys = append(keys, fs.key)
-		}
-	}
-	for k := range extra {
-		if _, dup := spans[k]; !dup {
-			keys = append(keys, k)
-		}
-	}
-	sort.Strings(keys)
-	for _, key := range keys {
-		var keyJSON bytes.Buffer
-		enc := json.NewEncoder(&keyJSON)
-		enc.SetEscapeHTML(false)
-		if e := enc.Encode(key); e != nil {
-			return fail(e)
-		}
-		name := bytes.TrimRight(keyJSON.Bytes(), "\n")
+	for i, key := range keys {
 		if err := out.write([]byte(",")); err != nil {
 			return fail(err)
 		}
-		if err := out.write(name); err != nil {
+		if err := out.write(names[i]); err != nil {
 			return fail(err)
 		}
 		if err := out.write([]byte(":")); err != nil {
@@ -716,8 +766,13 @@ func (k *keeper) prepareDiskSnapshot(ctx context.Context, raw *spool, owner [32]
 	if err := out.write([]byte("}")); err != nil {
 		return fail(err)
 	}
-	if f.size > maxHistoryBytes {
-		return fail(errHistorySize)
+	if f.size != planned {
+		return fail(fmt.Errorf("keeper: upstream spool wrote %d bytes, planned %d", f.size, planned))
+	}
+	if tk != nil && wsEnvelope {
+		if err := f.setFirstMember(ticketMember, tk.id()); err != nil {
+			return fail(err)
+		}
 	}
 	if k.cfg.ignoreClientStoreFalse {
 		t.store = true

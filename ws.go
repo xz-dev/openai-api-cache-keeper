@@ -144,7 +144,7 @@ func (k *keeper) wsTurn(ctx context.Context, conn *websocket.Conn, header http.H
 	if routeErr != nil {
 		return "", wsError(ctx, conn, routeErr), false
 	}
-	t, apiErr := k.prepareDiskSnapshot(ctx, data, owner, func(id string) (*historySnapshot, error) {
+	t, apiErr := k.prepareDiskAdmit(ctx, data, owner, func(id string) (*historySnapshot, error) {
 		if id == sess.lastID && sess.lastPin != "" {
 			history, err := k.store.snapshotID(ctx, sess.lastPin, owner, true)
 			if err != errMissingItem {
@@ -152,10 +152,7 @@ func (k *keeper) wsTurn(ctx context.Context, conn *websocket.Conn, header http.H
 			}
 		}
 		return k.store.snapshotID(ctx, id, owner, false)
-	}, true, false)
-	if apiErr == nil {
-		apiErr = k.admitTurn(ctx, data, t, false, k.largeBodyAuth(header, ""))
-	}
+	}, true, false, k.admitTurn(ctx, data, k.largeBodyAuth(header, "")))
 	data.Close()
 	if apiErr != nil {
 		return "", wsError(ctx, conn, apiErr), false

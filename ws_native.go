@@ -831,10 +831,7 @@ func (k *keeper) wsNativeClientFrame(ctx context.Context, conn, upstream *websoc
 		}
 		return k.store.snapshotID(ctx, id, owner, false)
 	}
-	t, apiErr := k.prepareDiskSnapshot(ctx, data, owner, lookup, true, true)
-	if apiErr == nil {
-		apiErr = k.admitTurn(ctx, data, t, true, k.largeBodyAuth(r.Header, r.URL.RawQuery))
-	}
+	t, apiErr := k.prepareDiskAdmit(ctx, data, owner, lookup, true, true, k.admitTurn(ctx, data, k.largeBodyAuth(r.Header, r.URL.RawQuery)))
 	if apiErr != nil {
 		return "", wsError(ctx, conn, apiErr), probe.prevSet
 	}
