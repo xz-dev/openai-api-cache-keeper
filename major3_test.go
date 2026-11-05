@@ -110,7 +110,7 @@ func TestFallbackPathRefusedAboveL(t *testing.T) {
 	var admissions atomic.Int64 // every ticket admission reads the memory ledger
 	k.gate.memAvailable = func() (int64, error) { admissions.Add(1); return 901 * mib, nil }
 	status, out := postPath(t, srv, http.MethodPost, "/v1/chat/completions", "Bearer big", fallbackBodyOf(70<<20), false)
-	want := `{"error":{"code":"request_too_large","hop":"keeper","message":"keeper: /v1/chat/completions is a fallback path; its limit is 16777216 bytes and the body has 73400320","param":null,"type":"invalid_request_error"}}`
+	want := `{"error":{"code":"request_too_large","hop":"keeper","limit_bytes":16777216,"message":"keeper: /v1/chat/completions is a fallback path; its limit is 16777216 bytes and the body has 73400320","param":null,"type":"invalid_request_error"}}`
 	if status != 413 || strings.TrimSpace(out) != want {
 		t.Fatalf("70 MiB chat: %d %s", status, out)
 	}

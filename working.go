@@ -98,7 +98,7 @@ func workingError(err error) *apiError {
 		err = requestSizeError(tooLarge.Limit)
 	}
 	if errors.As(err, &named) {
-		return &apiError{status: 413, typ: "invalid_request_error", code: named.code, message: named.Error()}
+		return &apiError{status: 413, typ: "invalid_request_error", code: named.code, hop: keeperHop, limit: named.limit, message: named.Error()}
 	}
 	var refused *authRefusal
 	if errors.As(err, &refused) {
@@ -110,12 +110,12 @@ func workingError(err error) *apiError {
 	}
 	var floor *storageFloorError
 	if errors.As(err, &floor) {
-		return &apiError{status: http.StatusInsufficientStorage, typ: "server_error", code: "insufficient_storage", message: floor.Error()}
+		return &apiError{status: http.StatusInsufficientStorage, typ: "server_error", code: "insufficient_storage", hop: keeperHop, limit: spoolDiskFloor, message: floor.Error()}
 	}
 	if errors.Is(err, errWorkSize) {
-		return &apiError{status: 413, typ: "invalid_request_error", code: "working_set_too_large", message: err.Error()}
+		return &apiError{status: 413, typ: "invalid_request_error", code: "working_set_too_large", hop: keeperHop, message: err.Error()}
 	}
-	return &apiError{status: 503, typ: "server_error", code: "working_set_unavailable", message: "Working capacity unavailable; retry later."}
+	return &apiError{status: 503, typ: "server_error", code: "working_set_unavailable", hop: keeperHop, message: "Working capacity unavailable; retry later."}
 }
 
 // spoolRequest copies one request body or message to a new spool. auth,

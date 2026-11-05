@@ -258,8 +258,8 @@ type apiError struct {
 	status                    int
 	typ, code, param, message string
 	retryAfter                string // Retry-After hint for capacity_busy
-	hop                       string // the refusing hop, on the named size refusals of D2
-	limit                     int64  // the WS message limit, on the bridge-shaped error event
+	hop                       string // keeperHop on every keeper size or capacity refusal (D9)
+	limit                     int64  // rendered as limit_bytes where a byte limit applies; 0 = none
 }
 
 func (e *apiError) object() map[string]any {

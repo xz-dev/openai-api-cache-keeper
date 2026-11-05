@@ -10,7 +10,7 @@ import (
 
 // errNativeSocketLimit marks a native WebSocket rejection; it reuses the
 // shared working-set error shape.
-var errNativeSocketLimit = &apiError{status: http.StatusServiceUnavailable, typ: "server_error", code: "working_set_unavailable", message: "Working capacity unavailable; retry later."}
+var errNativeSocketLimit = &apiError{status: http.StatusServiceUnavailable, typ: "server_error", code: "working_set_unavailable", hop: keeperHop, message: "Working capacity unavailable; retry later."}
 
 // newNativeProxy returns the transparent default path: an httputil.ReverseProxy
 // to the single configured Sub2API upstream. Unknown paths, methods, queries

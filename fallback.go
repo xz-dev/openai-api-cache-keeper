@@ -32,7 +32,7 @@ func fallbackTooLarge(path string, size int64) *apiError {
 	if size >= 0 {
 		msg += fmt.Sprintf(" and the body has %d", size)
 	}
-	return &apiError{status: http.StatusRequestEntityTooLarge, typ: "invalid_request_error", code: "request_too_large", hop: keeperHop, message: msg}
+	return &apiError{status: http.StatusRequestEntityTooLarge, typ: "invalid_request_error", code: "request_too_large", hop: keeperHop, limit: fallbackLimit, message: msg}
 }
 
 // boundFallback applies L to a request with a body on a fallback path, for

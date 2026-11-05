@@ -134,22 +134,28 @@ func (g *capacityGate) available() (disk, mem int64, err error) {
 }
 
 func ledgerUnavailable(err error) *apiError {
-	return &apiError{status: http.StatusServiceUnavailable, typ: "server_error", code: "capacity_ledger_unavailable",
+	return &apiError{status: http.StatusServiceUnavailable, typ: "server_error", code: "capacity_ledger_unavailable", hop: keeperHop,
 		message: "keeper: the capacity ledger is unavailable: " + boundedText(err.Error())}
 }
 
-// refusal names required and available bytes and the floors (D4).
+// refusal names required and available bytes and the floors (D4). Its
+// limit_bytes is the bytes the request needs on the refused resource, as
+// the other hops report for insufficient_memory.
 func refusal(rd, rm, dA, mA, liveD, liveM int64) *apiError {
 	floors := fmt.Sprintf("floors: %d-byte disk reserve plus store headroom, %d-byte memory floor plus %d-byte margin", spoolDiskFloor, memFloor, memMargin)
 	switch {
 	case rd <= dA && rm <= mA:
-		return &apiError{status: http.StatusServiceUnavailable, typ: "server_error", code: "capacity_busy", retryAfter: retryAfterHint,
+		need := rm
+		if rd > dA-liveD {
+			need = rd
+		}
+		return &apiError{status: http.StatusServiceUnavailable, typ: "server_error", code: "capacity_busy", hop: keeperHop, limit: need, retryAfter: retryAfterHint,
 			message: fmt.Sprintf("keeper: capacity busy: the request needs %d disk and %d memory bytes; %d disk and %d memory bytes are free after live tickets (%s)", rd, rm, dA-liveD, mA-liveM, floors)}
 	case rd > dA:
-		return &apiError{status: http.StatusInsufficientStorage, typ: "server_error", code: "insufficient_storage",
+		return &apiError{status: http.StatusInsufficientStorage, typ: "server_error", code: "insufficient_storage", hop: keeperHop, limit: rd,
 			message: fmt.Sprintf("keeper: insufficient storage: the request needs %d disk bytes; %d are available (%s)", rd, dA, floors)}
 	}
-	return &apiError{status: http.StatusServiceUnavailable, typ: "server_error", code: "insufficient_memory",
+	return &apiError{status: http.StatusServiceUnavailable, typ: "server_error", code: "insufficient_memory", hop: keeperHop, limit: rm,
 		message: fmt.Sprintf("keeper: insufficient memory: the request needs %d memory bytes; %d are available (%s)", rm, mA, floors)}
 }
 

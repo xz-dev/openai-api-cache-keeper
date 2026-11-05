@@ -125,7 +125,7 @@ func innerEndError(e turnEnd) *apiError {
 		return &apiError{status: http.StatusBadGateway, typ: "upstream_error", code: "upstream_frame_too_large",
 			message: "keeper: an upstream frame was refused and the turn was ended: " + boundedText(e.cause)}
 	case e.code == websocket.StatusMessageTooBig:
-		return &apiError{status: http.StatusRequestEntityTooLarge, typ: "invalid_request_error", code: "request_too_large",
+		return &apiError{status: http.StatusRequestEntityTooLarge, typ: "invalid_request_error", code: "request_too_large", hop: keeperHop,
 			message: fmt.Sprintf("keeper: the inner hop closed the WebSocket with 1009 (message too big): %s", boundedText(e.reason))}
 	case e.code >= 0:
 		return &apiError{status: http.StatusBadGateway, typ: "upstream_error", code: "upstream_closed",

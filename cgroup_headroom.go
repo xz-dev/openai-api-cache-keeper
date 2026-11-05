@@ -99,7 +99,7 @@ func (e *insufficientMemoryError) Error() string {
 }
 
 func insufficientMemory(e *insufficientMemoryError) *apiError {
-	return &apiError{status: http.StatusServiceUnavailable, typ: "server_error", code: "insufficient_memory", message: e.Error()}
+	return &apiError{status: http.StatusServiceUnavailable, typ: "server_error", code: "insufficient_memory", hop: keeperHop, limit: e.need, message: e.Error()}
 }
 
 // headroomLocked checks n more bytes against the cgroup: memory.current
