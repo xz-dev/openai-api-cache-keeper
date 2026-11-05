@@ -182,6 +182,7 @@ func (k *keeper) wsTurn(ctx context.Context, conn *websocket.Conn, header http.H
 	var c collector
 	defer c.release(k.work)
 	id := ""
+	delivered := false // The terminal frame reached the client.
 	status := resp.StatusCode
 	prepare := func() (*responseAcceptance, error) { return k.prepareSocketAcceptance(ctx, &c, t, owner, sess, &id) }
 	err = readSSEOwned(resp.Body, nil, func(event *responseBuffer, suspend suspendResponseFrame) error {
@@ -190,14 +191,17 @@ func (k *keeper) wsTurn(ctx context.Context, conn *websocket.Conn, header http.H
 			return err
 		}
 		defer release()
-		return conn.Write(ctx, websocket.MessageText, wire)
+		err = conn.Write(ctx, websocket.MessageText, wire)
+		delivered = delivered || (err == nil && c.done)
+		return err
 	}, k, k.work)
 	if err == nil && !c.done && ctx.Err() == nil {
 		status = wsFailure(ctx, conn, c.responseID(), c.nextSeq(), upstreamFailed(requestIDFrom(header), "ws relay", errors.New("upstream stream ended before terminal response")))
 	}
 	if err != nil {
 		log.Printf("ws relay ended early: %v", err)
-		if ctx.Err() == nil && status == http.StatusOK && id == "" {
+		// D9: a stored turn whose terminal was not relayed still ends in an explicit error event.
+		if ctx.Err() == nil && status == http.StatusOK && !delivered {
 			status = wsFailure(ctx, conn, c.responseID(), c.nextSeq(), responseError(err))
 		}
 	}

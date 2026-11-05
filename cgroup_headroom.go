@@ -15,9 +15,9 @@ import (
 // 503 insufficient_memory instead of crossing memory.max - 32 MiB.
 const cgroupMargin int64 = 32 << 20
 
-// cgroupMem reads keeper's own cgroup v2 memory.max and memory.current
-// through fds opened once at startup.
-type cgroupMem struct{ max, cur *os.File }
+// cgroupMem reads keeper's own cgroup v2 memory.max, memory.current and
+// memory.stat through fds opened once at startup (stat may be nil).
+type cgroupMem struct{ max, cur, stat *os.File }
 
 // openCgroupMem returns nil when keeper has no cgroup v2 memory limit.
 func openCgroupMem() *cgroupMem {
@@ -44,7 +44,8 @@ func openCgroupMem() *cgroupMem {
 		mx.Close()
 		return nil
 	}
-	return &cgroupMem{max: mx, cur: cur}
+	stat, _ := os.Open(filepath.Join(dir, "memory.stat"))
+	return &cgroupMem{max: mx, cur: cur, stat: stat}
 }
 
 func preadInt(f *os.File) (int64, bool) {
@@ -67,8 +68,28 @@ func (c *cgroupMem) read() (limit, current int64, ok bool) {
 	if limit, ok = preadInt(c.max); !ok {
 		return 0, 0, false
 	}
-	current, ok = preadInt(c.cur)
-	return limit, current, ok
+	if current, ok = preadInt(c.cur); !ok {
+		return 0, 0, false
+	}
+	if c.stat != nil {
+		var buf [8192]byte
+		n, _ := c.stat.ReadAt(buf[:], 0)
+		current = workingSetBytes(current, buf[:n])
+	}
+	return limit, current, true
+}
+
+// workingSetBytes is memory.current minus inactive_file. Leader decision
+// (M1 6b): clean, reclaimable file cache does not count against headroom.
+func workingSetBytes(current int64, stat []byte) int64 {
+	for _, line := range bytes.Split(stat, []byte("\n")) {
+		if v, ok := bytes.CutPrefix(line, []byte("inactive_file ")); ok {
+			if n, err := strconv.ParseInt(string(v), 10, 64); err == nil && n > 0 && n <= current {
+				return current - n
+			}
+		}
+	}
+	return current
 }
 
 type insufficientMemoryError struct{ need, free int64 }

@@ -585,6 +585,7 @@ func (k *keeper) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		var wire []byte
 		var parsed map[string]json.RawMessage
 		var release func()
+		delivered := false // The terminal frame reached the client (or the task).
 		err = readSSEOwned(resp.Body, func(frame []byte) error {
 			if release != nil {
 				defer release()
@@ -594,12 +595,16 @@ func (k *keeper) serveHTTP(w http.ResponseWriter, r *http.Request) {
 				if wire == nil {
 					return nil
 				}
-				return task.record(r.Context(), wire, parsed)
+				err := task.record(r.Context(), wire, parsed)
+				delivered = delivered || (err == nil && c.done)
+				return err
 			}
 			if err := writeSSEFrame(w, frame, wire); err != nil {
 				return err
 			}
-			return rc.Flush()
+			err := rc.Flush()
+			delivered = delivered || (err == nil && c.done)
+			return err
 		}, func(data *responseBuffer, suspend suspendResponseFrame) error {
 			var e error
 			wire, release, parsed, e = k.responseFrameOwned(r.Context(), &c, data, true, t.store, prepare, suspend)
@@ -614,7 +619,8 @@ func (k *keeper) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		if err != nil {
 			log.Printf("http relay ended early: %v", err)
-			if r.Context().Err() == nil && id == "" {
+			// D9: a stored turn whose terminal was not relayed still ends in an explicit error event.
+			if r.Context().Err() == nil && !delivered {
 				event := failureEvent(c.responseID(), responseError(err), c.nextSeq())
 				payload, _ := json.Marshal(event)
 				_, _ = fmt.Fprintf(w, "event: %s\ndata: %s\n\n", event["type"], payload)
