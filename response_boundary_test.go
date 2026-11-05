@@ -16,7 +16,9 @@ import (
 )
 
 func TestResponseMetadataRejectsBeforeGrowth(t *testing.T) {
-	raw := []byte(`{"id":"resp_many","status":"completed","output":[` + strings.Repeat(`{},`, 199999) + `{}]}`)
+	// 4,000,000 one-byte items: their headers (96 MB) exceed the output
+	// budget, so the count pass refuses before any header is allocated.
+	raw := []byte(`{"id":"resp_many","status":"completed","output":[` + strings.Repeat(`0,`, 3999999) + `0]}`)
 	m := newWorkingSet()
 	var c collector
 	defer c.release(m)
@@ -84,8 +86,10 @@ func TestConcurrentStoreFalseMetadataRefusal(t *testing.T) {
 	for i := 0; i < 16; i++ {
 		wg.Go(func() {
 			status, body, _ := post(t, srv, "Bearer metadata", `{"input":"A","store":false}`)
-			if status == 200 || !strings.Contains(body, "working_set") {
-				t.Errorf("store:false bypass: %d %s", status, body[:min(200, len(body))])
+			// No item count cap (D5): each turn is served whole or refused
+			// explicitly by the byte budget its charged slots exceed.
+			if (status != 200 || body != raw) && !strings.Contains(body, "working_set") {
+				t.Errorf("neither served nor refused by bytes: %d %s", status, body[:min(200, len(body))])
 			}
 		})
 	}

@@ -384,6 +384,7 @@ type collector struct {
 	pendingState *stateLease
 	charged      int64
 	items        []json.RawMessage // response.output_item.done, by output_index
+	reserve      func(int64) bool  // charges item slots while collect runs
 	id           string
 	started      string // id from response.created/in_progress
 	status       string
@@ -410,11 +411,16 @@ func (c *collector) final() (string, []json.RawMessage, bool) {
 	}
 	output := c.output
 	if len(output) == 0 { // some upstreams only stream items and send an empty final output
+		// Compact in place: the charged slots are reused, nothing allocates.
+		kept := c.items[:0]
 		for _, item := range c.items {
 			if item != nil {
-				output = append(output, item)
+				kept = append(kept, item)
 			}
 		}
+		clear(c.items[len(kept):])
+		c.items = kept
+		output = kept
 	}
 	return c.id, output, true
 }

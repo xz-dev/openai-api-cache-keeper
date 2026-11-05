@@ -8,6 +8,7 @@ import (
 	"io"
 	"slices"
 	"unicode/utf8"
+	"unsafe"
 )
 
 var errUpstreamData = errors.New("malformed upstream response")
@@ -75,41 +76,34 @@ func arraySpans(raw []byte, fn func(start, end int) error) error {
 	return err
 }
 
-// responseItems returns the elements as cap-limited aliases of raw.
-func responseItems(raw []byte) ([]json.RawMessage, error) {
+// validItems checks that raw is null, absent or one JSON array; it keeps nothing.
+func validItems(raw []byte) error {
 	if len(raw) == 0 || bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
-		return nil, nil
-	}
-	var items []json.RawMessage
-	err := arraySpans(raw, func(start, end int) error {
-		if len(items) >= maxResponseItems {
-			return errWorkSize
-		}
-		items = append(items, raw[start:end:end])
 		return nil
-	})
-	if err != nil {
-		return nil, err
 	}
-	return items, nil
+	return arraySpans(raw, func(int, int) error { return nil })
 }
 
-// cloneItems is responseItems with ONE independent copy: a counting pass sizes
-// the header slice and a single byte buffer exactly; items are subslices whose
-// caps sum to the buffer's real capacity.
-func cloneItems(raw []byte) ([]json.RawMessage, error) {
+// itemSlotBytes is the heap one kept item header costs.
+const itemSlotBytes = int64(unsafe.Sizeof(json.RawMessage(nil)))
+
+// cloneItems copies the elements of raw ONCE: a counting pass sizes the
+// header slice and a single byte buffer exactly; items are subslices whose
+// caps sum to the buffer's real capacity. The item count is not capped: the
+// header slice is charged through reserve before it is allocated (D5).
+func cloneItems(raw []byte, reserve func(int64) bool) ([]json.RawMessage, error) {
 	if len(raw) == 0 || bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
 		return nil, nil
 	}
 	count, size := 0, 0
 	if err := arraySpans(raw, func(start, end int) error {
-		if count >= maxResponseItems {
-			return errWorkSize
-		}
 		count, size = count+1, size+end-start
 		return nil
 	}); err != nil || count == 0 {
 		return nil, err
+	}
+	if reserve != nil && !reserve(int64(count)*itemSlotBytes) {
+		return nil, errWorkSize
 	}
 	items := make([]json.RawMessage, 0, count)
 	buf := slices.Grow([]byte(nil), size)
@@ -198,7 +192,7 @@ func (c *collector) response(raw []byte) error {
 	if terminal && id == "" {
 		return errUpstreamData
 	}
-	output, err := cloneItems(memberValue(raw, ms, "output"))
+	output, err := cloneItems(memberValue(raw, ms, "output"), c.reserve)
 	if err != nil {
 		return err
 	}
@@ -235,8 +229,17 @@ func (c *collector) eventFields(raw []byte, ms []jsonMember) error {
 	case "response.output_item.done":
 		var index int
 		item := memberValue(raw, ms, "item")
-		if !smallInt(memberValue(raw, ms, "output_index"), &index) || index < 0 || index >= 4096 || len(item) == 0 {
+		if !smallInt(memberValue(raw, ms, "output_index"), &index) || index < 0 || len(item) == 0 {
 			return errUpstreamData
+		}
+		if index >= cap(c.items) {
+			// Slots are charged, never counted: the old and new header
+			// overlap while copying (D5).
+			grown := max(2*cap(c.items), index+1)
+			if c.reserve == nil || !c.reserve(int64(grown+cap(c.items))*itemSlotBytes) {
+				return errWorkSize
+			}
+			c.items = append(make([]json.RawMessage, 0, grown), c.items...)
 		}
 		for len(c.items) <= index {
 			c.items = append(c.items, nil)
@@ -289,7 +292,7 @@ func (m *workingSet) reserveOutput(n int64) bool {
 }
 func (m *workingSet) freeOutput(n int64) { m.mu.Lock(); m.output -= n; m.mu.Unlock() }
 func (c *collector) bytes() int64 {
-	n := c.idBytes() + int64((cap(c.items)+cap(c.output))*24)
+	n := c.idBytes() + int64(cap(c.items)+cap(c.output))*itemSlotBytes
 	for _, v := range c.items {
 		n += int64(cap(v))
 	}
@@ -322,13 +325,13 @@ func (c *collector) release(m *workingSet) {
 // event map, its exactly decoded keys (<= 5n/4 with rounding) and slots.
 // Reserved BEFORE parse/rewrite, not inferred from output afterward.
 func responseScratch(n int) int64 {
-	return int64(n)*9/4 + maxResponseItems*24 + 512<<10
+	return int64(n)*9/4 + 512<<10
 }
 
 // decodeScratch is the legacy reservation for paths that still fully decode
 // and re-encode a document (background log records, error frames).
 func decodeScratch(n int) int64 {
-	return 8*int64(n) + 2*maxResponseItems*24 + 256*128
+	return 8*int64(n) + 256*128
 }
 func (c *collector) collect(raw []byte, m *workingSet, event bool) error {
 	scratch := responseScratch(len(raw))
@@ -341,12 +344,21 @@ func (c *collector) collect(raw []byte, m *workingSet, event bool) error {
 	if len(raw) > maxResponseBytes || !m.reserveOutput(scratch) {
 		return errWorkSize
 	}
+	// Item headers are charged by count, on top of the byte scratch.
+	c.reserve = func(n int64) bool {
+		if !m.reserveOutput(n) {
+			return false
+		}
+		scratch += n
+		return true
+	}
 	var err error
 	if event {
 		err = c.event(raw)
 	} else {
 		err = c.response(raw)
 	}
+	c.reserve = nil
 	if err != nil {
 		m.freeOutput(scratch)
 		return err

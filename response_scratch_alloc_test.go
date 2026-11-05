@@ -29,7 +29,10 @@ func TestResponseScratchCoversRealAllocation(t *testing.T) {
 	bare := func(id, extra, output string) string {
 		return `{"id":"` + id + `","object":"response","status":"completed","store":false` + extra + `,"output":[` + output + `]}`
 	}
-	many := strings.TrimSuffix(strings.Repeat(text(strings.Repeat("y", 200))+",", maxResponseItems), ",")
+	many := strings.TrimSuffix(strings.Repeat(text(strings.Repeat("y", 200))+",", 8192), ",")
+	// No item count cap (D5): 300,000 tiny items are charged per slot.
+	const tinyCount = 300000
+	tiny := strings.TrimSuffix(strings.Repeat("0,", tinyCount), ",")
 	nested := `{"type":"message","content":[` + strings.TrimSuffix(strings.Repeat(`{"type":"output_text","text":"z","annotations":[{"a":[[[{"b":"`+strings.Repeat("q", 2000)+`"}]]]}]},`, 900), ",") + `]}`
 	var keys strings.Builder
 	for i := range 120 {
@@ -39,6 +42,7 @@ func TestResponseScratchCoversRealAllocation(t *testing.T) {
 		"onebig":    bare("r", "", text(strings.Repeat("x", 2<<20))),
 		"escapes":   bare("r", "", text(strings.Repeat(`\u00e9\n\"\\`, 2<<20/16))),
 		"manyitems": bare("r", "", many),
+		"tinyitems": bare("r", "", tiny),
 		"nested":    bare("r", "", nested),
 		"dupkeys":   `{"id":"a","store":true,"id":"b","object":"response","status":"completed","output":[],"output":[` + text(strings.Repeat("d", 1<<20)) + `],"store":false,"id":"c"}`,
 		"largeid":   bare(strings.Repeat("i", 4<<20), "", text("t")),
@@ -69,6 +73,9 @@ func TestResponseScratchCoversRealAllocation(t *testing.T) {
 			for _, stored := range []bool{false, true} {
 				n := len(raw)
 				bound := responseScratch(n)
+				if name == "tinyitems" {
+					bound += tinyCount * itemSlotBytes // reserved by count, on top of the byte scratch
+				}
 				m := newWorkingSet()
 				var parse collector
 				pb := []byte(raw)

@@ -23,9 +23,15 @@ func TestFinalOutputMetadataBeforeAllocation(t *testing.T) {
 	err := c.boundedResponse(raw, m)
 	runtime.ReadMemStats(&b)
 	t.Logf("source=%d outputItems=%d charged=%d totalAllocDelta=%d heapAllocDelta=%d err=%v", len(raw), len(c.output), m.output, b.TotalAlloc-a.TotalAlloc, int64(b.HeapAlloc)-int64(a.HeapAlloc), err)
-	if err == nil {
-		t.Error("oversized collection accepted; must reject before allocating 200000 RawMessage entries")
+	// No item count cap (D5): 200,000 items are accepted, and every header
+	// slot is charged before it is allocated.
+	if err != nil || len(c.output) != 200000 {
+		t.Fatalf("collection refused: %v / %d", err, len(c.output))
 	}
+	if alloc := int64(b.TotalAlloc - a.TotalAlloc); m.output < alloc-64<<10 {
+		t.Errorf("charged %d < allocated %d", m.output, alloc)
+	}
+	c.release(m)
 }
 
 func TestFinalMalformedJSONExplicit(t *testing.T) {

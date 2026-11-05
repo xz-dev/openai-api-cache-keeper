@@ -26,7 +26,7 @@ func TestFinalManySSELines(t *testing.T) {
 	err := readSSE(strings.NewReader(body), func([]byte) error { lines++; return nil }, func(raw []byte) error { return c.boundedEvent(raw, m) })
 	runtime.ReadMemStats(&b)
 	t.Logf("source=%d lines=%d charged=%d totalAllocDelta=%d heapAllocDelta=%d err=%v", len(body), lines, m.output, b.TotalAlloc-a.TotalAlloc, int64(b.HeapAlloc)-int64(a.HeapAlloc), err)
-	if err == nil && lines > maxResponseItems {
+	if err == nil && lines > 8192 {
 		t.Error("unbounded line metadata accepted outside global output budget")
 	}
 }

@@ -26,11 +26,8 @@ const (
 	// D1); it lives on disk, never in the heap.
 	maxHistoryBytes int64 = 256 << 20
 	maxEventBytes         = 1 << 20
-	// maxResponseItems bounds the output array of ONE upstream response
-	// object (itself bounded by maxResponseBytes) so its slice header is a
-	// fixed term of responseScratch. History and request input have no item
-	// cap (design D5).
-	maxResponseItems   = 8192
+	// No item count is capped: response output, history and request input
+	// are bounded by bytes, and every item slot is charged (design D5).
 	maxResponseBytes   = 8 << 20 // per object, event or non-stream body
 	maxCollectedBytes  = 16 << 20
 	maxTaskStreamBytes = 8 << 20 // cumulative task-log re-parse budget; SSE relay itself is unbounded

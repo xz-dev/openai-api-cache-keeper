@@ -316,7 +316,7 @@ func (t *responseTask) record(ctx context.Context, raw []byte, parsed map[string
 				(t.upstreamID != "" && id != t.upstreamID && id != publicID(t.upstreamID)) {
 				return errUpstreamData
 			}
-			if _, err := responseItems(doc["output"]); err != nil {
+			if err := validItems(doc["output"]); err != nil {
 				return err
 			}
 		}
