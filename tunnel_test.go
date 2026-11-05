@@ -108,7 +108,7 @@ func TestNativeTunnelMessageCappedAtL(t *testing.T) {
 			Error  map[string]any `json:"error"`
 		}
 		if json.Unmarshal(b, &ev) != nil || ev.Type != "error" || ev.Status != 413 || ev.Error["code"] != "request_too_large" ||
-			ev.Error["hop"] != "keeper" || ev.Error["limit"] != float64(fallbackLimit) || ev.Error["type"] != "invalid_request_error" {
+			ev.Error["hop"] != "keeper" || ev.Error["limit_bytes"] != float64(fallbackLimit) || ev.Error["limit"] != nil || ev.Error["type"] != "invalid_request_error" {
 			t.Fatalf("fragmented %t: error event %s", fragmented, b)
 		}
 		_, _, err = c.Read(ctx)

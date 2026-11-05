@@ -274,7 +274,7 @@ func (e *apiError) object() map[string]any {
 		obj["hop"] = e.hop
 	}
 	if e.limit != 0 {
-		obj["limit"] = e.limit
+		obj["limit_bytes"] = e.limit
 	}
 	return obj
 }

@@ -192,7 +192,7 @@ func (t *wsTunnel) refuse() {
 	}
 	if !t.downMid {
 		ev, _ := json.Marshal(map[string]any{"type": "error", "status": http.StatusRequestEntityTooLarge, "error": map[string]any{
-			"type": "invalid_request_error", "code": "request_too_large", "hop": keeperHop, "limit": fallbackLimit,
+			"type": "invalid_request_error", "code": "request_too_large", "hop": keeperHop, "limit_bytes": fallbackLimit,
 			"message": fmt.Sprintf("Request exceeds the %d-byte WebSocket message limit of %s.", fallbackLimit, keeperHop)}})
 		if _, err := t.client.Write(wsServerFrame(0x1, ev)); err != nil {
 			return

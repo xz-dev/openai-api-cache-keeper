@@ -119,7 +119,7 @@ func TestWSInnerErrorThenCloseNeverBare(t *testing.T) {
 		if i%2 == 1 {
 			prev = "resp_native"
 		}
-		up.errFrame.Store(`{"type":"error","status":413,"error":{"type":"invalid_request_error","code":"request_too_large","hop":"responses-ws-sse-bridge","message":"too large","limit":16777216}}`)
+		up.errFrame.Store(`{"type":"error","status":413,"error":{"type":"invalid_request_error","code":"request_too_large","hop":"responses-ws-sse-bridge","message":"too large","limit_bytes":16777216}}`)
 		up.errClose.Store(true)
 		ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 		if err := c.Write(ctx, websocket.MessageText, []byte(`{"type":"response.create","model":"m","input":"B","previous_response_id":"`+prev+`"}`)); err != nil {
