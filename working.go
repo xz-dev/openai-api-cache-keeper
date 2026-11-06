@@ -877,5 +877,7 @@ func (k *keeper) forwardDisk(ctx context.Context, upstream *url.URL, path, rawQu
 	if err != nil {
 		return nil, err
 	}
-	return k.forwardReader(ctx, upstream, path, rawQuery, header, body)
+	// The section is fixed at creation, so its size is exactly the bytes sent,
+	// even if accept later appends output items to the same file.
+	return k.forwardReader(ctx, upstream, path, rawQuery, header, body, body.Size())
 }

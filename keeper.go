@@ -456,7 +456,10 @@ func publicID(id string) string {
 	return "resp_" + id
 }
 
-func (k *keeper) forwardReader(ctx context.Context, upstream *url.URL, path, rawQuery string, header http.Header, body io.Reader) (*http.Response, error) {
+// forwardReader POSTs body upstream. size is the exact number of bytes body
+// yields, or -1 when unknown: a known size is sent as Content-Length so the
+// upstream can charge the whole body up front; an unknown size goes chunked.
+func (k *keeper) forwardReader(ctx context.Context, upstream *url.URL, path, rawQuery string, header http.Header, body io.Reader, size int64) (*http.Response, error) {
 	target := *upstream
 	target.Path = strings.TrimRight(target.Path, "/") + path
 	target.RawQuery = rawQuery
@@ -479,6 +482,9 @@ func (k *keeper) forwardReader(ctx context.Context, upstream *url.URL, path, raw
 	}
 	req.Header.Del("Accept-Encoding")
 	req.Header.Del("Content-Length")
+	if size > 0 { // 0 with a non-nil body would also mean unknown to net/http
+		req.ContentLength = size
+	}
 	req.Header.Set("Content-Type", "application/json")
 	return k.client.Do(req)
 }
