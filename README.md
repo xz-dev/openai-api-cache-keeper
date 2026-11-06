@@ -49,7 +49,7 @@ For the measured 384-MiB memory envelope, the following conservative limits are 
 
 | Resource | Limit / behavior |
 |---|---|
-| Client request/frame | Existing `MAX_REQUEST_BYTES`, default 32 MiB; unchanged. Spool before JSON decode. |
+| Client request/frame | `MAX_REQUEST_BYTES`, the end-to-end cap, default 256 MiB. The expanded-history limit and the transient spool budget (4 x cap) follow it. Spool before JSON decode. |
 | In-flight/queued turns | 64 total across HTTP and WS; overflow returns explicit `working_set_unavailable` (503). |
 | Live WebSockets | 64; excess handshake rejected with 503. |
 | Pending WS messages | One queued message per socket in addition to current turn; excess messages receive explicit overload. Reader keeps servicing control frames while work queues. |
@@ -123,10 +123,10 @@ An invalid model or malformed request returns `400 / invalid_request_error`; `no
 | `STORE_TTL` | `10m` | Positive Go duration; lifetime from entry creation/replacement, not last read. |
 | `STORE_MAX_ENTRIES` | `100` | Maximum registered response-ID aliases; LRU eviction. `0` is unlimited; negative values fail startup. Pins/shared history nodes are excluded. |
 | `STORE_MAX_BYTES` | `0` | Live retained history payload budget, not a filesystem quota; LRU eviction. `0` is unlimited; negative values fail startup. Other safety limits remain. |
-| `MAX_REQUEST_BYTES` | `33554432` | Maximum request body or WebSocket frame size. |
+| `MAX_REQUEST_BYTES` | `268435456` | The end-to-end cap: maximum request body or WebSocket frame size, and the expanded-history limit (`history_too_large`). The transient spool budget is 4 x cap, and `STORE_PIN_MAX_BYTES` defaults to it. Startup fails below 16 MiB, or above what the capacity gate can ever admit: 7 x cap must fit the ledger filesystem size minus the 1 GiB reserve and `STORE_MAX_BYTES`, and the memory footprint must fit MemTotal minus 232 MiB. Production keeps the default; the nightly CI stack sets 1 GiB. |
 | `STORE_DIR` | `/var/tmp/openai-api-cache-keeper` | Directory for the disposable disk cache. Must be a real disk volume, never tmpfs. |
 | `STORE_META_MAX_BYTES` | `33554432` | Accounted metadata budget for prefix nodes, unique item indexes, response aliases and socket pins. |
-| `STORE_PIN_MAX_BYTES` | `104857600` | Aggregate payload budget for all live WebSocket history pins. |
+| `STORE_PIN_MAX_BYTES` | `MAX_REQUEST_BYTES` | Aggregate payload budget for all live WebSocket history pins; the default admits one maximum history. |
 | `STORE_COMPACT_BYTES` | `419430400` | Physical file maintenance trigger before admission, not a hard disk quota; temporary-copy headroom required. |
 | `REQUIRE_NO_DEFAULT_ROUTE` | `false` | Refuse to start while the network namespace has a default route. |
 | `IGNORE_CLIENT_STORE_FALSE` | `false` | Store turns even when the client sent `store: false`. |

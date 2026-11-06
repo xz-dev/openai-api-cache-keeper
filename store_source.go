@@ -179,7 +179,7 @@ func (s *store) prepareStoreSource(ctx context.Context, owner [32]byte, source i
 		case ok != (p.hold != nil) || (ok && inPlace.f != p.file):
 			return nil, errors.New("store source mixes spools")
 		}
-		if !ok && p.file.size+n > maxSpoolBytes {
+		if !ok && p.file.size+n > p.file.mem.spoolMax {
 			return nil, errWorkSize
 		}
 		var hash [32]byte

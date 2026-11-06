@@ -143,7 +143,7 @@ func TestExpandedHistoryBoundBeforeCopy(t *testing.T) {
 	s := newTestStore(t, time.Hour, 2<<20, 1<<20, 1<<20, 4<<20)
 	owner := [32]byte{1}
 	raw, _ := json.Marshal(strings.Repeat("X", 1<<20))
-	n := int(maxHistoryBytes>>20) + 1
+	n := int(defaultCapBytes>>20) + 1
 	full := make([]json.RawMessage, n)
 	for i := range full {
 		full[i] = raw
@@ -161,7 +161,7 @@ func TestExpandedHistoryBoundBeforeCopy(t *testing.T) {
 func TestSpoolBudgetAndDiskErrorCleanup(t *testing.T) {
 	_, _, k := newTestKeeper(t)
 	k.work.mu.Lock()
-	k.work.disk = maxSpoolBytes
+	k.work.disk = k.work.spoolMax
 	k.work.mu.Unlock()
 	if f, err := k.spoolRequest(context.Background(), strings.NewReader("x"), nil); err == nil {
 		f.Close()

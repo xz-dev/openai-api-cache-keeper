@@ -59,6 +59,14 @@ func newKeeper(cfg config) *keeper {
 		st.close()
 		log.Fatalf("capacity ledger: %v", err)
 	}
+	work := newWorkingSet()
+	if cfg.capBytes > 0 {
+		if err := gate.checkCap(cfg.capBytes); err != nil {
+			st.close()
+			log.Fatalf("capacity ledger: %v", err)
+		}
+		work.setCap(cfg.capBytes)
+	}
 	var routing *routingClient
 	if cfg.routingIndex != nil {
 		routing = newRoutingClient(cfg.routingIndex)
@@ -66,7 +74,7 @@ func newKeeper(cfg config) *keeper {
 	k := &keeper{
 		routing: routing,
 		gate:    gate,
-		work:    newWorkingSet(),
+		work:    work,
 		cfg:     cfg,
 		store:   st,
 		tasks:   make(map[string]*responseTask),

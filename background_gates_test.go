@@ -321,7 +321,7 @@ func TestBackgroundLogWriteAndCleanupFailure(t *testing.T) {
 			k.work.mu.Lock()
 			base := k.work.disk
 			k.work.mu.Unlock()
-			fill := maxSpoolBytes - base
+			fill := k.work.spoolMax - base
 			if mode == "write" {
 				k.work.mu.Lock()
 				k.work.disk += fill

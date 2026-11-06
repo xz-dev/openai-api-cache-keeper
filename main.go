@@ -31,6 +31,7 @@ type config struct {
 	maxStoreBytes         int64
 	maxStoreEntries       int64
 	maxRequestBytes       int64
+	capBytes              int64 // MAX_REQUEST_BYTES, the end-to-end cap (D1): history, spool and pin limits follow it; 0 = defaultCapBytes
 	storeDir              string
 	ledgerDir             string // CAPACITY_LEDGER_DIR; default STORE_DIR/capacity-ledger
 	memInfoPath           string // CAPACITY_MEMINFO; default /proc/meminfo
@@ -118,9 +119,13 @@ func loadConfig() (config, error) {
 	if cfg.maxStoreEntries, err = envNonNegativeInt("STORE_MAX_ENTRIES", 100); err != nil {
 		return config{}, err
 	}
-	if cfg.maxRequestBytes, err = envPositiveInt("MAX_REQUEST_BYTES", 256<<20); err != nil {
+	if cfg.capBytes, err = envPositiveInt("MAX_REQUEST_BYTES", defaultCapBytes); err != nil {
 		return config{}, err
 	}
+	if cfg.capBytes < minCapBytes {
+		return config{}, fmt.Errorf("MAX_REQUEST_BYTES must be at least %d (16 MiB, the inline-bytes and fallback limit)", minCapBytes)
+	}
+	cfg.maxRequestBytes = cfg.capBytes
 	cfg.ledgerDir = os.Getenv("CAPACITY_LEDGER_DIR")
 	cfg.memInfoPath = os.Getenv("CAPACITY_MEMINFO")
 	cfg.storeDir = os.Getenv("STORE_DIR")
@@ -130,7 +135,7 @@ func loadConfig() (config, error) {
 	if cfg.storeMetaBytes, err = envPositiveInt("STORE_META_MAX_BYTES", 32<<20); err != nil {
 		return config{}, err
 	}
-	if cfg.storePinBytes, err = envPositiveInt("STORE_PIN_MAX_BYTES", 256<<20); err != nil {
+	if cfg.storePinBytes, err = envPositiveInt("STORE_PIN_MAX_BYTES", cfg.capBytes); err != nil {
 		return config{}, err
 	}
 	if cfg.storeCompactBytes, err = envPositiveInt("STORE_COMPACT_BYTES", 400<<20); err != nil {

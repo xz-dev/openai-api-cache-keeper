@@ -22,19 +22,23 @@ import (
 // Bounds for the unchanged 384-MiB envelope. Slow upstreams retain disk files,
 // while simultaneously materialized scratch is admitted by actual byte credits.
 const (
-	// The expanded history spool follows the 256 MiB end-to-end cap (design
-	// D1); it lives on disk, never in the heap.
-	maxHistoryBytes int64 = 256 << 20
-	maxEventBytes         = 1 << 20
+	// defaultCapBytes is the production end-to-end cap (design D1), the
+	// MAX_REQUEST_BYTES default. The expanded history spool follows the
+	// configured cap; it lives on disk, never in the heap.
+	defaultCapBytes int64 = 256 << 20
+	// minCapBytes is the smallest accepted cap: the 16 MiB inline-bytes and
+	// fallback limits (design D2) must fit under it.
+	minCapBytes   int64 = 16 << 20
+	maxEventBytes       = 1 << 20
 	// No item count is capped: response output, history and request input
 	// are bounded by bytes, and every item slot is charged (design D5).
 	maxResponseBytes   = 8 << 20 // per object, event or non-stream body
 	maxCollectedBytes  = 16 << 20
 	maxTaskStreamBytes = 8 << 20 // cumulative task-log re-parse budget; SSE relay itself is unbounded
-	// maxSpoolBytes is keeper's transient disk byte budget: one maximum
-	// turn holds its raw request and its rebuilt upstream spool (k_disk 2,
-	// design D4) with room for concurrent small turns.
-	maxSpoolBytes int64 = 4 * maxHistoryBytes
+	// spoolCapFactor sets keeper's transient disk byte budget to 4 x cap:
+	// one maximum turn holds its raw request and its rebuilt upstream spool
+	// (k_disk 2, design D4) with room for concurrent small turns.
+	spoolCapFactor = 4
 )
 
 var errWorkSize = errors.New("encoded history or response exceeds working limit")
@@ -52,7 +56,9 @@ func (e *sizeLimitError) Error() string {
 
 func (e *sizeLimitError) Is(target error) bool { return target == errWorkSize }
 
-var errHistorySize error = &sizeLimitError{code: "history_too_large", what: "the expanded history", setting: "keeper history limit", limit: maxHistoryBytes}
+func historySizeError(limit int64) error {
+	return &sizeLimitError{code: "history_too_large", what: "the expanded history", setting: "keeper history limit", limit: limit}
+}
 
 func requestSizeError(limit int64) error {
 	return &sizeLimitError{code: "request_too_large", what: "the request body or frame", setting: "MAX_REQUEST_BYTES", limit: limit}
@@ -73,9 +79,22 @@ type workingSet struct {
 	statfs        func(fd int, st *unix.Statfs_t) error // free-space source; nil = unix.Fstatfs
 	cg            *cgroupMem
 	cgroup        func() (limit, current int64, ok bool) // test hook; nil = cg
+	// Limits derived from the cap (setCap); fixed before serving.
+	historyMax int64 // expanded history bytes
+	spoolMax   int64 // transient spool disk bytes
 }
 
-func newWorkingSet() *workingSet { return &workingSet{cg: openCgroupMem()} }
+func newWorkingSet() *workingSet {
+	m := &workingSet{cg: openCgroupMem()}
+	m.setCap(defaultCapBytes)
+	return m
+}
+
+// setCap derives the history limit and the transient spool budget from the
+// end-to-end cap.
+func (m *workingSet) setCap(capBytes int64) {
+	m.historyMax, m.spoolMax = capBytes, spoolCapFactor*capBytes
+}
 
 // previousNotFound never echoes an unbounded client id: the message carries
 // at most a 64-byte UTF-8-safe prefix (the lookup itself used the full id).
@@ -605,8 +624,9 @@ func (k *keeper) prepareDiskAdmit(ctx context.Context, raw *spool, owner [32]byt
 			planned += spans[key].end - spans[key].start
 		}
 	}
-	if planned > maxHistoryBytes {
-		return nil, workingError(errHistorySize)
+	historyMax := k.work.historyMax
+	if planned > historyMax {
+		return nil, workingError(historySizeError(historyMax))
 	}
 	var tk *capTicket
 	if admit != nil {
@@ -625,7 +645,7 @@ func (k *keeper) prepareDiskAdmit(ctx context.Context, raw *spool, owner [32]byt
 	}
 	f.ticket = tk
 	t.file = f
-	out := &spoolWriter{f: f, limit: maxHistoryBytes}
+	out := &spoolWriter{f: f, limit: historyMax}
 	copyBuf := make([]byte, 32<<10)
 	if wsEnvelope {
 		// Reserve room before `{` for a ticket as the frame's first member;
@@ -646,8 +666,8 @@ func (k *keeper) prepareDiskAdmit(ctx context.Context, raw *spool, owner [32]byt
 		if _, err := io.CopyBuffer(struct{ io.Writer }{f}, raw.spanReader(fs.start, fs.end), copyBuf); err != nil {
 			return fail(err)
 		}
-		if f.size > maxHistoryBytes {
-			return fail(errHistorySize)
+		if f.size > historyMax {
+			return fail(historySizeError(historyMax))
 		}
 		if err := out.write([]byte(`,`)); err != nil {
 			return fail(err)
@@ -665,8 +685,8 @@ func (k *keeper) prepareDiskAdmit(ctx context.Context, raw *spool, owner [32]byt
 			if nItems > 0 {
 				separator = 1
 			}
-			if f.size+size+separator > maxHistoryBytes {
-				return errHistorySize
+			if f.size+size+separator > historyMax {
+				return historySizeError(historyMax)
 			}
 			if nItems > 0 {
 				if err := out.write([]byte(",")); err != nil {
@@ -704,8 +724,8 @@ func (k *keeper) prepareDiskAdmit(ctx context.Context, raw *spool, owner [32]byt
 		if _, err := io.CopyBuffer(struct{ io.Writer }{f}, r, copyBuf); err != nil {
 			return err
 		}
-		if f.size-off > maxHistoryBytes {
-			return errHistorySize
+		if f.size-off > historyMax {
+			return historySizeError(historyMax)
 		}
 		if err := t.addSpan(itemSpan{off, int(f.size - off)}); err != nil {
 			return err
@@ -734,8 +754,8 @@ func (k *keeper) prepareDiskAdmit(ctx context.Context, raw *spool, owner [32]byt
 		if err := out.write([]byte(`,"role":"user"}`)); err != nil {
 			return fail(err)
 		}
-		if f.size-off > maxHistoryBytes {
-			return fail(errHistorySize)
+		if f.size-off > historyMax {
+			return fail(historySizeError(historyMax))
 		}
 		if err := t.addSpan(itemSpan{off, int(f.size - off)}); err != nil {
 			return fail(err)
@@ -765,8 +785,8 @@ func (k *keeper) prepareDiskAdmit(ctx context.Context, raw *spool, owner [32]byt
 		if _, err := io.CopyBuffer(struct{ io.Writer }{f}, raw.spanReader(fs.start, fs.end), copyBuf); err != nil {
 			return fail(err)
 		}
-		if f.size > maxHistoryBytes {
-			return fail(errHistorySize)
+		if f.size > historyMax {
+			return fail(historySizeError(historyMax))
 		}
 	}
 	if err := out.write([]byte("}")); err != nil {
@@ -798,7 +818,7 @@ type spoolWriter struct {
 
 func (w *spoolWriter) write(p []byte) error {
 	if w.f.size+int64(len(p)) > w.limit {
-		return errHistorySize
+		return historySizeError(w.limit)
 	}
 	_, err := w.f.Write(p)
 	return err
@@ -845,8 +865,8 @@ func (k *keeper) prepareAcceptDisk(ctx context.Context, t *diskTurn, id string, 
 	for _, item := range output {
 		encoded += int64(len(item)) + 1
 	}
-	if encoded > maxHistoryBytes {
-		return nil, errHistorySize
+	if encoded > k.work.historyMax {
+		return nil, historySizeError(k.work.historyMax)
 	}
 	// Output items are appended to the turn spool so accept replays everything
 	// from disk. Spans already cover input+history; output extends them.

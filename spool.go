@@ -123,7 +123,7 @@ func (k *keeper) newSpool() (_ *spool, err error) {
 }
 func (f *spool) Write(p []byte) (int, error) {
 	f.mem.mu.Lock()
-	if f.mem.disk+int64(len(p)) > maxSpoolBytes {
+	if f.mem.disk+int64(len(p)) > f.mem.spoolMax {
 		f.mem.mu.Unlock()
 		return 0, errors.New("transient disk budget exceeded")
 	}

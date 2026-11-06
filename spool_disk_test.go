@@ -13,13 +13,14 @@ import (
 // The spool constants follow the 256 MiB cap (design D1, D5).
 func TestSpoolBudgetsFollowCap(t *testing.T) {
 	const capBytes = 268435456
-	if maxHistoryBytes != capBytes {
-		t.Fatalf("maxHistoryBytes=%d", maxHistoryBytes)
+	m := newWorkingSet()
+	if m.historyMax != capBytes {
+		t.Fatalf("historyMax=%d", m.historyMax)
 	}
 	// One maximum HTTP turn holds its raw spool plus its rebuilt upstream
 	// spool (k_disk 2) inside the transient disk budget.
-	if maxSpoolBytes < 2*capBytes {
-		t.Fatalf("maxSpoolBytes=%d cannot hold one maximum turn", maxSpoolBytes)
+	if m.spoolMax < 2*capBytes {
+		t.Fatalf("spoolMax=%d cannot hold one maximum turn", m.spoolMax)
 	}
 	t.Setenv("STORE_DIR", t.TempDir())
 	t.Setenv("UPSTREAM_URL", "http://127.0.0.1:1")

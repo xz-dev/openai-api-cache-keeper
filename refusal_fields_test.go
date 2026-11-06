@@ -31,7 +31,7 @@ func TestRefusalCarriesHopAndLimit(t *testing.T) {
 		{"ticket ledger unavailable", ledgerUnavailable(errors.New("flock failed")), 503, "capacity_ledger_unavailable", 0, ""},
 		{"spool over MAX_REQUEST_BYTES", workingError(requestSizeError(1234)), 413, "request_too_large", 1234, ""},
 		{"http body over MAX_REQUEST_BYTES", workingError(&http.MaxBytesError{Limit: 99}), 413, "request_too_large", 99, ""},
-		{"history cap", workingError(errHistorySize), 413, "history_too_large", maxHistoryBytes, ""},
+		{"history cap", workingError(historySizeError(defaultCapBytes)), 413, "history_too_large", defaultCapBytes, ""},
 		{"spool disk floor", workingError(&storageFloorError{free: 1, need: 2}), 507, "insufficient_storage", spoolDiskFloor, ""},
 		{"cgroup memory charge", workingError(&insufficientMemoryError{need: 77, free: 1}), 503, "insufficient_memory", 77, ""},
 		{"working set too large", workingError(errWorkSize), 413, "working_set_too_large", 0, ""},

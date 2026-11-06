@@ -101,7 +101,10 @@ func newTicketID() (string, error) {
 }
 
 // readMemAvailable reads MemAvailable (bytes) from a meminfo file.
-func readMemAvailable(path string) (int64, error) {
+func readMemAvailable(path string) (int64, error) { return readMeminfo(path, "MemAvailable") }
+
+// readMeminfo reads one kB field (as bytes) from a meminfo file.
+func readMeminfo(path, field string) (int64, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return 0, err
@@ -109,7 +112,7 @@ func readMemAvailable(path string) (int64, error) {
 	defer f.Close()
 	sc := bufio.NewScanner(f)
 	for sc.Scan() {
-		if rest, ok := strings.CutPrefix(sc.Text(), "MemAvailable:"); ok {
+		if rest, ok := strings.CutPrefix(sc.Text(), field+":"); ok {
 			kb, err := strconv.ParseInt(strings.TrimSuffix(strings.TrimSpace(rest), " kB"), 10, 64)
 			if err != nil {
 				return 0, err
@@ -117,7 +120,7 @@ func readMemAvailable(path string) (int64, error) {
 			return kb << 10, nil
 		}
 	}
-	return 0, errors.New("MemAvailable missing from " + path)
+	return 0, errors.New(field + " missing from " + path)
 }
 
 // createTicketFile links a fully written, fsynced ticket into dir under

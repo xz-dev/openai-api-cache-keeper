@@ -186,7 +186,7 @@ func (s *store) getPinned(pin string, owner [32]byte) ([]json.RawMessage, bool) 
 
 // boundedGet keeps the old slice-based bounded lookup for tests.
 func (s *store) boundedGet(id string, owner [32]byte, pinned bool) ([]json.RawMessage, bool, error) {
-	return s.getLimited(id, owner, pinned, maxHistoryBytes)
+	return s.getLimited(id, owner, pinned, s.inputWork.historyMax)
 }
 
 // Count encoded occurrences, not unique payload bytes: a tiny deduplicated

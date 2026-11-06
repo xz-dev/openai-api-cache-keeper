@@ -3,8 +3,9 @@ package main
 import "unsafe"
 
 // History and input item spans have no count cap: they are bounded by bytes
-// (maxHistoryBytes, MAX_REQUEST_BYTES) and every span-slice capacity is
-// charged to the file's working set before it is allocated (design D5).
+// (the history limit and MAX_REQUEST_BYTES, both the cap) and every span-slice
+// capacity is charged to the file's working set before it is allocated
+// (design D5).
 func (t *diskTurn) addSpan(span itemSpan) error {
 	next, free, err := growSpans(t.spans, t.file)
 	if err != nil {

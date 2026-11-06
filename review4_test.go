@@ -205,7 +205,7 @@ func TestReview4HandshakeSpoolFailureExplicit(t *testing.T) {
 	u, _ := url.Parse(up.URL)
 	_, _, k := newTestKeeper(t, func(c *config) { c.upstream = u })
 	k.work.mu.Lock()
-	k.work.disk = maxSpoolBytes - 200
+	k.work.disk = k.work.spoolMax - 200
 	k.work.mu.Unlock()
 	defer func() {
 		k.work.mu.Lock()

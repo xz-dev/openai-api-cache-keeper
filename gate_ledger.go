@@ -134,6 +134,40 @@ func (g *capacityGate) available() (disk, mem int64, err error) {
 	return disk - spoolDiskFloor - headroom, mem - memFloor - memMargin, err
 }
 
+// checkCap refuses a cap whose footprint the gate can never admit, even on
+// an idle host: the whole filesystem free (its size for unprivileged writers)
+// minus the 1 GiB reserve and the store budget, and MemAvailable at MemTotal
+// minus 232 MiB. MemTotal comes from the gate's meminfo source, or from
+// /proc/meminfo when that source has none (a test source).
+func (g *capacityGate) checkCap(capBytes int64) error {
+	var st unix.Statfs_t
+	if err := unix.Statfs(g.dir, &st); err != nil {
+		return fmt.Errorf("MAX_REQUEST_BYTES check: %w", err)
+	}
+	disk := int64(st.Blocks-(st.Bfree-st.Bavail))*st.Frsize - spoolDiskFloor - g.storeMax
+	total, err := readMeminfo(g.memInfo, "MemTotal")
+	if err != nil {
+		if total, err = readMeminfo("/proc/meminfo", "MemTotal"); err != nil {
+			return fmt.Errorf("MAX_REQUEST_BYTES check: %w", err)
+		}
+	}
+	return capFits(capBytes, disk, total-memFloor-memMargin)
+}
+
+// capFits checks a cap against the most disk and memory the gate can ever
+// offer one ticket.
+func capFits(capBytes, diskMax, memMax int64) error {
+	if capBytes > diskMax/kDiskTotal { // divide first: 7 x cap may overflow
+		return fmt.Errorf("MAX_REQUEST_BYTES=%d can never be admitted: its disk footprint is %d x %d bytes, and the ledger filesystem can offer at most %d (its size minus the %d-byte reserve and STORE_MAX_BYTES)",
+			capBytes, kDiskTotal, capBytes, max(diskMax, 0), spoolDiskFloor)
+	}
+	if _, rMem := footprint(capBytes); rMem > memMax {
+		return fmt.Errorf("MAX_REQUEST_BYTES=%d can never be admitted: its memory footprint is %d bytes, and MemTotal minus the %d-byte floor and %d-byte margin is %d",
+			capBytes, rMem, memFloor, memMargin, memMax)
+	}
+	return nil
+}
+
 func ledgerUnavailable(err error) *apiError {
 	return &apiError{status: http.StatusServiceUnavailable, typ: "server_error", code: "capacity_ledger_unavailable", hop: keeperHop,
 		message: "keeper: the capacity ledger is unavailable: " + boundedText(err.Error())}
